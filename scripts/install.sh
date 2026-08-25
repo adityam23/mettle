@@ -49,14 +49,14 @@ for bin in mettle mettled; do
     fi
 done
 
-# CUDA archives ship the CUDA runtime libraries the daemon links against.
+# Archives may bundle non-base shared libraries (CUDA runtime, OpenBLAS).
 if [ -d "$tmp"/*/lib ]; then
     libdir="${METTLE_LIB_DIR:-$HOME/.local/lib/mettle}"
     mkdir -p "$libdir"
     cp "$tmp"/*/lib/*.so* "$libdir/" 2>/dev/null || true
     cat <<EOF
 
-CUDA runtime libraries installed to ${libdir}.
+Bundled shared libraries installed to ${libdir}.
 Add them to the loader path before starting the daemon:
 
     export LD_LIBRARY_PATH="${libdir}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"

@@ -1,6 +1,6 @@
 //! OpenAI-compatible `/v1/*` routes: chat completions (SSE + non-stream),
-//! text completions, embeddings, and model listing. Consumed by
-//! agentic-assistant's `openai_compat.py` and other OpenAI SDK clients.
+//! text completions, embeddings, and model listing. Consumed by standard
+//! OpenAI SDK clients.
 
 use std::sync::Arc;
 

@@ -35,6 +35,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-${{ matrix.features }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - name: Build
         run: >
           cargo build --release --target ${{ matrix.target }}
@@ -43,11 +46,25 @@ jobs:
         shell: bash
         run: |
           dir="${{ matrix.artifact }}"
-          mkdir -p "$dir"
+          mkdir -p "$dir/lib"
           cp "target/${{ matrix.target }}/release/mettle" "$dir/"
           cp "target/${{ matrix.target }}/release/mettled" "$dir/"
+          # turbovec pulls ndarray/blas on Linux -> dynamic OpenBLAS (+ its
+          # gfortran runtime). Bundle everything non-base so the archive is
+          # self-contained.
+          for bin in "$dir"/mettle "$dir"/mettled; do
+            ldd "$bin" | awk '$3 ~ /^\// {print $3}' | while read -r so; do
+              case "$(basename "$so")" in
+                *openblas*|*gfortran*|*quadmath*|*gomp*) cp -n "$so" "$dir/lib/" ;;
+              esac
+            done
+          done
           tar czf "${dir}.tar.gz" "$dir"
-          sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+          else
+            shasum -a 256 "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -70,7 +87,7 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential cmake clang pkg-config curl git ca-certificates
+          apt-get install -y --no-install-recommends build-essential cmake clang pkg-config curl git ca-certificates libssl-dev libopenblas-dev
           curl https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
@@ -88,10 +105,15 @@ jobs:
           dir="mettle-linux-amd64-cuda"
           mkdir -p "$dir/lib"
           cp target/release/mettle target/release/mettled "$dir/"
-          # Bundle the CUDA runtime libraries llama.cpp was linked against so
-          # the archive works without a CUDA toolkit install.
-          find target/release -name 'libcudart.so*' -o -name 'libcublas*.so*' | while read -r so; do
-            cp -n "$so" "$dir/lib/"
+          # Bundle CUDA runtime libs llama.cpp linked against plus any other
+          # non-base shared libraries, so the archive works without a CUDA
+          # toolkit or OpenBLAS installed.
+          for bin in "$dir"/mettle "$dir"/mettled; do
+            ldd "$bin" | awk '$3 ~ /^\// {print $3}' | while read -r so; do
+              case "$(basename "$so")" in
+                *cudart*|*cublas*|*openblas*|*gfortran*|*quadmath*|*gomp*) cp -n "$so" "$dir/lib/" ;;
+              esac
+            done
           done
           tar czf "mettle-linux-amd64-cuda.tar.gz" "$dir"
           sha256sum "mettle-linux-amd64-cuda.tar.gz" > "mettle-linux-amd64-cuda.tar.gz.sha256"

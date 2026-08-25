@@ -948,7 +948,7 @@ fn embed_ctx_params(pooling: Pooling, n_tokens: usize, n_seqs: usize) -> LlamaCo
 }
 
 // ---------------------------------------------------------------------------
-// GGUF inspection (for `engine tune` partial-offload sizing)
+// GGUF inspection (for `mettled tune` partial-offload sizing)
 // ---------------------------------------------------------------------------
 
 /// Read the transformer layer count from a GGUF file header. `None` when

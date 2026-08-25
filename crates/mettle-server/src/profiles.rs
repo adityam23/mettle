@@ -1069,7 +1069,7 @@ impl ProfileManager {
     /// dropped/unloaded JIT slot, failed load, or nothing resident at all.
     /// `profile_degraded` reflects whether the CURRENT session degraded a
     /// profile (dropped/shrunk slots); consumers surface the reason instead
-    /// of retrying blindly (agentic-assistant engine-profiles.md).
+    /// of retrying blindly.
     pub fn slot_unavailable_payload(&self, id: &str) -> serde_json::Value {
         let (dropped, shrunk) = self
             .inner

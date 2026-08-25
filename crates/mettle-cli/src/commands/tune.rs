@@ -1,4 +1,4 @@
-//! `mettle-cli tune` — delegates to the engine binary's `tune` mode:
+//! `mettle tune` — delegates to the `mettled` daemon's `tune` mode:
 //! VRAM detection (nvidia-smi) → per-model `n_gpu_layers` (full, partial,
 //! or CPU) written to `config.toml`.
 

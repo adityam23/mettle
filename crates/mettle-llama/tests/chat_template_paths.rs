@@ -24,13 +24,11 @@ fn gguf(rel: &str) -> String {
     models_root().join(rel).to_string_lossy().into_owned()
 }
 
-/// The Qwen distill GGUF lives outside this repo (agent-assistant
-/// benchmarks); overridable for hosts without it.
+/// The Qwen distill GGUF is not shipped with this repo; point
+/// `METTLE_QWEN_GGUF` at one to run these tests.
 fn qwen_gguf() -> String {
-    std::env::var("METTLE_QWEN_GGUF").unwrap_or_else(|_| {
-        "/personal-projects/agentic-assistant/benchmarks/financebench/models/qwen35-4b-opus-distill.Q4_K_M.gguf"
-            .into()
-    })
+    std::env::var("METTLE_QWEN_GGUF")
+        .expect("set METTLE_QWEN_GGUF to a Qwen-style reasoning-distill GGUF")
 }
 
 fn piece(model: &llama_cpp_2::model::LlamaModel, t: llama_cpp_2::token::LlamaToken) -> String {

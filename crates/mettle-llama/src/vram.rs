@@ -223,9 +223,8 @@ mod tests {
     #[test]
     #[ignore]
     fn real_gguf_estimate() {
-        let p = std::path::Path::new(
-            "/personal-projects/agentic-assistant/benchmarks/financebench/models/\
-             qwen35-4b-opus-distill.Q4_K_M.gguf",
+        let p = std::path::PathBuf::from(
+            std::env::var("METTLE_QWEN_GGUF").expect("set METTLE_QWEN_GGUF to a real GGUF"),
         );
         if !p.exists() {
             return; // model not present on this host

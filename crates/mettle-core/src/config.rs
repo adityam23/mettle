@@ -298,7 +298,7 @@ pub struct EngineOptions {
     pub speculative: SpeculativeSetting,
 
     /// Engine-wide GPU offload (layers, 0 = CPU, 999 = all); written by
-    /// `engine tune` from VRAM detection. Per-model override via
+    /// `mettled tune` from VRAM detection. Per-model override via
     /// `[[model]] n_gpu_layers`.
     #[serde(default)]
     pub n_gpu_layers: Option<u32>,

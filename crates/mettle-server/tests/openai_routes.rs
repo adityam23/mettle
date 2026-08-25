@@ -1,16 +1,15 @@
 //! HTTP-level tests for the OpenAI-compatible `/v1/*` surface, Anthropic
 //! `/v1/messages`, and the OCR endpoint: status codes, error shapes, and
-//! serde wire shapes (matching what OpenAI/Anthropic SDKs and
-//! agentic-assistant's `openai_compat.py` parse).
+//! serde wire shapes (matching what OpenAI/Anthropic SDKs parse).
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use mettle_core::config::RootConfig;
 use mettle_server::app::build_router;
 use mettle_server::state::AppState;
-use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {

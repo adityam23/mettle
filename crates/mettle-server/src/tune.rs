@@ -1,4 +1,4 @@
-//! `engine tune` — hardware-matched config generation.
+//! `mettled tune` — hardware-matched config generation.
 //!
 //! Detects free VRAM (nvidia-smi), sizes each configured model against the
 //! budget, and writes `config.toml` with per-model `n_gpu_layers`:

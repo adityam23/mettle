@@ -6,8 +6,8 @@ license.workspace = true
 
 [features]
 default = ["mtp", "mtmd"]
-# Accelerator backends, passed through to llama.cpp. CUDA first on this host
-# (needs NVCC_CCBIN=gcc-14 shim; see agent-docs/cuda-build.md).
+# Accelerator backends, passed through to llama.cpp. CUDA-first; release
+# artifacts ship prebuilt CPU/Metal/CUDA archives (see .github/workflows).
 cuda = ["llama-cpp-2/cuda"]
 cudnn = ["cuda"]
 metal = ["llama-cpp-2/metal"]
