@@ -51,14 +51,18 @@ jobs:
           cp "target/${{ matrix.target }}/release/mettled" "$dir/"
           # turbovec pulls ndarray/blas on Linux -> dynamic OpenBLAS (+ its
           # gfortran runtime). Bundle everything non-base so the archive is
-          # self-contained.
-          for bin in "$dir"/mettle "$dir"/mettled; do
-            ldd "$bin" | awk '$3 ~ /^\// {print $3}' | while read -r so; do
-              case "$(basename "$so")" in
-                *openblas*|*gfortran*|*quadmath*|*gomp*) cp -n "$so" "$dir/lib/" ;;
-              esac
+          # self-contained. macOS links Accelerate (system framework), so
+          # there is nothing to bundle there.
+          if [ "$(uname -s)" = "Linux" ]; then
+            for bin in "$dir"/mettle "$dir"/mettled; do
+              ldd "$bin" | awk '$3 ~ /^\// {print $3}' | while read -r so; do
+                case "$(basename "$so")" in
+                  *openblas*|*gfortran*|*quadmath*|*gomp*) cp -n "$so" "$dir/lib/" ;;
+                esac
+              done
             done
-          done
+          fi
+          rmdir --ignore-fail-on-non-empty "$dir/lib" 2>/dev/null || true
           tar czf "${dir}.tar.gz" "$dir"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
