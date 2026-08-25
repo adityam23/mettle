@@ -233,7 +233,7 @@ The company reported operating margins of 19.2% with revenue of $32.7 billion. "
 
 /// Dump mettle's exact rendered prompt for a request payload so it can be
 /// diffed against llama-server --jinja (`--verbose-prompt`) and the jinja2
-/// reference render. Writes /tmp/infengine_render.txt.
+/// reference render. Writes /tmp/mettle_render.txt.
 #[test]
 #[ignore = "needs the qwen35-4b distill GGUF on disk"]
 fn dump_rendered_prompt_from_payload() {
@@ -255,7 +255,7 @@ fn dump_rendered_prompt_from_payload() {
         .collect();
     let built = build_chat_tokens(&model, &msgs).unwrap();
     let text = render(&model, &built.tokens);
-    std::fs::write("/tmp/infengine_render.txt", &text).unwrap();
+    std::fs::write("/tmp/mettle_render.txt", &text).unwrap();
     println!(
         "tokens={} opens_reasoning={:?}",
         built.tokens.len(),

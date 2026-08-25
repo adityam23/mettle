@@ -6,7 +6,7 @@ use std::path::PathBuf;
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 
 /// Top-level engine configuration, deserialized from TOML.
-/// Zero-config first run: `engine serve` works with no file present.
+/// Zero-config first run: `mettled` starts fine with no config file present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootConfig {
