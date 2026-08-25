@@ -1,0 +1,109 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  standard:
+    name: ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            features: ""
+            artifact: mettle-linux-amd64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            features: "metal"
+            artifact: mettle-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
+      - name: Build
+        run: >
+          cargo build --release --target ${{ matrix.target }}
+          ${{ matrix.features != '' && '--features' || '' }} ${{ matrix.features }}
+      - name: Package
+        shell: bash
+        run: |
+          dir="${{ matrix.artifact }}"
+          mkdir -p "$dir"
+          cp "target/${{ matrix.target }}/release/mettle" "$dir/"
+          cp "target/${{ matrix.target }}/release/mettled" "$dir/"
+          tar czf "${dir}.tar.gz" "$dir"
+          sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+  cuda:
+    name: mettle-linux-amd64-cuda
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake clang pkg-config curl git ca-certificates
+          curl https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda
+      - name: Build (CUDA)
+        env:
+          # Ampere (80), Ada (86/89) laptop/desktop parts; override for other cards.
+          CMAKE_CUDA_ARCHITECTURES: "80;86;89"
+        run: cargo build --release --features cuda
+      - name: Package
+        shell: bash
+        run: |
+          dir="mettle-linux-amd64-cuda"
+          mkdir -p "$dir/lib"
+          cp target/release/mettle target/release/mettled "$dir/"
+          # Bundle the CUDA runtime libraries llama.cpp was linked against so
+          # the archive works without a CUDA toolkit install.
+          find target/release -name 'libcudart.so*' -o -name 'libcublas*.so*' | while read -r so; do
+            cp -n "$so" "$dir/lib/"
+          done
+          tar czf "mettle-linux-amd64-cuda.tar.gz" "$dir"
+          sha256sum "mettle-linux-amd64-cuda.tar.gz" > "mettle-linux-amd64-cuda.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mettle-linux-amd64-cuda
+          path: |
+            mettle-linux-amd64-cuda.tar.gz
+            mettle-linux-amd64-cuda.tar.gz.sha256
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            mettle-linux-amd64-cuda.tar.gz
+            mettle-linux-amd64-cuda.tar.gz.sha256

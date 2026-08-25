@@ -1,0 +1,12 @@
+pub mod anthropic;
+pub mod engine;
+pub mod error;
+pub mod ocr;
+pub mod ollama_chat;
+pub mod ollama_embed;
+pub mod ollama_generate;
+pub mod ollama_manage;
+pub mod ollama_show;
+pub mod ollama_tags;
+pub mod openai;
+pub mod rag;
