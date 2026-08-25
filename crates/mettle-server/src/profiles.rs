@@ -1,0 +1,2121 @@
+//! Profile manager (agent-docs/profiles-contract.md): runtime-switchable,
+//! VRAM-aware model collections with graceful degradation.
+//!
+//! Owns three questions the routes ask:
+//! * **fit** — will a slot's weights + KV + compute buffers fit free VRAM?
+//!   Estimated from the GGUF header ([`mettle_llama::vram::estimate_vram`]),
+//!   corrected by post-load measurement persisted in `state.json`.
+//! * **degradation** — full ctx → halved ctx down to `min_ctx` → drop;
+//!   never silently, always as [`EngineEvent`]s.
+//! * **residency** — what is loaded, under which profile, and what happens
+//!   when a switch supersedes an in-flight one (generation counter).
+//!
+//! # Threading / locking
+//! `activate()` runs as a spawned task; every blocking `load_model` call is
+//! wrapped in `spawn_blocking`. Because the llama worker is a single thread
+//! (`LlamaBackend` is `!Send`, init-once), a model load blocks ALL
+//! generation — "activating" is a first-class visible state (`switching`,
+//! `SlotState::Loading`), and in-flight requests stall rather than fail.
+//!
+//! # Known limitation (accepted, documented)
+//! Supersede uses cooperative cancellation: each activation carries a
+//! generation number checked before every slot operation, and a late
+//! completing load rolls itself back. The residual race — an unload decided
+//! by generation N landing after generation N+1 re-targeted the same slot —
+//! is narrowed to a single blocking op wide and self-heals by
+//! re-activating the profile (status shows the slot Unloaded; `/v1`
+//! answers a clean structured 503). Single-user surface; not worth
+//! phase-serializing activations yet.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use mettle_core::config::{
+    ModelEntry, ModelRole, Placement, ProfileConfig, ProfileSlot, RootConfig,
+};
+use mettle_core::device::Device;
+use mettle_core::engine::{ModelLoadSpec, SlotLoadSpec};
+use mettle_core::model_registry::{LoaderKind, ModelRegistry, RegistryEntry};
+use mettle_llama::vram::estimate_vram;
+
+use crate::events::{EngineEvent, EventBus};
+use crate::llama_bridge;
+use crate::state::SharedEngine;
+
+/// Planner margin when `[engine] vram_margin_bytes` is unset: absorbs CUDA
+/// workspace/cuda-graph overhead the header estimate does not model plus
+/// other processes' usage. Measured gap on the reference card was ~850 MiB
+/// including those effects; 512 MiB + measurement reconciliation covers a
+/// single-user box.
+const DEFAULT_VRAM_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
+
+/// `state.json` schema version marker — bump when the meaning of a stored
+/// byte count changes. Entries carrying a different version are discarded.
+const STATE_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Idle time before an unpinned JIT slot is unloaded again (handoff §5;
+/// per-request TTL extension deliberately deferred).
+const JIT_TTL_SECS: u64 = 600;
+/// TTL sweep cadence.
+const SWEEP_INTERVAL_SECS: u64 = 30;
+
+/// Substrings identifying CUDA out-of-memory failures at decode time.
+/// Brittle by nature; kept in one place (profiles-contract.md §6) so the
+/// match list is auditable.
+const OOM_PATTERNS: &[&str] = &["out of memory", "cudaMalloc"];
+
+fn is_oom_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    OOM_PATTERNS.iter().any(|p| m.contains(p))
+}
+
+fn parse_role(s: &str) -> Option<ModelRole> {
+    match s {
+        "chat" => Some(ModelRole::Chat),
+        "embed" => Some(ModelRole::Embed),
+        "rerank" => Some(ModelRole::Rerank),
+        "ocr" => Some(ModelRole::Ocr),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared handles
+// ---------------------------------------------------------------------------
+
+/// Handles into [`crate::state::AppState`] internals the manager needs.
+/// Passed separately (instead of `Weak<AppState>`) so there is no
+/// manager ↔ state reference cycle.
+#[derive(Clone)]
+pub struct ProfileDeps {
+    pub engine: Arc<std::sync::RwLock<Option<SharedEngine>>>,
+    pub registry: Arc<std::sync::RwLock<ModelRegistry>>,
+    pub loaded_models: Arc<Mutex<Vec<String>>>,
+}
+
+// ---------------------------------------------------------------------------
+// Slot state + persisted measurements
+// ---------------------------------------------------------------------------
+
+/// Runtime residency of one catalog model.
+#[derive(Debug, Clone)]
+pub enum SlotState {
+    Unloaded,
+    Loading,
+    Loaded {
+        ctx: u32,
+        /// Planner estimate for THIS load's context (None for CPU slots,
+        /// which are not budgeted against VRAM).
+        estimated_bytes: Option<u64>,
+        /// Post-load device-memory delta, when a device was reachable.
+        measured_bytes: Option<u64>,
+        shrunk: bool,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+impl SlotState {
+    /// Wire label for `/engine/status` (`loading/loaded/unloaded/failed`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unloaded => "unloaded",
+            Self::Loading => "loading",
+            Self::Loaded { .. } => "loaded",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// One persisted post-load measurement (`state.json`, XDG data dir). Stale
+/// entries (different engine version or GGUF mtime) are discarded on use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MeasuredEntry {
+    pub bytes: u64,
+    /// Context the measurement was taken at (the KV slope lets a fresh
+    /// measurement project to other contexts).
+    pub ctx: u32,
+    pub engine_version: String,
+    pub gguf_mtime_secs: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedState {
+    active_profile: Option<String>,
+    #[serde(default)]
+    measured: HashMap<String, MeasuredEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Fit model
+// ---------------------------------------------------------------------------
+
+/// Cost of a slot as `(anchor bytes at anchor ctx) + kv slope`. Both the
+/// header estimate (anchor = weights + compute @ full ctx) and a fresh
+/// measurement (anchor = measured total @ its ctx) project through the same
+/// formula, so the ladder logic is identical either way.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotCost {
+    pub anchor_bytes: u64,
+    pub anchor_ctx: u32,
+    pub kv_per_token: u64,
+}
+
+impl SlotCost {
+    /// Projected cost at `ctx` (saturating — never negative).
+    pub fn at(&self, ctx: u32) -> u64 {
+        let delta = i128::from(ctx) - i128::from(self.anchor_ctx);
+        let total = i128::from(self.anchor_bytes) + delta * i128::from(self.kv_per_token);
+        u64::try_from(total.max(0)).unwrap_or(u64::MAX)
+    }
+}
+
+/// Context sizes the degradation ladder walks: full, then halves, clamped
+/// to end exactly at `min_ctx`. Empty tail when `min_ctx` is unset or ≥
+/// full (a `min_ctx` above the full context cannot rescue a full-context
+/// failure — shrinking past it is meaningless).
+fn ctx_rungs(full: u32, min_ctx: Option<u32>) -> Vec<u32> {
+    let mut rungs = vec![full];
+    if let Some(floor) = min_ctx.filter(|m| *m < full) {
+        let mut cur = full;
+        while cur > floor {
+            let next = (cur / 2).max(floor);
+            if *rungs.last().unwrap() == next {
+                break;
+            }
+            rungs.push(next);
+            cur = next;
+        }
+    }
+    rungs
+}
+
+/// Pure planner decision: the largest rung whose projected cost fits
+/// `budget`, or `None` when the slot must be dropped. Used by the JIT
+/// admission check and the `/engine/profiles` fit preview; activation walks
+/// the same rungs but retries smaller ones after real load errors.
+fn pick_ctx(cost: &SlotCost, budget: u64, full: u32, min_ctx: Option<u32>) -> Option<(u32, bool)> {
+    // Rungs descend from full; the first fitting rung is the largest
+    // context that fits.
+    ctx_rungs(full, min_ctx)
+        .into_iter()
+        .find(|&ctx| cost.at(ctx) <= budget)
+        .map(|ctx| (ctx, ctx != full))
+}
+
+// ---------------------------------------------------------------------------
+// Manager
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct Inner {
+    active: Option<String>,
+    slots: HashMap<String, SlotState>,
+    dropped: Vec<String>,
+    shrunk: Vec<String>,
+}
+
+pub struct ProfileManager {
+    deps: ProfileDeps,
+    config: RootConfig,
+    events: Arc<EventBus>,
+    device: Option<Box<dyn Device>>,
+    inner: Mutex<Inner>,
+    measured: Mutex<HashMap<String, MeasuredEntry>>,
+    /// JIT-slot activity timestamps for the TTL sweeper (task 5 of the
+    /// handoff; recorded here from `touch()`).
+    last_used: Mutex<HashMap<String, Instant>>,
+    /// Activation generation: bumped by every `activate()`; a run observing
+    /// a foreign generation stops touching the world.
+    generation: AtomicU64,
+    switching: AtomicBool,
+    /// Set while a runtime-OOM eviction is in flight; concurrent OOM
+    /// reports collapse into the first attempt.
+    recovering: AtomicBool,
+    state_path: PathBuf,
+}
+
+impl ProfileManager {
+    pub fn new(
+        deps: ProfileDeps,
+        config: RootConfig,
+        events: Arc<EventBus>,
+        state_path: PathBuf,
+    ) -> Self {
+        let device = mettle_core::device::detect();
+        Self {
+            deps,
+            config,
+            events,
+            device,
+            inner: Mutex::new(Inner {
+                active: None,
+                slots: HashMap::new(),
+                dropped: Vec::new(),
+                shrunk: Vec::new(),
+            }),
+            measured: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(1),
+            last_used: Mutex::new(HashMap::new()),
+            switching: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
+            state_path,
+        }
+    }
+
+    // -- configuration accessors ------------------------------------------
+
+    fn profile(&self, name: &str) -> Option<ProfileConfig> {
+        self.config.profile.iter().find(|p| p.name == name).cloned()
+    }
+
+    /// Does `name` name a configured profile? Route-level 404 check
+    /// (before a generation bump).
+    pub fn profile_exists(&self, name: &str) -> bool {
+        self.profile(name).is_some()
+    }
+
+    fn catalog_entry(&self, id: &str) -> Option<ModelEntry> {
+        self.config.model.iter().find(|m| m.id == id).cloned()
+    }
+
+    fn full_ctx(&self) -> u32 {
+        self.config.engine.n_ctx.unwrap_or(8192)
+    }
+
+    fn margin_bytes(&self) -> u64 {
+        self.config
+            .engine
+            .vram_margin_bytes
+            .unwrap_or(DEFAULT_VRAM_MARGIN_BYTES)
+    }
+
+    fn kv_q8(&self) -> bool {
+        matches!(
+            self.config.engine.kv_cache,
+            mettle_core::config::KVCacheSetting::Fp8
+        )
+    }
+
+    fn n_seq_max(&self) -> usize {
+        self.config.engine.max_concurrent_seqs
+    }
+
+    fn stale(&self, gen: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) != gen
+    }
+
+    fn switching(&self) -> bool {
+        self.switching.load(Ordering::SeqCst)
+    }
+
+    /// Effective role: explicit catalog value wins, else inferred from the
+    /// loader kind (GGUF→chat, vision→ocr, embedding→embed, rerank→rerank).
+    fn effective_role(&self, id: &str) -> ModelRole {
+        let catalog = self.catalog_entry(id);
+        if let Some(role) = catalog.as_ref().and_then(|m| m.role) {
+            return role;
+        }
+        let reg = self.deps.registry.read().ok();
+        let kind = reg
+            .as_ref()
+            .and_then(|r| r.resolve(id).ok())
+            .map(|e| e.loader_kind.clone());
+        match kind {
+            Some(LoaderKind::Embedding { .. }) => ModelRole::Embed,
+            Some(LoaderKind::Rerank { .. }) => ModelRole::Rerank,
+            Some(LoaderKind::GgufVision { .. }) => ModelRole::Ocr,
+            _ => ModelRole::Chat,
+        }
+    }
+
+    // -- fit --------------------------------------------------------------
+
+    /// Drafter wiring for a chat slot: an explicit catalog `draft` wins
+    /// (standard draft); otherwise the implicit same-size gemma4 `-mtp`
+    /// drafter preserves today's boot-time MTP behavior.
+    fn draft_wiring(&self, reg_entry: &RegistryEntry) -> Option<ModelLoadSpec> {
+        if let Some(draft_id) = self.catalog_entry(&reg_entry.alias).and_then(|m| m.draft) {
+            let reg = self.deps.registry.read().ok()?;
+            if let Ok(drafter) = reg.resolve(&draft_id) {
+                return llama_bridge::load_spec_for_route(&drafter).ok();
+            }
+            return None;
+        }
+        let reg = self.deps.registry.read().ok()?;
+        let drafter = llama_bridge::resolve_mtp_drafter(&reg, reg_entry)?;
+        llama_bridge::load_spec_for_route(&drafter).ok()
+    }
+
+    /// Whether `wiring` rides as MTP (own full-size KV → scales with the
+    /// target's ctx) or as a standard drafter (short contexts → constant).
+    fn wiring_is_mtp(&self, reg_entry: &RegistryEntry, wiring: &ModelLoadSpec) -> bool {
+        if let Some(draft_id) = self.catalog_entry(&reg_entry.alias).and_then(|m| m.draft) {
+            let _ = draft_id;
+            return false; // explicit catalog draft: standard drafting
+        }
+        let reg = match self.deps.registry.read() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        llama_bridge::resolve_mtp_drafter(&reg, reg_entry).is_some_and(|d| d.alias == wiring.alias)
+    }
+
+    /// Header-derived fit model for a slot (weights + mmproj + drafters +
+    /// KV slope + compute heuristic). `None` when the GGUF is unreadable or
+    /// lacks geometry keys — the slot is then unloadable (GPU-or-refuse
+    /// cannot verify fit).
+    fn estimate_cost(&self, reg_entry: &RegistryEntry) -> Option<SlotCost> {
+        let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
+        let est = estimate_vram(&gguf, self.full_ctx(), self.kv_q8(), self.n_seq_max())?;
+
+        let mut anchor = est.weights_bytes + est.compute_bytes;
+        let mut slope = est.kv_bytes_per_token;
+        if let Some(mmproj) = llama_bridge::resolve_mmproj_path(reg_entry) {
+            anchor += std::fs::metadata(mmproj).map(|m| m.len()).unwrap_or(0);
+        }
+        if let Some(wiring) = self.draft_wiring(reg_entry) {
+            if let Some(d_est) = estimate_vram(
+                &wiring.gguf_path,
+                self.full_ctx(),
+                self.kv_q8(),
+                self.n_seq_max(),
+            ) {
+                anchor += d_est.weights_bytes + d_est.compute_bytes;
+                if self.wiring_is_mtp(reg_entry, &wiring) {
+                    slope += d_est.kv_bytes_per_token;
+                } else {
+                    // standard drafter: short-context KV, treat as constant
+                    anchor += d_est.kv_bytes_per_token * 1024;
+                }
+            }
+        }
+
+        Some(SlotCost {
+            anchor_bytes: anchor + slope * u64::from(self.full_ctx()),
+            anchor_ctx: self.full_ctx(),
+            kv_per_token: slope,
+        })
+    }
+
+    /// Fresh persisted measurement for this exact binary + file, projected
+    /// through the header KV slope. `None` = stale/absent → use the header
+    /// estimate.
+    fn measured_cost(&self, id: &str, reg_entry: &RegistryEntry) -> Option<SlotCost> {
+        let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
+        let mtime = gguf_mtime_secs(&gguf)?;
+        let measured = self.measured.lock().ok()?;
+        let m = measured.get(id)?;
+        if m.engine_version != STATE_ENGINE_VERSION || m.gguf_mtime_secs != mtime {
+            return None;
+        }
+        // Slope comes from the header when it is readable (measurements
+        // don't change it); a measurement without a header projects flat.
+        let kv_per_token = estimate_vram(&gguf, self.full_ctx(), self.kv_q8(), self.n_seq_max())
+            .map(|e| e.kv_bytes_per_token)
+            .unwrap_or(0);
+        Some(SlotCost {
+            anchor_bytes: m.bytes,
+            anchor_ctx: m.ctx,
+            kv_per_token,
+        })
+    }
+
+    fn slot_cost(&self, reg_entry: &RegistryEntry) -> Option<SlotCost> {
+        self.measured_cost(&reg_entry.alias, reg_entry)
+            .or_else(|| self.estimate_cost(reg_entry))
+    }
+
+    // -- engine plumbing ----------------------------------------------------
+
+    fn engine_handle(&self) -> Result<SharedEngine, String> {
+        self.deps
+            .engine
+            .read()
+            .expect("engine lock poisoned")
+            .clone()
+            .ok_or_else(|| "engine not initialised".to_string())
+    }
+
+    async fn load_via_engine(&self, spec: SlotLoadSpec) -> Result<(), String> {
+        let engine = self.engine_handle()?;
+        tokio::task::spawn_blocking(move || engine.load_slot(spec).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| format!("load task panicked: {e}"))?
+    }
+
+    async fn unload_via_engine(&self, alias: &str) -> Result<(), String> {
+        let engine = self.engine_handle()?;
+        let alias = alias.to_string();
+        tokio::task::spawn_blocking(move || engine.remove_model(&alias).map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| format!("unload task panicked: {e}"))?
+    }
+
+    fn remember_loaded(&self, alias: &str) {
+        if let Ok(mut l) = self.deps.loaded_models.lock() {
+            if !l.iter().any(|a| a == alias) {
+                l.push(alias.to_string());
+            }
+        }
+    }
+
+    fn remember_unloaded(&self, alias: &str) {
+        if let Ok(mut l) = self.deps.loaded_models.lock() {
+            l.retain(|a| a != alias);
+        }
+    }
+
+    fn set_slot(&self, id: &str, state: SlotState) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.slots.insert(id.to_string(), state);
+        }
+    }
+
+    /// Build the full load instruction for one slot: placement-forced
+    /// offload, drafter wiring, ctx override.
+    fn slot_spec(
+        &self,
+        reg_entry: &RegistryEntry,
+        placement: Placement,
+        n_ctx: Option<u32>,
+    ) -> Result<SlotLoadSpec, String> {
+        let mut model = llama_bridge::load_spec_for_route(reg_entry)?;
+        // Placement is the only offload knob (profiles-contract.md).
+        model.n_gpu_layers = Some(match placement {
+            Placement::Gpu => 999,
+            Placement::Cpu => 0,
+        });
+        let wiring = self.draft_wiring(reg_entry);
+        let (mtp_draft, draft) =
+            if wiring.is_some() && self.wiring_is_mtp(reg_entry, wiring.as_ref().unwrap()) {
+                (wiring, None)
+            } else {
+                (None, wiring)
+            };
+        Ok(SlotLoadSpec {
+            model,
+            mtp_draft,
+            draft,
+            n_ctx,
+        })
+    }
+
+    // -- activation ---------------------------------------------------------
+
+    /// Boot-time re-activation: load `state.json`; if it names a profile
+    /// that still exists, activate it (degradation applies — VRAM may have
+    /// changed across restarts). Otherwise the engine idles.
+    pub async fn boot_activate(self: Arc<Self>) {
+        match self.load_persisted_active() {
+            Some(name) => {
+                tracing::info!("re-activating persisted profile '{name}'");
+                if let Err(e) = Arc::clone(&self).activate(name).await {
+                    tracing::warn!("boot activation failed: {e}");
+                }
+            }
+            None => {
+                tracing::info!("no active profile persisted; engine idles until one is activated");
+            }
+        }
+    }
+
+    fn load_persisted_active(&self) -> Option<String> {
+        let bytes = std::fs::read(&self.state_path).ok()?;
+        let state: PersistedState = serde_json::from_slice(&bytes).ok()?;
+        // Refresh the measured cache with non-stale entries.
+        if let Ok(mut measured) = self.measured.lock() {
+            for (id, entry) in state.measured {
+                if entry.engine_version == STATE_ENGINE_VERSION {
+                    measured.insert(id, entry);
+                }
+            }
+        }
+        let active = state.active_profile?;
+        self.profile(&active).is_some().then_some(active)
+    }
+
+    fn persist_state(&self) {
+        let payload = {
+            let inner = match self.inner.lock() {
+                Ok(i) => i,
+                Err(_) => return,
+            };
+            let measured = match self.measured.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            PersistedState {
+                active_profile: inner.active.clone(),
+                measured: measured.clone(),
+            }
+        };
+        let tmp = self.state_path.with_extension("json.tmp");
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = self.state_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&tmp, serde_json::to_vec(&payload).unwrap_or_default())?;
+            std::fs::rename(&tmp, &self.state_path)
+        };
+        if let Err(e) = write() {
+            tracing::warn!("failed to persist engine state: {e}");
+        }
+    }
+
+    /// Activate `name`: diff-and-unload, then load target slots by
+    /// priority through the degradation ladder. Completion is announced by
+    /// events (`profile.active` / `profile.degraded`); the returned Result
+    /// is for the caller's logs.
+    pub async fn activate(self: Arc<Self>, name: String) -> Result<(), String> {
+        let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.switching.store(true, Ordering::SeqCst);
+        self.events
+            .emit(EngineEvent::ProfileActivating { name: name.clone() });
+
+        let result = self.run_activation(&name, my_gen).await;
+
+        // Only the newest run owns the switching flag.
+        if self.generation.load(Ordering::SeqCst) == my_gen {
+            self.switching.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn run_activation(&self, name: &str, my_gen: u64) -> Result<(), String> {
+        let Some(profile) = self.profile(name) else {
+            return Err(format!("unknown profile '{name}'"));
+        };
+
+        // Highest priority first; unprioritized slots follow in declaration
+        // order (stable sort — config.rs documents the semantics).
+        let mut targets: Vec<(usize, &ProfileSlot)> = profile.slots.iter().enumerate().collect();
+        targets.sort_by_key(|(i, s)| (s.priority.unwrap_or(u32::MAX), *i));
+
+        // 1. Diff: unload everything resident that the target doesn't name.
+        let target_ids: HashSet<&str> = profile.slots.iter().map(|s| s.id.as_str()).collect();
+        let resident: Vec<String> = match self.inner.lock() {
+            Ok(inner) => inner
+                .slots
+                .iter()
+                .filter(|(_, st)| matches!(st, SlotState::Loaded { .. } | SlotState::Loading))
+                .map(|(id, _)| id.clone())
+                .collect(),
+            Err(_) => return Err("slot state poisoned".into()),
+        };
+        for id in resident {
+            if self.stale(my_gen) {
+                return Ok(()); // superseded; the newer run diffs from scratch
+            }
+            if target_ids.contains(id.as_str()) {
+                continue; // overlapping models stay resident
+            }
+            match self.unload_via_engine(&id).await {
+                Ok(()) => {
+                    self.set_slot(&id, SlotState::Unloaded);
+                    self.remember_unloaded(&id);
+                    self.events.emit(EngineEvent::SlotUnloaded { id });
+                }
+                Err(e) => tracing::warn!("unload '{id}' failed during switch: {e}"),
+            }
+        }
+
+        // 2. Load target slots in priority order through the ladder.
+        let mut loaded_any = false;
+        let mut dropped: Vec<String> = Vec::new();
+        let mut shrunk: Vec<String> = Vec::new();
+        let mut refusal: Option<String> = None;
+
+        for (idx, (_, slot)) in targets.iter().enumerate() {
+            if self.stale(my_gen) {
+                return Ok(());
+            }
+            if matches!(
+                self.inner
+                    .lock()
+                    .ok()
+                    .and_then(|i| i.slots.get(&slot.id).cloned()),
+                Some(SlotState::Loaded { .. })
+            ) {
+                loaded_any = true; // overlap: already resident
+                continue;
+            }
+            match self
+                .load_through_ladder(&slot.id, slot.placement, my_gen)
+                .await
+            {
+                LadderOutcome::Loaded { shrunk: was_shrunk } => {
+                    loaded_any = true;
+                    if was_shrunk {
+                        shrunk.push(slot.id.clone());
+                    }
+                }
+                LadderOutcome::Dropped(reason) => {
+                    dropped.push(slot.id.clone());
+                    // First slot refused ⇒ refuse the whole activation
+                    // (profiles-contract.md); current state stands.
+                    if idx == 0 && !loaded_any {
+                        refusal = Some(reason);
+                        break;
+                    }
+                }
+                LadderOutcome::Aborted => return Ok(()),
+            }
+        }
+
+        if let Some(reason) = refusal {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.dropped = profile.slots.iter().map(|s| s.id.clone()).collect();
+                inner.shrunk.clear();
+            }
+            self.events.emit(EngineEvent::ProfileDegraded {
+                name: name.to_string(),
+                dropped: profile.slots.iter().map(|s| s.id.clone()).collect(),
+                shrunk: Vec::new(),
+                reason: reason.clone(),
+            });
+            return Err(format!("activation of '{name}' refused: {reason}"));
+        }
+
+        // 3. Commit.
+        if self.stale(my_gen) {
+            return Ok(());
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.active = Some(name.to_string());
+            inner.dropped = dropped.clone();
+            inner.shrunk = shrunk.clone();
+        }
+        self.persist_state();
+
+        if !dropped.is_empty() || !shrunk.is_empty() {
+            self.events.emit(EngineEvent::ProfileDegraded {
+                name: name.to_string(),
+                dropped: dropped.clone(),
+                shrunk: shrunk.clone(),
+                reason: "vram".into(),
+            });
+        }
+        self.events.emit(EngineEvent::ProfileActive {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// The per-slot degradation ladder: full ctx → halved ctx down to
+    /// `min_ctx` → drop. CPU slots bypass the VRAM ladder entirely (config
+    /// intent, loaded unconditionally from RAM).
+    async fn load_through_ladder(
+        &self,
+        id: &str,
+        placement: Option<Placement>,
+        my_gen: u64,
+    ) -> LadderOutcome {
+        let placement = placement.unwrap_or(Placement::Gpu);
+        self.set_slot(id, SlotState::Loading);
+
+        let Some(catalog) = self.catalog_entry(id) else {
+            let reason = format!("model '{id}' is not in the catalog");
+            self.fail_slot(id, &reason);
+            return LadderOutcome::Dropped(reason);
+        };
+        let reg_entry = match self.deps.registry.read() {
+            Ok(reg) => reg.resolve(id).cloned().map_err(|e| e.to_string()),
+            Err(_) => Err("registry lock poisoned".into()),
+        };
+        let reg_entry = match reg_entry {
+            Ok(e) => e,
+            Err(reason) => {
+                self.fail_slot(id, &reason);
+                return LadderOutcome::Dropped(reason);
+            }
+        };
+
+        if placement == Placement::Cpu {
+            // CPU residency is config intent, never a recovery move: no
+            // budget check, no shrink ladder.
+            let spec = match self.slot_spec(&reg_entry, Placement::Cpu, None) {
+                Ok(s) => s,
+                Err(reason) => {
+                    self.fail_slot(id, &reason);
+                    return LadderOutcome::Dropped(reason);
+                }
+            };
+            match self.load_via_engine(spec).await {
+                Ok(()) => {
+                    self.record_load_success(id, self.full_ctx(), None, None, false);
+                    return LadderOutcome::Loaded { shrunk: false };
+                }
+                Err(reason) => {
+                    self.fail_slot(id, &reason);
+                    return LadderOutcome::Dropped(reason);
+                }
+            }
+        }
+
+        // GPU path: budget = free − margin (fresh snapshot per slot).
+        let Some(device) = self.device.as_ref() else {
+            let reason = "no accelerator detected (GPU-or-refuse)".to_string();
+            self.fail_slot(id, &reason);
+            return LadderOutcome::Dropped(reason);
+        };
+        device.clear_cache();
+        let Some(mem_before) = device.memory() else {
+            let reason = "accelerator unreachable".to_string();
+            self.fail_slot(id, &reason);
+            return LadderOutcome::Dropped(reason);
+        };
+        let budget = mem_before.free_bytes.saturating_sub(self.margin_bytes());
+
+        let Some(cost) = self.slot_cost(&reg_entry) else {
+            let reason = format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
+            self.fail_slot(id, &reason);
+            return LadderOutcome::Dropped(reason);
+        };
+
+        let gguf_for_measure = llama_bridge::resolve_gguf_path(&reg_entry).ok();
+        // Fast planner pass: when no rung fits even on paper, refuse the
+        // slot without a doomed cudaMalloc round-trip.
+        if pick_ctx(&cost, budget, self.full_ctx(), catalog.min_ctx).is_none() {
+            let reason = format!(
+                "'{}' needs {} bytes at full ctx, {} free after margin (no rung fits)",
+                id,
+                cost.at(self.full_ctx()),
+                budget
+            );
+            self.fail_slot(id, &reason);
+            return LadderOutcome::Dropped(reason);
+        }
+        for (rung_idx, ctx) in ctx_rungs(self.full_ctx(), catalog.min_ctx)
+            .into_iter()
+            .enumerate()
+        {
+            if self.stale(my_gen) {
+                return LadderOutcome::Aborted;
+            }
+            let projected = cost.at(ctx);
+            if projected > budget {
+                continue; // planner filter: this rung cannot fit
+            }
+            let shrunk = rung_idx > 0 || ctx != self.full_ctx();
+            let spec = match self.slot_spec(&reg_entry, Placement::Gpu, Some(ctx)) {
+                Ok(s) => s,
+                Err(reason) => {
+                    self.fail_slot(id, &reason);
+                    return LadderOutcome::Dropped(reason);
+                }
+            };
+            match self.load_via_engine(spec).await {
+                Ok(()) => {
+                    if self.stale(my_gen) {
+                        // Late finish after a supersede: the load is REAL —
+                        // record it so residency views stay truthful. A
+                        // slot the newer profile never wanted becomes a
+                        // visible non-pinned resident (the TTL sweeper /
+                        // next activation diff cleans it up).
+                        self.record_load_success(id, ctx, Some(projected), None, shrunk);
+                        return LadderOutcome::Aborted;
+                    }
+                    let measured = device.memory().and_then(|after| {
+                        let delta =
+                            i128::from(mem_before.free_bytes) - i128::from(after.free_bytes);
+                        u64::try_from(delta.max(0)).ok()
+                    });
+                    if let (Some(bytes), Some(gguf)) = (measured, gguf_for_measure.as_ref()) {
+                        if let Some(mtime) = gguf_mtime_secs(gguf) {
+                            if let Ok(mut store) = self.measured.lock() {
+                                store.insert(
+                                    id.to_string(),
+                                    MeasuredEntry {
+                                        bytes,
+                                        ctx,
+                                        engine_version: STATE_ENGINE_VERSION.into(),
+                                        gguf_mtime_secs: mtime,
+                                    },
+                                );
+                            }
+                            self.persist_state();
+                        }
+                    }
+                    if let Some(after) = device.memory() {
+                        if after.free_bytes < self.margin_bytes() {
+                            self.events.emit(EngineEvent::VramPressure {
+                                free_bytes: after.free_bytes,
+                            });
+                        }
+                    }
+                    self.record_load_success(id, ctx, Some(projected), measured, shrunk);
+                    return LadderOutcome::Loaded { shrunk };
+                }
+                // Load-time OOM (cudaMalloc) lands here: slide down the
+                // ladder rather than giving up on the slot.
+                Err(reason) => {
+                    tracing::warn!("load '{id}' at ctx={ctx} failed: {reason}");
+                }
+            }
+        }
+
+        let reason = format!(
+            "'{}' needs {} bytes at full ctx, {} free after margin (all rungs failed)",
+            id,
+            cost.at(self.full_ctx()),
+            budget
+        );
+        self.fail_slot(id, &reason);
+        LadderOutcome::Dropped(reason)
+    }
+
+    fn record_load_success(
+        &self,
+        id: &str,
+        ctx: u32,
+        estimated_bytes: Option<u64>,
+        measured_bytes: Option<u64>,
+        shrunk: bool,
+    ) {
+        self.set_slot(
+            id,
+            SlotState::Loaded {
+                ctx,
+                estimated_bytes,
+                measured_bytes,
+                shrunk,
+            },
+        );
+        self.remember_loaded(id);
+        self.touch(id);
+        self.events
+            .emit(EngineEvent::SlotLoaded { id: id.to_string() });
+    }
+
+    fn fail_slot(&self, id: &str, reason: &str) {
+        self.set_slot(
+            id,
+            SlotState::Failed {
+                reason: reason.to_string(),
+            },
+        );
+        self.remember_unloaded(id);
+        self.events.emit(EngineEvent::SlotFailed {
+            id: id.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    // -- JIT slots -----------------------------------------------------------
+
+    /// Load a catalog model OUTSIDE the active profile. Must fit free VRAM
+    /// without evicting anything; never touches pinned members.
+    pub async fn jit_load(&self, id: &str) -> Result<(), SlotOpError> {
+        if self.is_pinned(id) {
+            return Err(SlotOpError::Pinned);
+        }
+        if self.switching() {
+            return Err(SlotOpError::SwitchInProgress);
+        }
+        if matches!(
+            self.inner
+                .lock()
+                .ok()
+                .and_then(|i| i.slots.get(id).cloned()),
+            Some(SlotState::Loaded { .. }) | Some(SlotState::Loading)
+        ) {
+            return Err(SlotOpError::AlreadyResident);
+        }
+
+        // The registry is the loadable universe (user catalog entries plus
+        // built-ins); a JIT slot need not appear in any [[profile]] or even
+        // in `config.model`.
+        let reg_entry = {
+            let reg = self
+                .deps
+                .registry
+                .read()
+                .map_err(|_| SlotOpError::LoadFailed("registry lock poisoned".into()))?;
+            match reg.resolve(id).cloned() {
+                Ok(entry) => entry,
+                Err(_) => return Err(SlotOpError::UnknownModel),
+            }
+        };
+
+        // JIT is a GPU operation (placement is profile intent; these slots
+        // have no profile).
+        let Some(device) = self.device.as_ref() else {
+            return Err(SlotOpError::Vram("no accelerator detected".into()));
+        };
+        device.clear_cache();
+        let mem = device
+            .memory()
+            .ok_or_else(|| SlotOpError::Vram("accelerator unreachable".into()))?;
+        let budget = mem.free_bytes.saturating_sub(self.margin_bytes());
+
+        let cost = self.slot_cost(&reg_entry).ok_or_else(|| {
+            SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into())
+        })?;
+        let full = self.full_ctx();
+        let needed = cost.at(full);
+        if needed > budget {
+            return Err(SlotOpError::Vram(format!(
+                "'{id}' needs {needed} bytes, {budget} available after margin"
+            )));
+        }
+
+        self.set_slot(id, SlotState::Loading);
+        let spec = self
+            .slot_spec(&reg_entry, Placement::Gpu, None)
+            .map_err(SlotOpError::LoadFailed)?;
+        match self.load_via_engine(spec).await {
+            Ok(()) => {
+                self.record_load_success(id, full, Some(needed), None, false);
+                Ok(())
+            }
+            Err(reason) => {
+                self.fail_slot(id, &reason);
+                Err(SlotOpError::LoadFailed(reason))
+            }
+        }
+    }
+
+    /// Unload a JIT slot. Pinned members refuse (409 upstream).
+    pub async fn jit_unload(&self, id: &str) -> Result<(), SlotOpError> {
+        let known = self
+            .deps
+            .registry
+            .read()
+            .map(|reg| reg.resolve(id).is_ok())
+            .unwrap_or(false);
+        if !known {
+            return Err(SlotOpError::UnknownModel);
+        }
+        if self.is_pinned(id) {
+            return Err(SlotOpError::Pinned);
+        }
+        if self.switching() {
+            return Err(SlotOpError::SwitchInProgress);
+        }
+        let resident = matches!(
+            self.inner
+                .lock()
+                .ok()
+                .and_then(|i| i.slots.get(id).cloned()),
+            Some(SlotState::Loaded { .. }) | Some(SlotState::Loading)
+        );
+        if !resident {
+            return Err(SlotOpError::NotResident);
+        }
+        self.unload_via_engine(id)
+            .await
+            .map_err(SlotOpError::LoadFailed)?;
+        self.set_slot(id, SlotState::Unloaded);
+        self.remember_unloaded(id);
+        self.events
+            .emit(EngineEvent::SlotUnloaded { id: id.to_string() });
+        Ok(())
+    }
+
+    /// Is `id` a member of the currently active profile?
+    fn is_pinned(&self, id: &str) -> bool {
+        let active = self.inner.lock().ok().and_then(|i| i.active.clone());
+        active
+            .and_then(|name| self.profile(&name))
+            .is_some_and(|p| p.slots.iter().any(|s| s.id == id))
+    }
+
+    /// Request-resolution touch point for the future JIT TTL sweeper.
+    pub fn touch(&self, id: &str) {
+        if let Ok(mut lu) = self.last_used.lock() {
+            lu.insert(id.to_string(), Instant::now());
+        }
+    }
+
+    // -- /v1 role aliases ----------------------------------------------------
+
+    /// `"role:<name>"` → the active profile's highest-priority slot serving
+    /// that role. Anything else — including an unresolvable role name —
+    /// passes through unchanged, so explicit ids keep working verbatim.
+    pub fn resolve_alias(&self, name: &str) -> String {
+        let Some(role_name) = name.strip_prefix("role:") else {
+            return name.to_string();
+        };
+        let Some(role) = parse_role(role_name) else {
+            return name.to_string();
+        };
+        self.resolve_role_slot(role)
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Highest-priority resident-slot candidate for `role`: same ordering
+    /// semantics as activation (priority first, declaration order breaking
+    /// ties). Membership in the ACTIVE profile is what counts — residency
+    /// is checked separately by availability.
+    fn resolve_role_slot(&self, role: ModelRole) -> Option<String> {
+        let active = self.inner.lock().ok()?.active.clone()?;
+        let profile = self.profile(&active)?;
+        let mut ordered: Vec<&ProfileSlot> = profile.slots.iter().collect();
+        ordered.sort_by_key(|s| s.priority.unwrap_or(u32::MAX)); // stable ⇒ declaration tiebreak
+        ordered
+            .into_iter()
+            .find(|s| self.effective_role(&s.id) == role)
+            .map(|s| s.id.clone())
+    }
+
+    // -- /v1 structured unavailability ---------------------------------------
+
+    /// Wire payload for a registry-known model that cannot serve right now:
+    /// dropped/unloaded JIT slot, failed load, or nothing resident at all.
+    /// `profile_degraded` reflects whether the CURRENT session degraded a
+    /// profile (dropped/shrunk slots); consumers surface the reason instead
+    /// of retrying blindly.
+    pub fn slot_unavailable_payload(&self, id: &str) -> serde_json::Value {
+        let (dropped, shrunk) = self
+            .inner
+            .lock()
+            .map(|i| (i.dropped.clone(), i.shrunk.clone()))
+            .unwrap_or_default();
+        serde_json::json!({
+            "error": {
+                "code": "slot_unavailable",
+                "reason": "vram",
+                "profile_degraded": !dropped.is_empty() || !shrunk.is_empty(),
+                "missing": [id],
+            }
+        })
+    }
+
+    /// VRAM footprint for `/v1/models`: a fresh measurement wins over the
+    /// planner estimate; non-resident models report the header estimate and
+    /// CPU-resident or in-flight slots report nothing.
+    pub fn vram_bytes(&self, id: &str) -> Option<u64> {
+        if let Ok(inner) = self.inner.lock() {
+            match inner.slots.get(id) {
+                Some(SlotState::Loaded {
+                    estimated_bytes,
+                    measured_bytes,
+                    ..
+                }) => return measured_bytes.or(*estimated_bytes),
+                Some(SlotState::Loading) | Some(SlotState::Failed { .. }) => return None,
+                _ => {}
+            }
+        }
+        let entry = self
+            .deps
+            .registry
+            .read()
+            .ok()
+            .and_then(|reg| reg.resolve(id).ok().cloned())?;
+        self.slot_cost(&entry).map(|c| c.at(self.full_ctx()))
+    }
+
+    // -- JIT TTL sweeper -------------------------------------------------------
+
+    /// Background loop unloading unpinned JIT slots idle beyond
+    /// [`JIT_TTL_SECS`]. Spawned once at boot.
+    pub async fn ttl_sweeper_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            self.sweep_jit_slots().await;
+        }
+    }
+
+    /// Unload every resident non-profile slot whose last use predates the
+    /// TTL. Pinned members are never touched; a switch in flight defers the
+    /// whole sweep to the next tick.
+    async fn sweep_jit_slots(&self) {
+        if self.switching() {
+            return;
+        }
+        let deadline = Instant::now() - Duration::from_secs(JIT_TTL_SECS);
+        let pinned: HashSet<String> = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|i| i.active.clone())
+            .and_then(|name| self.profile(&name))
+            .map(|p| p.slots.iter().map(|s| s.id.clone()).collect())
+            .unwrap_or_default();
+        let expired: Vec<String> = {
+            let inner = match self.inner.lock() {
+                Ok(i) => i,
+                Err(_) => return,
+            };
+            let lu = match self.last_used.lock() {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            inner
+                .slots
+                .iter()
+                .filter(|(id, st)| {
+                    matches!(st, SlotState::Loaded { .. })
+                        && !pinned.contains(*id)
+                        && lu.get(*id).is_none_or(|t| *t < deadline)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in expired {
+            if self.switching() {
+                return; // superseded mid-sweep; next tick re-derives
+            }
+            match self.unload_via_engine(&id).await {
+                Ok(()) => {
+                    self.set_slot(&id, SlotState::Unloaded);
+                    self.remember_unloaded(&id);
+                    self.events.emit(EngineEvent::SlotUnloaded { id });
+                }
+                Err(e) => tracing::warn!("TTL unload '{id}' failed: {e}"),
+            }
+        }
+    }
+
+    // -- runtime OOM recovery ---------------------------------------------------
+
+    /// Decode-error funnel (`profiles-contract.md` §6): cheap sync pattern
+    /// check on the hot path; actual recovery runs as its own task. Safe to
+    /// call with any error text — non-OOM messages are ignored.
+    pub fn note_runtime_failure(self: &Arc<Self>, failing_alias: &str, msg: &str) {
+        if !is_oom_error(msg) {
+            return;
+        }
+        tracing::warn!("CUDA OOM while serving '{failing_alias}'; recovering");
+        let this = self.clone();
+        let failing = failing_alias.to_string();
+        tokio::spawn(this.on_runtime_oom(failing));
+    }
+
+    /// One OOM recovery attempt: evict exactly one slot — preferring idle
+    /// JIT residents (oldest use first), else the active profile's
+    /// lowest-priority member — never the failing slot itself. The failing
+    /// request has already failed; it is not retried server-side.
+    ///
+    /// Simplification (same accepted tradeoff as activation): the llama
+    /// worker is sequential, so when this runs no other slot is EXECUTING;
+    /// requests merely queued against the victim fail their next turn with
+    /// a structured 503. Boot re-activation remains the crash-level path.
+    pub async fn on_runtime_oom(self: Arc<Self>, failing: String) {
+        if self.recovering.swap(true, Ordering::SeqCst) {
+            return; // one recovery at a time
+        }
+        let outcome: Result<(), String> = async {
+            let Some(victim) = self.pick_oom_victim(&failing) else {
+                // Nothing evictable: report pressure and stand down. Boot
+                // re-activation handles the crash-level case.
+                self.events.emit(EngineEvent::VramPressure {
+                    free_bytes: self
+                        .device
+                        .as_ref()
+                        .and_then(|d| d.memory())
+                        .map(|m| m.free_bytes)
+                        .unwrap_or(0),
+                });
+                return Ok(());
+            };
+            self.unload_via_engine(&victim).await?;
+            self.set_slot(&victim, SlotState::Unloaded);
+            self.remember_unloaded(&victim);
+            self.events
+                .emit(EngineEvent::SlotUnloaded { id: victim.clone() });
+            // Losing a profile member is degradation; announce it so the
+            // consumer can surface "OCR unavailable" rather than guess.
+            let member_of_active = self.is_pinned(&victim);
+            if member_of_active {
+                if let Ok(mut inner) = self.inner.lock() {
+                    if !inner.dropped.contains(&victim) {
+                        inner.dropped.push(victim.clone());
+                    }
+                }
+                if let Some(name) = self.inner.lock().ok().and_then(|i| i.active.clone()) {
+                    self.events.emit(EngineEvent::ProfileDegraded {
+                        name,
+                        dropped: vec![victim],
+                        shrunk: Vec::new(),
+                        reason: "vram".into(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = outcome {
+            tracing::warn!("runtime OOM recovery failed: {e}");
+        }
+        self.recovering.store(false, Ordering::SeqCst);
+    }
+
+    /// Eviction choice: oldest-touched JIT resident wins; otherwise the
+    /// lowest-priority (highest priority number, latest declared) profile
+    /// member. The failing slot itself is never chosen.
+    fn pick_oom_victim(&self, failing: &str) -> Option<String> {
+        let now = Instant::now();
+        let inner = self.inner.lock().ok()?;
+        let members: HashMap<String, (u32, usize)> = inner
+            .active
+            .clone()
+            .and_then(|name| self.profile(&name))
+            .map(|p| {
+                p.slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.id.clone(), (s.priority.unwrap_or(u32::MAX), i)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut jits: Vec<(String, Instant)> = Vec::new();
+        let mut pinned_members: Vec<(String, u32, usize)> = Vec::new();
+        for (id, st) in inner.slots.iter() {
+            if id == failing || !matches!(st, SlotState::Loaded { .. }) {
+                continue;
+            }
+            match members.get(id) {
+                Some(&(prio, idx)) => pinned_members.push((id.clone(), prio, idx)),
+                None => {
+                    let touched = self
+                        .last_used
+                        .lock()
+                        .ok()
+                        .and_then(|lu| lu.get(id).copied())
+                        .unwrap_or(now);
+                    jits.push((id.clone(), touched));
+                }
+            }
+        }
+
+        jits.sort_by_key(|(_, t)| *t);
+        if let Some((id, _)) = jits.first() {
+            return Some(id.clone());
+        }
+        pinned_members.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        pinned_members.first().map(|(id, _, _)| id.clone())
+    }
+
+    // -- views ---------------------------------------------------------------
+
+    /// `GET /engine/status` payload.
+    pub fn status(&self) -> serde_json::Value {
+        let inner = self.inner.lock().map(|i| i.clone()).unwrap_or_default();
+        let mut ids: Vec<String> = inner.slots.keys().cloned().collect();
+        for p in &self.config.profile {
+            for s in &p.slots {
+                if !ids.contains(&s.id) {
+                    ids.push(s.id.clone());
+                }
+            }
+        }
+
+        let slots: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                let st = inner.slots.get(id);
+                let (label, ctx, estimated, measured, shrunk, reason) = match st {
+                    Some(SlotState::Loaded {
+                        ctx,
+                        estimated_bytes,
+                        measured_bytes,
+                        shrunk,
+                    }) => (
+                        "loaded",
+                        Some(*ctx),
+                        *estimated_bytes,
+                        *measured_bytes,
+                        *shrunk,
+                        None,
+                    ),
+                    Some(SlotState::Failed { reason }) => {
+                        ("failed", None, None, None, false, Some(reason.clone()))
+                    }
+                    Some(SlotState::Loading) => ("loading", None, None, None, false, None),
+                    _ => ("unloaded", None, None, None, false, None),
+                };
+                let placement = self
+                    .config
+                    .profile
+                    .iter()
+                    .flat_map(|p| p.slots.iter())
+                    .find(|s| s.id == *id)
+                    .and_then(|s| s.placement)
+                    .unwrap_or(Placement::Gpu);
+                let priority = self
+                    .config
+                    .profile
+                    .iter()
+                    .flat_map(|p| p.slots.iter())
+                    .find(|s| s.id == *id)
+                    .and_then(|s| s.priority);
+                serde_json::json!({
+                    "id": id,
+                    "role": self.effective_role(id),
+                    "priority": priority,
+                    "placement": placement,
+                    "state": label,
+                    "ctx": ctx,
+                    "estimated_bytes": estimated,
+                    "measured_bytes": measured,
+                    "shrunk": shrunk,
+                    "pinned": self.is_pinned(id),
+                    "reason": reason,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "active": inner.active,
+            "switching": self.switching(),
+            "degraded": { "dropped": inner.dropped, "shrunk": inner.shrunk },
+            "slots": slots,
+        })
+    }
+
+    /// `GET /engine/device` payload.
+    pub fn device_view(&self) -> serde_json::Value {
+        match self.device.as_ref().and_then(|d| d.memory()) {
+            Some(mem) => serde_json::json!({
+                "available": true,
+                "backend": self.device.as_ref().map(|d| d.name()),
+                "total_bytes": mem.total_bytes,
+                "free_bytes": mem.free_bytes,
+                "margin_bytes": self.margin_bytes(),
+            }),
+            None => serde_json::json!({ "available": false, "backend": null }),
+        }
+    }
+
+    /// `GET /engine/profiles` payload: definitions + active + per-slot /
+    /// per-profile fit previews. Overlapping models across profiles are
+    /// counted per profile (a preview, not an accounting identity).
+    pub fn profiles_view(&self) -> serde_json::Value {
+        let active = self.inner.lock().ok().and_then(|i| i.active.clone());
+
+        let profiles: Vec<serde_json::Value> = self
+            .config
+            .profile
+            .iter()
+            .map(|p| {
+                let mut total = Some(0u64);
+                let slots: Vec<serde_json::Value> = p
+                    .slots
+                    .iter()
+                    .map(|s| {
+                        let est = self
+                            .deps
+                            .registry
+                            .read()
+                            .ok()
+                            .and_then(|reg| reg.resolve(&s.id).ok().cloned())
+                            .and_then(|entry| self.slot_cost(&entry))
+                            .map(|c| c.at(self.full_ctx()));
+                        if est.is_none() {
+                            total = None;
+                        } else {
+                            total = total.map(|t| t + est.unwrap_or(0));
+                        }
+                        serde_json::json!({
+                            "id": s.id,
+                            "priority": s.priority,
+                            "placement": s.placement.unwrap_or(Placement::Gpu),
+                            "role": self.effective_role(&s.id),
+                            "estimated_bytes": est,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "name": p.name,
+                    "slots": slots,
+                    "estimated_bytes": total,
+                })
+            })
+            .collect();
+
+        serde_json::json!({ "active": active, "profiles": profiles })
+    }
+}
+
+// helpers ----------------------------------------------------------------
+
+enum LadderOutcome {
+    Loaded { shrunk: bool },
+    Dropped(String),
+    Aborted,
+}
+
+/// Errors the slot routes map onto HTTP statuses.
+#[derive(Debug)]
+pub enum SlotOpError {
+    UnknownModel,       // 404
+    Pinned,             // 409
+    SwitchInProgress,   // 503 + Retry-After
+    AlreadyResident,    // 409 (load of an already-loaded JIT slot)
+    NotResident,        // unload no-op
+    Vram(String),       // 503 structured
+    LoadFailed(String), // 503
+}
+
+fn gguf_mtime_secs(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// `state.json` under [`data_dir`](mettle_core::config::data_dir),
+/// overridable via `METTLE_STATE` (tests point this at a tempfile).
+pub fn default_state_path() -> PathBuf {
+    if let Ok(p) = std::env::var("METTLE_STATE") {
+        return PathBuf::from(p);
+    }
+    mettle_core::config::data_dir().join("state.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mettle_core::device::DeviceMemory;
+    use mettle_core::engine::{Engine, EngineError, EngineRequest};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    fn active_name(m: &ProfileManager) -> Option<String> {
+        m.inner.lock().unwrap().active.clone()
+    }
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// Metadata-only v3 GGUF with real KV-geometry KVs, so `estimate_vram`
+    /// produces a genuine KV slope; a 4 MiB body makes the file size real.
+    fn write_synthetic_gguf(path: &Path) {
+        const TYPE_STRING: u32 = 8;
+        const TYPE_UINT32: u32 = 4;
+        let arch = "qwen3";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        buf.extend_from_slice(&8u64.to_le_bytes()); // kv pairs
+        let put_str = |buf: &mut Vec<u8>, s: &str| {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        };
+        put_str(&mut buf, "general.architecture");
+        buf.extend_from_slice(&TYPE_STRING.to_le_bytes());
+        put_str(&mut buf, arch);
+        for (k, v) in [
+            (format!("{arch}.block_count"), 36u32),
+            (format!("{arch}.embedding_length"), 2560),
+            (format!("{arch}.attention.head_count"), 32),
+            (format!("{arch}.attention.head_count_kv"), 8),
+            (format!("{arch}.attention.key_length"), 128),
+            (format!("{arch}.attention.value_length"), 128),
+            (format!("{arch}.vocab_size"), 151_936),
+        ] {
+            put_str(&mut buf, &k);
+            buf.extend_from_slice(&TYPE_UINT32.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&buf).unwrap();
+        f.write_all(&vec![0u8; 4 * MIB as usize]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    struct FakeDevice {
+        free: AtomicU64,
+    }
+    impl Device for FakeDevice {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn memory(&self) -> Option<DeviceMemory> {
+            Some(DeviceMemory {
+                total_bytes: 8 * GIB,
+                free_bytes: self.free.load(AtomicOrdering::SeqCst),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeEngine {
+        loaded: Mutex<Vec<String>>,
+        ops: Mutex<Vec<String>>,
+        fail: Mutex<HashMap<String, String>>,
+        /// One-shot park gate: `(nth, signal)` parks exactly load attempt
+        /// `nth` of the alias (0 = first attempt).
+        park_nth: parking_lot::Mutex<HashMap<String, (usize, std::sync::mpsc::Receiver<()>)>>,
+        loads_started: parking_lot::Mutex<HashMap<String, usize>>,
+    }
+    impl FakeEngine {
+        fn op_log(&self) -> Vec<String> {
+            self.ops.lock().unwrap().clone()
+        }
+        fn wait_for_op(&self, needle: &str) {
+            for _ in 0..5000 {
+                if self.op_log().iter().any(|op| op.contains(needle)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("no op containing '{needle}'; saw {:?}", self.op_log());
+        }
+    }
+    impl Engine for FakeEngine {
+        fn sender(&self) -> tokio::sync::mpsc::Sender<EngineRequest> {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            tx
+        }
+        fn loaded(&self) -> Vec<String> {
+            self.loaded.lock().unwrap().clone()
+        }
+        fn load_model(&self, spec: ModelLoadSpec) -> Result<(), EngineError> {
+            self.load_slot(SlotLoadSpec {
+                model: spec,
+                mtp_draft: None,
+                draft: None,
+                n_ctx: None,
+            })
+        }
+        fn load_slot(&self, slot: SlotLoadSpec) -> Result<(), EngineError> {
+            let alias = slot.model.alias.clone();
+            // Attempt numbers make parking deterministic: exactly the Nth
+            // load of an alias blocks, so a racing second loader can never
+            // steal the gate (the old map-keyed gate deadlocked on exactly
+            // that race).
+            let attempt = {
+                let mut starts = self.loads_started.lock();
+                let n = *starts.entry(alias.clone()).or_insert(0);
+                starts.insert(alias.clone(), n + 1);
+                n
+            };
+            self.ops.lock().unwrap().push(format!(
+                "load:{alias}@ctx={:?},ngl={:?}",
+                slot.n_ctx, slot.model.n_gpu_layers
+            ));
+            let parks = {
+                let gate = self.park_nth.lock();
+                gate.get(&alias).is_some_and(|(nth, _)| *nth == attempt)
+            };
+            if parks {
+                let (_, rx) = self.park_nth.lock().remove(&alias).unwrap();
+                let _ = rx.recv(); // held until the test releases us
+            }
+            if let Some(reason) = self.fail.lock().unwrap().get(&alias) {
+                return Err(EngineError::Other(reason.clone()));
+            }
+            // Mirrors LlamaEngine::load_slot: the resident list dedupes.
+            let mut loaded = self.loaded.lock().unwrap();
+            if !loaded.contains(&alias) {
+                loaded.push(alias);
+            }
+            Ok(())
+        }
+        fn remove_model(&self, alias: &str) -> Result<(), EngineError> {
+            self.ops.lock().unwrap().push(format!("unload:{alias}"));
+            self.loaded.lock().unwrap().retain(|a| a != alias);
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        manager: Arc<ProfileManager>,
+        engine: Arc<FakeEngine>,
+        events: Arc<EventBus>,
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// Each profile is `(name, slot ids in order)` over the default
+        /// model pair m1/m2.
+        fn build(profiles: &[(&str, &[&str])], free_bytes: u64) -> Self {
+            Self::build_fiddled(&["m1", "m2"], profiles, free_bytes, |_| {})
+        }
+
+        /// Explicit model universe: every id gets a synthetic GGUF and a
+        /// catalog entry.
+        fn build_with_models(ids: &[&str], profiles: &[(&str, &[&str])], free_bytes: u64) -> Self {
+            Self::build_fiddled(ids, profiles, free_bytes, |_| {})
+        }
+
+        /// Fixture with a pre-Arc config tweak (roles, priorities) that
+        /// cannot be applied through the `Arc<ProfileManager>` afterwards.
+        fn build_fiddled(
+            ids: &[&str],
+            profiles: &[(&str, &[&str])],
+            free_bytes: u64,
+            fiddle: impl FnOnce(&mut RootConfig),
+        ) -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut config = RootConfig::default();
+            let mut models = Vec::new();
+            for id in ids {
+                let gguf = dir.path().join(format!("{id}.gguf"));
+                write_synthetic_gguf(&gguf);
+                models.push(ModelEntry {
+                    id: (*id).into(),
+                    default: false,
+                    path: Some(gguf),
+                    n_gpu_layers: None,
+                    mmproj_path: None,
+                    role: None,
+                    min_ctx: None,
+                    draft: None,
+                });
+            }
+            config.model = models;
+            config.profile = profiles
+                .iter()
+                .map(|(name, slots)| ProfileConfig {
+                    name: (*name).to_string(),
+                    slots: slots
+                        .iter()
+                        .map(|id| ProfileSlot {
+                            id: (*id).to_string(),
+                            priority: None,
+                            placement: None,
+                        })
+                        .collect(),
+                })
+                .collect();
+            fiddle(&mut config);
+
+            let engine = Arc::new(FakeEngine::default());
+            let mut registry = ModelRegistry::new();
+            registry.apply_user_models(&config.model);
+            let deps = ProfileDeps {
+                engine: Arc::new(std::sync::RwLock::new(Some(engine.clone() as SharedEngine))),
+                registry: Arc::new(std::sync::RwLock::new(registry)),
+                loaded_models: Arc::new(Mutex::new(Vec::new())),
+            };
+            let events = Arc::new(EventBus::new());
+            let manager =
+                ProfileManager::new(deps, config, events.clone(), dir.path().join("state.json"));
+            let mut manager = Box::new(manager);
+            // Private field: inject the fake probe before wrapping in Arc.
+            manager.device = Some(Box::new(FakeDevice {
+                free: AtomicU64::new(free_bytes),
+            }));
+            Self {
+                manager: Arc::new(*manager),
+                engine,
+                events,
+                dir,
+            }
+        }
+
+        fn replay_contains(&self, needle: &str) -> bool {
+            let (replay, _rx) = self.events.subscribe();
+            replay.iter().any(|j| j.contains(needle))
+        }
+    }
+
+    // -- pure planner ----------------------------------------------------------
+
+    #[test]
+    fn ctx_rungs_halve_down_to_min_ctx() {
+        assert_eq!(ctx_rungs(8192, None), vec![8192]);
+        assert_eq!(ctx_rungs(8192, Some(2048)), vec![8192, 4096, 2048]);
+        assert_eq!(ctx_rungs(8192, Some(6000)), vec![8192, 6000]);
+        assert_eq!(ctx_rungs(1000, Some(2000)), vec![1000]);
+    }
+
+    #[test]
+    fn pick_ctx_full_shrink_and_drop() {
+        let cost = SlotCost {
+            anchor_bytes: 1000,
+            anchor_ctx: 100,
+            kv_per_token: 10,
+        };
+        // Full fits: unshrunk.
+        assert_eq!(pick_ctx(&cost, 1100, 100, Some(25)), Some((100, false)));
+        // Full doesn't fit, half does: shrunk.
+        assert_eq!(pick_ctx(&cost, 950, 100, Some(25)), Some((50, true)));
+        // Only the floor fits: clamped to min_ctx.
+        assert_eq!(pick_ctx(&cost, 300, 100, Some(25)), Some((25, true)));
+        // Nothing fits: drop.
+        assert_eq!(pick_ctx(&cost, 100, 100, Some(25)), None);
+    }
+
+    // -- activation --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn activate_loads_all_slots_and_persists() {
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], 8 * GIB);
+
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        assert_eq!(active_name(&fx.manager), Some("p".into()));
+        let ops = fx.engine.op_log();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(ops.iter().all(|op| op.contains("ngl=Some(999)")), "{ops:?}");
+        assert!(
+            ops.iter().any(|op| op.contains("load:m1@ctx=Some(8192)")),
+            "{ops:?}"
+        );
+        assert!(fx.replay_contains("\"profile.activating\""));
+        assert!(fx.replay_contains("\"profile.active\""));
+        assert!(fx.dir.path().join("state.json").exists(), "state persisted");
+    }
+
+    #[tokio::test]
+    async fn boot_reactivates_persisted_profile() {
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+        let ops_before = fx.engine.op_log().len();
+
+        let mut registry = ModelRegistry::new();
+        registry.apply_user_models(&fx.manager.config.model);
+        let registry = Arc::new(std::sync::RwLock::new(registry));
+        let fresh = Arc::new(ProfileManager::new(
+            ProfileDeps {
+                engine: Arc::new(std::sync::RwLock::new(Some(
+                    fx.engine.clone() as SharedEngine
+                ))),
+                registry,
+                loaded_models: Arc::new(Mutex::new(Vec::new())),
+            },
+            fx.manager.config.clone(),
+            fx.events.clone(),
+            fx.dir.path().join("state.json"),
+        ));
+        fresh.clone().boot_activate().await;
+
+        assert_eq!(active_name(&fresh), Some("p".into()));
+        assert!(fx.engine.op_log().len() > ops_before, "engine reloaded");
+    }
+
+    #[tokio::test]
+    async fn overlap_stays_resident_across_switch() {
+        let fx = Fixture::build(&[("p1", &["m1", "m2"]), ("p2", &["m1"])], 8 * GIB);
+        fx.manager.clone().activate("p1".into()).await.unwrap();
+
+        // p2 shares m1 with p1; only m2 should be touched.
+        fx.manager.clone().activate("p2".into()).await.unwrap();
+
+        let ops = fx.engine.op_log();
+        assert_eq!(
+            ops.iter().filter(|op| op.starts_with("load:")).count(),
+            2,
+            "{ops:?}"
+        );
+        assert!(ops.contains(&"unload:m2".to_string()), "{ops:?}");
+        assert!(!ops.contains(&"unload:m1".to_string()), "{ops:?}");
+        assert_eq!(active_name(&fx.manager), Some("p2".into()));
+    }
+
+    #[tokio::test]
+    async fn refusal_keeps_previous_profile_active() {
+        // 'big' must name a NON-resident slot: an overlap slot would be
+        // skipped as already resident and never reach the ladder.
+        let fx = Fixture::build_with_models(
+            &["m1", "m2", "m3"],
+            &[("ok", &["m1", "m2"]), ("big", &["m3"])],
+            8 * GIB,
+        );
+        fx.manager.clone().activate("ok".into()).await.unwrap();
+        // Make 'big''s only slot unloadable.
+        fx.engine
+            .fail
+            .lock()
+            .unwrap()
+            .insert("m3".into(), "simulated load failure".into());
+
+        let err = fx.manager.clone().activate("big".into()).await.unwrap_err();
+        assert!(err.contains("m3"), "{err}");
+        assert_eq!(
+            active_name(&fx.manager),
+            Some("ok".into()),
+            "previous profile kept"
+        );
+        assert!(fx.replay_contains("\"profile.degraded\""));
+    }
+
+    #[tokio::test]
+    async fn supersede_aborts_inflight_activation() {
+        let fx = Fixture::build(&[("p1", &["m1", "m2"]), ("p2", &["m1"])], 8 * GIB);
+        // Park m1's load under p1.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        fx.engine.park_nth.lock().insert("m1".into(), (0, rx));
+
+        let p1 = fx.manager.clone();
+        let j1 = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(p1.activate("p1".into()))
+        });
+        fx.engine.wait_for_op("load:m1");
+
+        // p2 wants only m1; it supersedes p1 mid-load.
+        fx.manager.clone().activate("p2".into()).await.unwrap();
+        drop(tx); // release p1's parked load
+        let _r1 = j1.await.unwrap();
+
+        assert_eq!(active_name(&fx.manager), Some("p2".into()));
+        // m1 is resident exactly once despite the double load attempt.
+        let resident = fx.engine.loaded();
+        assert_eq!(
+            resident.iter().filter(|a| *a == "m1").count(),
+            1,
+            "{resident:?}"
+        );
+    }
+
+    #[test]
+    fn stale_measured_entry_is_discarded() {
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], 8 * GIB);
+        let entry = fx
+            .manager
+            .deps
+            .registry
+            .read()
+            .unwrap()
+            .resolve("m1")
+            .unwrap()
+            .clone();
+        let gguf = llama_bridge::resolve_gguf_path(&entry).unwrap();
+        let mtime = gguf_mtime_secs(&gguf).unwrap();
+
+        // Fresh measurement: accepted.
+        fx.manager.measured.lock().unwrap().insert(
+            "m1".into(),
+            MeasuredEntry {
+                bytes: 100 * MIB,
+                ctx: 4096,
+                engine_version: STATE_ENGINE_VERSION.to_string(),
+                gguf_mtime_secs: mtime,
+            },
+        );
+        assert!(fx.manager.measured_cost("m1", &entry).is_some());
+
+        // Wrong mtime: discarded, planner falls back to the header estimate.
+        fx.manager
+            .measured
+            .lock()
+            .unwrap()
+            .get_mut("m1")
+            .unwrap()
+            .gguf_mtime_secs = mtime + 1;
+        assert!(fx.manager.measured_cost("m1", &entry).is_none());
+    }
+
+    #[tokio::test]
+    async fn jit_load_pins_profile_members_and_serves_others() {
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        // Profile members are pinned: JIT load refuses.
+        let err = fx.manager.clone().jit_load("m1").await.unwrap_err();
+        assert!(matches!(err, SlotOpError::Pinned), "{err:?}");
+
+        // A catalog model outside every profile loads on demand.
+        fx.manager
+            .deps
+            .registry
+            .write()
+            .unwrap()
+            .copy("m1", "m3")
+            .unwrap();
+        fx.manager.clone().jit_load("m3").await.unwrap();
+        assert!(fx.engine.loaded().contains(&"m3".to_string()));
+    }
+
+    // -- /v1 role aliases -------------------------------------------------------
+
+    #[test]
+    fn role_alias_resolves_by_priority_and_falls_through() {
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m1", "m2"])], 8 * GIB, |cfg| {
+            cfg.model[0].role = Some(ModelRole::Embed);
+            cfg.profile[0].slots[0].priority = Some(1);
+        });
+        // Nothing active: passthrough.
+        assert_eq!(fx.manager.resolve_alias("role:chat"), "role:chat");
+
+        // Simulate an active profile without loading anything: m1 is the
+        // prioritized embed slot, m2 the unprioritized chat fallback.
+        fx.manager.inner.lock().unwrap().active = Some("p".into());
+
+        assert_eq!(fx.manager.resolve_alias("role:embed"), "m1");
+        assert_eq!(fx.manager.resolve_alias("role:chat"), "m2");
+        assert_eq!(fx.manager.resolve_alias("role:nope"), "role:nope");
+        assert_eq!(fx.manager.resolve_alias("gemma4:e2b"), "gemma4:e2b");
+    }
+
+    #[test]
+    fn unavailable_payload_reports_degradation() {
+        let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
+        let j = fx.manager.slot_unavailable_payload("m9");
+        assert_eq!(j["error"]["code"], "slot_unavailable", "{j}");
+        assert_eq!(j["error"]["reason"], "vram");
+        assert_eq!(j["error"]["missing"][0], "m9");
+        assert_eq!(j["error"]["profile_degraded"], false);
+        fx.manager.inner.lock().unwrap().dropped.push("m9".into());
+        assert_eq!(
+            fx.manager.slot_unavailable_payload("m9")["error"]["profile_degraded"],
+            true
+        );
+    }
+
+    // -- JIT TTL sweeper ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn ttl_sweeper_unloads_idle_jit_slots_only() {
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+        fx.manager
+            .deps
+            .registry
+            .write()
+            .unwrap()
+            .copy("m1", "m3")
+            .unwrap();
+        fx.manager.clone().jit_load("m3").await.unwrap();
+        assert!(fx.engine.loaded().contains(&"m3".to_string()));
+
+        // Backdate m3's last use past the TTL. Pinned m1/m2 have no such
+        // concept — they survive regardless of their timestamps.
+        let old = Instant::now() - Duration::from_secs(JIT_TTL_SECS + 60);
+        fx.manager
+            .last_used
+            .lock()
+            .unwrap()
+            .insert("m3".into(), old);
+
+        fx.manager.sweep_jit_slots().await;
+
+        assert!(
+            !fx.engine.loaded().contains(&"m3".to_string()),
+            "{:?}",
+            fx.engine.loaded()
+        );
+        assert!(fx.engine.loaded().contains(&"m1".to_string()));
+        assert!(
+            fx.engine.op_log().contains(&"unload:m3".to_string()),
+            "{:?}",
+            fx.engine.op_log()
+        );
+        assert!(fx.replay_contains("\"slot.unloaded\""));
+    }
+
+    #[tokio::test]
+    async fn ttl_sweeper_spares_freshly_used_slots() {
+        let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+        fx.manager
+            .deps
+            .registry
+            .write()
+            .unwrap()
+            .copy("m1", "m3")
+            .unwrap();
+        fx.manager.clone().jit_load("m3").await.unwrap();
+
+        assert!(
+            fx.engine.loaded().contains(&"m3".to_string()),
+            "{:?}",
+            fx.engine.loaded()
+        );
+    }
+
+    // -- runtime OOM recovery ------------------------------------------------------
+
+    #[tokio::test]
+    async fn oom_recovery_evicts_lowest_priority_member_not_the_failure() {
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m1", "m2"])], 8 * GIB, |cfg| {
+            cfg.profile[0].slots[0].priority = Some(10); // lowest priority
+            cfg.profile[0].slots[1].priority = Some(1); // highest priority
+        });
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        fx.manager.clone().on_runtime_oom("m2".into()).await;
+
+        // m1 (lowest priority) evicted; the failing slot itself untouched.
+        let ops = fx.engine.op_log();
+        assert!(ops.contains(&"unload:m1".to_string()), "{ops:?}");
+        assert!(!ops.contains(&"unload:m2".to_string()), "{ops:?}");
+        assert!(fx.replay_contains("\"profile.degraded\""));
+        assert!(fx
+            .manager
+            .inner
+            .lock()
+            .unwrap()
+            .dropped
+            .contains(&"m1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn oom_recovery_prefers_jit_residents_over_members() {
+        let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+        fx.manager
+            .deps
+            .registry
+            .write()
+            .unwrap()
+            .copy("m1", "m2")
+            .unwrap();
+        fx.manager.clone().jit_load("m2").await.unwrap();
+
+        fx.manager.clone().on_runtime_oom("m1".into()).await;
+
+        // The JIT resident goes first; the profile member stays.
+        let ops = fx.engine.op_log();
+        assert!(ops.contains(&"unload:m2".to_string()), "{ops:?}");
+        assert!(
+            fx.engine.loaded().contains(&"m1".to_string()),
+            "{:?}",
+            fx.engine.loaded()
+        );
+        assert!(!fx.replay_contains("\"profile.degraded\""));
+    }
+
+    #[tokio::test]
+    async fn note_runtime_failure_only_reacts_to_oom_errors() {
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        fx.manager
+            .note_runtime_failure("m1", "some unrelated decode failure");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !fx.engine
+                .op_log()
+                .iter()
+                .any(|op| op.starts_with("unload:")),
+            "{:?}",
+            fx.engine.op_log()
+        );
+
+        fx.manager
+            .note_runtime_failure("m1", "CUDA error: cudaMalloc failed: out of memory");
+        // A real OOM on m1 recovers by evicting the OTHER resident (the
+        // failing slot itself is never chosen). Recovery runs as a spawned
+        // task on this current-thread runtime: await (not a blocking sleep)
+        // or it would never get polled.
+        for _ in 0..500 {
+            if fx
+                .engine
+                .op_log()
+                .iter()
+                .any(|op| op.starts_with("unload:m2"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            fx.engine
+                .op_log()
+                .iter()
+                .any(|op| op.starts_with("unload:m2")),
+            "{:?}",
+            fx.engine.op_log()
+        );
+    }
+}

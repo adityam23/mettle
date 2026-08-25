@@ -1,0 +1,28 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Model weights and caches (multi-GB binaries, pulled via `mettle pull`)
+models/
+*.gguf
+*.gguf.tmp
+
+# Runtime state
+*.db
+*.db-journal
+*.sqlite*
+*.log
+
+# Python tooling scratch
+__pycache__/
+.venv/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Private working docs and assistant config (not published)
+agent-docs/
+CLAUDE.md
+.claude/
+.omp/

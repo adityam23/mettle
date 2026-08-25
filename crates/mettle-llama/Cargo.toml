@@ -1,0 +1,44 @@
+[package]
+name = "mettle-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["mtp", "mtmd"]
+# Accelerator backends, passed through to llama.cpp. CUDA-first; release
+# artifacts ship prebuilt CPU/Metal/CUDA archives (see .github/workflows).
+cuda = ["llama-cpp-2/cuda"]
+cudnn = ["cuda"]
+metal = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]
+rocm = ["llama-cpp-2/rocm"]
+# Multimodal (vision/OCR) support via llama.cpp's mtmd.
+mtmd = ["llama-cpp-2/mtmd"]
+# Constrained decoding (JSON schema) via llguidance.
+llguidance = ["llama-cpp-2/llguidance"]
+# MTP speculative decoding (same-model drafters); pulls llama.cpp's common/
+# (wrapper_common.cpp) which hosts the llama_rs_mtp_speculative bridge.
+mtp = ["llama-cpp-2/common"]
+
+[lib]
+name = "mettle_llama"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+encoding_rs = "0.8"
+mettle-core = { version = "0.1.0", path = "../mettle-core" }
+llama-cpp-2 = "0.1.154"
+minijinja = "2"
+# Python-style string methods (startswith/split/lstrip/...) that HF chat
+# templates rely on; minijinja core does not implement them.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+# Flash-attention policy constants (llama_flash_attn_type) not re-exported
+# by llama-cpp-2; same version so the ABI matches.
+llama-cpp-sys-2 = "=0.1.154"
+tokio = { version = "1.52.3", features = ["sync"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+serde_json = "1"
