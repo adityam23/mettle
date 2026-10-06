@@ -113,6 +113,10 @@ pub fn build_llama_config(config: &RootConfig) -> LlamaConfig {
         default_max_tokens: 512,
         kv_cache_q8: matches!(config.engine.kv_cache, KVCacheSetting::Fp8),
         flash_attn: true,
+        rerank_micro_tokens: config
+            .engine
+            .rerank_micro_tokens
+            .unwrap_or(mettle_llama::DEFAULT_RERANK_MICRO_TOKENS),
         speculative: SpecConfig {
             gamma: 5,
             mtp: Vec::new(),

@@ -114,6 +114,10 @@ pub enum SlotState {
         /// Post-load device-memory delta, when a device was reachable.
         measured_bytes: Option<u64>,
         shrunk: bool,
+        /// Effective per-call packed-token cap for a rerank slot (the rung
+        /// the ladder admitted, which may be below the configured cap);
+        /// `None` for every other kind (residency contract §1.1).
+        micro_tokens: Option<usize>,
     },
     Failed {
         cause: FailCause,
@@ -242,19 +246,6 @@ fn ctx_rungs(full: u32, min_ctx: Option<u32>) -> Vec<u32> {
         }
     }
     rungs
-}
-
-/// Pure planner decision: the largest rung whose projected cost fits
-/// `budget`, or `None` when the slot must be dropped. Used by the JIT
-/// admission check and the `/engine/profiles` fit preview; activation walks
-/// the same rungs but retries smaller ones after real load errors.
-fn pick_ctx(cost: &SlotCost, budget: u64, full: u32, min_ctx: Option<u32>) -> Option<(u32, bool)> {
-    // Rungs descend from full; the first fitting rung is the largest
-    // context that fits.
-    ctx_rungs(full, min_ctx)
-        .into_iter()
-        .find(|&ctx| cost.at(ctx) <= budget)
-        .map(|ctx| (ctx, ctx != full))
 }
 
 // ---------------------------------------------------------------------------
@@ -420,11 +411,41 @@ impl ProfileManager {
         llama_bridge::resolve_mtp_drafter(&reg, reg_entry).is_some_and(|d| d.alias == wiring.alias)
     }
 
+    /// Configured per-call rerank packed-token cap, or `None` for every
+    /// other kind (residency contract §1.1: a rerank slot's KV is per-call,
+    /// so its cost is the packed-token cap's context, not the resident ctx).
+    fn rerank_cap(&self, reg_entry: &RegistryEntry) -> Option<usize> {
+        (self.effective_role(&reg_entry.alias) == ModelRole::Rerank).then(|| {
+            self.config
+                .engine
+                .rerank_micro_tokens
+                .unwrap_or(mettle_llama::DEFAULT_RERANK_MICRO_TOKENS)
+        })
+    }
+
+    /// Cap rungs: the configured cap, then halved down to
+    /// [`mettle_llama::MIN_RERANK_MICRO_TOKENS`]. Lowering the cap shrinks
+    /// the per-call context; it is preferred over dropping a rerank slot.
+    fn rerank_cap_rungs(cap: usize) -> Vec<usize> {
+        let mut rungs = vec![cap];
+        let mut c = cap;
+        while c > mettle_llama::MIN_RERANK_MICRO_TOKENS {
+            c = (c / 2).max(mettle_llama::MIN_RERANK_MICRO_TOKENS);
+            rungs.push(c);
+        }
+        rungs.dedup();
+        rungs
+    }
+
     /// Header-derived fit model for a slot (weights + mmproj + drafters +
-    /// KV slope + compute heuristic). `None` when the GGUF is unreadable or
-    /// lacks geometry keys — the slot is then unloadable (GPU-or-refuse
-    /// cannot verify fit).
-    fn estimate_cost(&self, reg_entry: &RegistryEntry) -> Option<SlotCost> {
+    /// KV slope + compute heuristic + a rerank slot's per-call context).
+    /// `None` when the GGUF is unreadable or lacks geometry keys — the slot
+    /// is then unloadable (GPU-or-refuse cannot verify fit).
+    fn estimate_cost(
+        &self,
+        reg_entry: &RegistryEntry,
+        rerank_cap: Option<usize>,
+    ) -> Option<SlotCost> {
         let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
         let est = estimate_vram(&gguf, self.full_ctx(), self.kv_q8(), self.n_seq_max())?;
 
@@ -448,6 +469,21 @@ impl ProfileManager {
                     anchor += d_est.kv_bytes_per_token * 1024;
                 }
             }
+        }
+
+        // §1.1: a rerank slot's KV lives in the per-call context, not in a
+        // resident cache — budget that context at the packed-token cap and
+        // drop the ctx-projected slope (its resident memory is weights +
+        // compute only).
+        if let Some(cap) = rerank_cap {
+            let per_call = mettle_llama::vram::rerank_cap_cost(
+                &gguf,
+                cap,
+                mettle_llama::RERANK_MICRO_BATCH,
+                self.kv_q8(),
+            )?;
+            anchor += per_call.total();
+            slope = 0;
         }
 
         Some(SlotCost {
@@ -480,9 +516,27 @@ impl ProfileManager {
         })
     }
 
-    fn slot_cost(&self, reg_entry: &RegistryEntry) -> Option<SlotCost> {
-        self.measured_cost(&reg_entry.alias, reg_entry)
-            .or_else(|| self.estimate_cost(reg_entry))
+    fn slot_cost(&self, reg_entry: &RegistryEntry, rerank_cap: Option<usize>) -> Option<SlotCost> {
+        let mut cost = self
+            .measured_cost(&reg_entry.alias, reg_entry)
+            .or_else(|| {
+                // The header estimate already accounts for the cap; the measured
+                // path cannot (a measurement sees the resident delta only), so
+                // add the per-call context here.
+                self.estimate_cost(reg_entry, None)
+            })?;
+        if let Some(cap) = rerank_cap {
+            let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
+            let per_call = mettle_llama::vram::rerank_cap_cost(
+                &gguf,
+                cap,
+                mettle_llama::RERANK_MICRO_BATCH,
+                self.kv_q8(),
+            )?;
+            cost.anchor_bytes = cost.anchor_bytes.saturating_add(per_call.total());
+            cost.kv_per_token = 0;
+        }
+        Some(cost)
     }
 
     // -- engine plumbing ----------------------------------------------------
@@ -538,6 +592,7 @@ impl ProfileManager {
         reg_entry: &RegistryEntry,
         placement: Placement,
         n_ctx: Option<u32>,
+        rerank_micro_tokens: Option<usize>,
     ) -> Result<SlotLoadSpec, String> {
         let mut model = llama_bridge::load_spec_for_route(reg_entry)?;
         // Placement is the only offload knob (profiles-contract.md).
@@ -557,6 +612,7 @@ impl ProfileManager {
             mtp_draft,
             draft,
             n_ctx,
+            rerank_micro_tokens,
         })
     }
 
@@ -755,8 +811,11 @@ impl ProfileManager {
         }
     }
 
-    /// True when the active profile's declared slots are settled and at
-    /// least one is loaded — the engine can answer a request right now.
+    /// True when the active profile is settled and still serves every role
+    /// it declares (residency contract §1.4): no activation in flight, and
+    /// for each declared role at least one slot is `Loaded`. A dropped
+    /// slot is fine as long as another slot covers its role; a role with
+    /// no surviving slot means the profile cannot answer — not ready.
     fn is_serving(&self) -> bool {
         let Ok(inner) = self.inner.lock() else {
             return false;
@@ -767,15 +826,24 @@ impl ProfileManager {
         let Some(profile) = self.profile(active) else {
             return false;
         };
-        let mut any_loaded = false;
+        let mut roles: Vec<ModelRole> = Vec::new();
+        let mut loaded_roles: Vec<ModelRole> = Vec::new();
         for slot in &profile.slots {
+            let role = self.effective_role(&slot.id);
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
             match inner.slots.get(&slot.id) {
                 Some(SlotState::Loading) => return false,
-                Some(SlotState::Loaded { .. }) => any_loaded = true,
+                Some(SlotState::Loaded { .. }) => {
+                    if !loaded_roles.contains(&role) {
+                        loaded_roles.push(role);
+                    }
+                }
                 _ => {}
             }
         }
-        any_loaded
+        !roles.is_empty() && roles.iter().all(|r| loaded_roles.contains(r))
     }
 
     /// Closed reason + detail for a profile that cannot serve, derived
@@ -990,7 +1058,7 @@ impl ProfileManager {
         if placement == Placement::Cpu {
             // CPU residency is config intent, never a recovery move: no
             // budget check, no shrink ladder.
-            let spec = match self.slot_spec(&reg_entry, Placement::Cpu, None) {
+            let spec = match self.slot_spec(&reg_entry, Placement::Cpu, None, None) {
                 Ok(s) => s,
                 Err(reason) => {
                     self.fail_slot(id, FailCause::Load, &reason);
@@ -999,7 +1067,7 @@ impl ProfileManager {
             };
             match self.load_via_engine(spec).await {
                 Ok(()) => {
-                    self.record_load_success(id, self.full_ctx(), None, None, false);
+                    self.record_load_success(id, self.full_ctx(), None, None, false, None);
                     return LadderOutcome::Loaded { shrunk: false };
                 }
                 Err(reason) => {
@@ -1023,29 +1091,56 @@ impl ProfileManager {
         };
         let budget = mem_before.free_bytes.saturating_sub(self.margin_bytes());
 
-        let Some(cost) = self.slot_cost(&reg_entry) else {
-            let reason = format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
-            self.fail_slot(id, FailCause::Load, &reason);
-            return LadderOutcome::Dropped(reason);
+        // Rung plan: ctx halving, crossed with the packed-token cap for a
+        // rerank slot (§1.1 — its per-call context, not its resident ctx,
+        // is what the cap moves; the ctx slope is zero for that kind, so
+        // the ctx rungs collapse to one).
+        let rerank_cap = self.rerank_cap(&reg_entry);
+        let cap_rungs: Vec<Option<usize>> = match rerank_cap {
+            Some(cap) => Self::rerank_cap_rungs(cap).into_iter().map(Some).collect(),
+            None => vec![None],
         };
+        let ctx_rungs: Vec<u32> = if rerank_cap.is_some() {
+            vec![self.full_ctx()]
+        } else {
+            ctx_rungs(self.full_ctx(), catalog.min_ctx)
+        };
+        let rungs: Vec<(Option<usize>, u32)> = cap_rungs
+            .into_iter()
+            .flat_map(|cap| ctx_rungs.iter().map(move |ctx| (cap, *ctx)))
+            .collect();
 
-        let gguf_for_measure = llama_bridge::resolve_gguf_path(&reg_entry).ok();
         // Fast planner pass: when no rung fits even on paper, refuse the
         // slot without a doomed cudaMalloc round-trip.
-        if pick_ctx(&cost, budget, self.full_ctx(), catalog.min_ctx).is_none() {
+        let mut costs = Vec::with_capacity(rungs.len());
+        for (cap, _ctx) in &rungs {
+            match self.slot_cost(&reg_entry, *cap) {
+                Some(cost) => costs.push(cost),
+                None => {
+                    let reason =
+                        format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
+                    self.fail_slot(id, FailCause::Load, &reason);
+                    return LadderOutcome::Dropped(reason);
+                }
+            }
+        }
+        let gguf_for_measure = llama_bridge::resolve_gguf_path(&reg_entry).ok();
+        if rungs
+            .iter()
+            .zip(&costs)
+            .all(|((_, ctx), cost)| cost.at(*ctx) > budget)
+        {
             let reason = format!(
                 "'{}' needs {} bytes at full ctx, {} free after margin (no rung fits)",
                 id,
-                cost.at(self.full_ctx()),
+                costs[0].at(self.full_ctx()),
                 budget
             );
             self.fail_slot(id, FailCause::Vram, &reason);
             return LadderOutcome::Dropped(reason);
         }
-        for (rung_idx, ctx) in ctx_rungs(self.full_ctx(), catalog.min_ctx)
-            .into_iter()
-            .enumerate()
-        {
+        for (rung_idx, ((cap, ctx), cost)) in rungs.iter().zip(&costs).enumerate() {
+            let ctx = *ctx;
             if self.stale(my_gen) {
                 return LadderOutcome::Aborted;
             }
@@ -1054,7 +1149,7 @@ impl ProfileManager {
                 continue; // planner filter: this rung cannot fit
             }
             let shrunk = rung_idx > 0 || ctx != self.full_ctx();
-            let spec = match self.slot_spec(&reg_entry, Placement::Gpu, Some(ctx)) {
+            let spec = match self.slot_spec(&reg_entry, Placement::Gpu, Some(ctx), *cap) {
                 Ok(s) => s,
                 Err(reason) => {
                     self.fail_slot(id, FailCause::Load, &reason);
@@ -1069,7 +1164,7 @@ impl ProfileManager {
                         // slot the newer profile never wanted becomes a
                         // visible non-pinned resident (the TTL sweeper /
                         // next activation diff cleans it up).
-                        self.record_load_success(id, ctx, Some(projected), None, shrunk);
+                        self.record_load_success(id, ctx, Some(projected), None, shrunk, *cap);
                         return LadderOutcome::Aborted;
                     }
                     let measured = device.memory().and_then(|after| {
@@ -1100,13 +1195,13 @@ impl ProfileManager {
                             });
                         }
                     }
-                    self.record_load_success(id, ctx, Some(projected), measured, shrunk);
+                    self.record_load_success(id, ctx, Some(projected), measured, shrunk, *cap);
                     return LadderOutcome::Loaded { shrunk };
                 }
                 // Load-time OOM (cudaMalloc) lands here: slide down the
                 // ladder rather than giving up on the slot.
                 Err(reason) => {
-                    tracing::warn!("load '{id}' at ctx={ctx} failed: {reason}");
+                    tracing::warn!("load '{id}' at ctx={ctx} cap={cap:?} failed: {reason}");
                 }
             }
         }
@@ -1114,7 +1209,7 @@ impl ProfileManager {
         let reason = format!(
             "'{}' needs {} bytes at full ctx, {} free after margin (all rungs failed)",
             id,
-            cost.at(self.full_ctx()),
+            costs[0].at(self.full_ctx()),
             budget
         );
         self.fail_slot(id, FailCause::Vram, &reason);
@@ -1128,6 +1223,7 @@ impl ProfileManager {
         estimated_bytes: Option<u64>,
         measured_bytes: Option<u64>,
         shrunk: bool,
+        micro_tokens: Option<usize>,
     ) {
         self.set_slot(
             id,
@@ -1136,6 +1232,7 @@ impl ProfileManager {
                 estimated_bytes,
                 measured_bytes,
                 shrunk,
+                micro_tokens,
             },
         );
         self.remember_loaded(id);
@@ -1206,7 +1303,8 @@ impl ProfileManager {
             .ok_or_else(|| SlotOpError::Vram("accelerator unreachable".into()))?;
         let budget = mem.free_bytes.saturating_sub(self.margin_bytes());
 
-        let cost = self.slot_cost(&reg_entry).ok_or_else(|| {
+        let rerank_cap = self.rerank_cap(&reg_entry);
+        let cost = self.slot_cost(&reg_entry, rerank_cap).ok_or_else(|| {
             SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into())
         })?;
         let full = self.full_ctx();
@@ -1219,11 +1317,11 @@ impl ProfileManager {
 
         self.set_slot(id, SlotState::Loading);
         let spec = self
-            .slot_spec(&reg_entry, Placement::Gpu, None)
+            .slot_spec(&reg_entry, Placement::Gpu, None, rerank_cap)
             .map_err(SlotOpError::LoadFailed)?;
         match self.load_via_engine(spec).await {
             Ok(()) => {
-                self.record_load_success(id, full, Some(needed), None, false);
+                self.record_load_success(id, full, Some(needed), None, false, rerank_cap);
                 Ok(())
             }
             Err(reason) => {
@@ -1360,6 +1458,15 @@ impl ProfileManager {
         }
     }
 
+    /// Whether this session's activation degraded the profile (dropped or
+    /// shrunk a slot). Carried on every `slot_unavailable` 503.
+    pub fn profile_degraded(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|i| !i.dropped.is_empty() || !i.shrunk.is_empty())
+            .unwrap_or(false)
+    }
+
     /// VRAM footprint for `/v1/models`: a fresh measurement wins over the
     /// planner estimate; non-resident models report the header estimate and
     /// CPU-resident or in-flight slots report nothing.
@@ -1381,7 +1488,8 @@ impl ProfileManager {
             .read()
             .ok()
             .and_then(|reg| reg.resolve(id).ok().cloned())?;
-        self.slot_cost(&entry).map(|c| c.at(self.full_ctx()))
+        let cap = self.rerank_cap(&entry);
+        self.slot_cost(&entry, cap).map(|c| c.at(self.full_ctx()))
     }
 
     // -- JIT TTL sweeper -------------------------------------------------------
@@ -1619,12 +1727,13 @@ impl ProfileManager {
             .iter()
             .map(|id| {
                 let st = inner.slots.get(id);
-                let (label, ctx, estimated, measured, shrunk, reason) = match st {
+                let (label, ctx, estimated, measured, shrunk, reason, micro_tokens) = match st {
                     Some(SlotState::Loaded {
                         ctx,
                         estimated_bytes,
                         measured_bytes,
                         shrunk,
+                        micro_tokens,
                     }) => (
                         "loaded",
                         Some(*ctx),
@@ -1632,12 +1741,19 @@ impl ProfileManager {
                         *measured_bytes,
                         *shrunk,
                         None,
+                        *micro_tokens,
                     ),
-                    Some(SlotState::Failed { reason, .. }) => {
-                        ("failed", None, None, None, false, Some(reason.clone()))
-                    }
-                    Some(SlotState::Loading) => ("loading", None, None, None, false, None),
-                    _ => ("unloaded", None, None, None, false, None),
+                    Some(SlotState::Failed { reason, .. }) => (
+                        "failed",
+                        None,
+                        None,
+                        None,
+                        false,
+                        Some(reason.clone()),
+                        None,
+                    ),
+                    Some(SlotState::Loading) => ("loading", None, None, None, false, None, None),
+                    _ => ("unloaded", None, None, None, false, None, None),
                 };
                 let placement = self
                     .config
@@ -1666,6 +1782,7 @@ impl ProfileManager {
                     "shrunk": shrunk,
                     "pinned": self.is_pinned(id),
                     "reason": reason,
+                    "micro_tokens": micro_tokens,
                 })
             })
             .collect();
@@ -1717,7 +1834,10 @@ impl ProfileManager {
                             .read()
                             .ok()
                             .and_then(|reg| reg.resolve(&s.id).ok().cloned())
-                            .and_then(|entry| self.slot_cost(&entry))
+                            .and_then(|entry| {
+                                let cap = self.rerank_cap(&entry);
+                                self.slot_cost(&entry, cap)
+                            })
                             .map(|c| c.at(self.full_ctx()));
                         if est.is_none() {
                             total = None;
@@ -1836,7 +1956,7 @@ mod tests {
     }
 
     struct FakeDevice {
-        free: AtomicU64,
+        free: Arc<AtomicU64>,
     }
     impl Device for FakeDevice {
         fn name(&self) -> &str {
@@ -1888,6 +2008,7 @@ mod tests {
                 mtp_draft: None,
                 draft: None,
                 n_ctx: None,
+                rerank_micro_tokens: None,
             })
         }
         fn load_slot(&self, slot: SlotLoadSpec) -> Result<(), EngineError> {
@@ -1903,8 +2024,8 @@ mod tests {
                 n
             };
             self.ops.lock().unwrap().push(format!(
-                "load:{alias}@ctx={:?},ngl={:?}",
-                slot.n_ctx, slot.model.n_gpu_layers
+                "load:{alias}@ctx={:?},ngl={:?},cap={:?}",
+                slot.n_ctx, slot.model.n_gpu_layers, slot.rerank_micro_tokens
             ));
             let parks = {
                 let gate = self.park_nth.lock();
@@ -1936,6 +2057,8 @@ mod tests {
         engine: Arc<FakeEngine>,
         events: Arc<EventBus>,
         dir: tempfile::TempDir,
+        /// Live free-VRAM counter the fake probe reads.
+        free: Arc<AtomicU64>,
     }
 
     impl Fixture {
@@ -2007,14 +2130,14 @@ mod tests {
                 ProfileManager::new(deps, config, events.clone(), dir.path().join("state.json"));
             let mut manager = Box::new(manager);
             // Private field: inject the fake probe before wrapping in Arc.
-            manager.device = Some(Box::new(FakeDevice {
-                free: AtomicU64::new(free_bytes),
-            }));
+            let free = Arc::new(AtomicU64::new(free_bytes));
+            manager.device = Some(Box::new(FakeDevice { free: free.clone() }));
             Self {
                 manager: Arc::new(*manager),
                 engine,
                 events,
                 dir,
+                free,
             }
         }
 
@@ -2035,20 +2158,60 @@ mod tests {
     }
 
     #[test]
-    fn pick_ctx_full_shrink_and_drop() {
-        let cost = SlotCost {
-            anchor_bytes: 1000,
-            anchor_ctx: 100,
-            kv_per_token: 10,
-        };
-        // Full fits: unshrunk.
-        assert_eq!(pick_ctx(&cost, 1100, 100, Some(25)), Some((100, false)));
-        // Full doesn't fit, half does: shrunk.
-        assert_eq!(pick_ctx(&cost, 950, 100, Some(25)), Some((50, true)));
-        // Only the floor fits: clamped to min_ctx.
-        assert_eq!(pick_ctx(&cost, 300, 100, Some(25)), Some((25, true)));
-        // Nothing fits: drop.
-        assert_eq!(pick_ctx(&cost, 100, 100, Some(25)), None);
+    fn rerank_cap_rungs_halve_down_to_the_floor() {
+        assert_eq!(
+            ProfileManager::rerank_cap_rungs(2048),
+            vec![2048, 1024, 512, 256]
+        );
+        assert_eq!(ProfileManager::rerank_cap_rungs(256), vec![256]);
+        assert_eq!(ProfileManager::rerank_cap_rungs(600), vec![600, 300, 256]);
+    }
+
+    /// §1.1: a rerank slot's fit must include the per-call packed-token
+    /// context, and when only a smaller cap fits the ladder loads that cap
+    /// instead of dropping the slot.
+    #[tokio::test]
+    async fn rerank_slot_budgets_per_call_context_and_shrinks_cap() {
+        let fx = Fixture::build_fiddled(&["r1"], &[("p", &["r1"])], 8 * GIB, |cfg| {
+            cfg.model[0].role = Some(mettle_core::config::ModelRole::Rerank);
+            cfg.engine.rerank_micro_tokens = Some(2048);
+        });
+        let m = fx.manager.clone();
+        let entry = m
+            .deps
+            .registry
+            .read()
+            .unwrap()
+            .resolve("r1")
+            .unwrap()
+            .clone();
+        let full = m.full_ctx();
+        // The cap moves the cost: a rerank slot's KV is per-call.
+        let resident_only = m.slot_cost(&entry, None).unwrap().at(full);
+        let at_floor = m.slot_cost(&entry, Some(256)).unwrap().at(full);
+        let at_default = m.slot_cost(&entry, Some(2048)).unwrap().at(full);
+        assert!(
+            at_floor > resident_only && at_default > at_floor,
+            "per-call context must be budgeted: {resident_only} {at_floor} {at_default}"
+        );
+
+        // Budget that admits the floor cap only.
+        fx.free
+            .store(at_floor + m.margin_bytes(), AtomicOrdering::SeqCst);
+        m.clone().activate("p".into()).await.unwrap();
+
+        let ops = fx.engine.op_log();
+        let load = ops.iter().find(|o| o.starts_with("load:r1")).unwrap();
+        assert!(load.contains("cap=Some(256)"), "{ops:?}");
+        // A lowered cap is a shrunk slot, reported as degradation.
+        assert!(m.profile_degraded());
+        assert!(
+            m.inner.lock().unwrap().shrunk.iter().any(|s| s == "r1"),
+            "slot recorded as shrunk"
+        );
+        // The effective cap is visible to the consumer (§1.1).
+        let status = m.status(true);
+        assert_eq!(status["slots"][0]["micro_tokens"], 256, "{status}");
     }
 
     // -- activation --------------------------------------------------------------

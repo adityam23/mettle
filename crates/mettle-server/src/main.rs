@@ -80,11 +80,6 @@ async fn main() {
 
     let router = app::build_router(app_state);
 
-    tracing::info!(
-        "engine listening on {} (Ollama /api/*, OpenAI /v1/*, Anthropic /v1/messages, OCR /v1/ocr)",
-        addr
-    );
-
     // Exit 98 (EADDRINUSE) is the contract's "another engine holds the
     // port" signal (residency contract §1.6): docket maps it to `offline`
     // and does not respawn, rather than treating it as a crash.
@@ -101,6 +96,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    tracing::info!(
+        "engine listening on {} (Ollama /api/*, OpenAI /v1/*, Anthropic /v1/messages, OCR /v1/ocr)",
+        addr
+    );
     if let Err(e) = axum::serve(listener, router).await {
         tracing::error!("server error: {e}");
         std::process::exit(1);

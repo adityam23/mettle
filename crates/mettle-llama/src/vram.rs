@@ -52,24 +52,21 @@ const COMPUTE_BASE_BYTES: u64 = 64 * 1024 * 1024;
 /// Vocab fallback when the header lacks `{arch}.vocab_size`.
 const DEFAULT_VOCAB: u64 = 131_072;
 
-/// Estimate the VRAM cost of `gguf` at `n_ctx` context tokens.
-///
-/// `kv_q8` mirrors `[engine] kv_cache = "fp8"` (llama.cpp q8_0 KV);
-/// `n_seq_max` scales the per-sequence logits buffer. Returns `None`
-/// when the file is unreadable or lacks the architecture geometry keys.
-pub fn estimate_vram(
-    gguf: &Path,
-    _n_ctx: u32,
-    kv_q8: bool,
-    n_seq_max: usize,
-) -> Option<VramEstimate> {
-    let ctx = GgufContext::from_file(gguf)?;
-    let weights_bytes = std::fs::metadata(gguf).ok()?.len();
+/// Attention/state geometry read from a GGUF header.
+struct Geometry {
+    n_embd: u64,
+    n_vocab: u64,
+    /// Bytes of KV per context token, over the layers that actually hold a
+    /// KV cache (attention layers only — see `full_attention_interval`).
+    kv_bytes_per_token: u64,
+    /// Recurrent (SSM/GDN) state per sequence in bytes; 0 for pure
+    /// attention models. Fixed per sequence, not per token (§1.7).
+    recurrent_state_per_seq: u64,
+}
 
-    // Keys are arch-prefixed (`llama.block_count`, `qwen35.block_count`,
-    // ...). Resolve the prefix from `general.architecture`, falling back
-    // to `llama` (the historical default and what `gguf_layer_count`
-    // assumed).
+/// Read the geometry keys, resolving the arch prefix from
+/// `general.architecture` (falling back to `llama`).
+fn geometry(ctx: &GgufContext, kv_q8: bool) -> Option<Geometry> {
     let arch_idx = ctx.find_key("general.architecture");
     let arch = (arch_idx >= 0)
         .then(|| ctx.val_str(arch_idx))
@@ -84,6 +81,9 @@ pub fn estimate_vram(
     let n_layer = u64::from(key("block_count")?);
     let n_embd = u64::from(key("embedding_length")?);
     let n_head = u64::from(key("attention.head_count")?);
+    if n_head == 0 || n_layer == 0 {
+        return None;
+    }
     // head_count_kv absent (or 0) means MHA — every head carries KV.
     let n_head_kv = match key("attention.head_count_kv") {
         Some(0) | None => n_head,
@@ -93,36 +93,168 @@ pub fn estimate_vram(
     // MLA models) else embd/head.
     let k_dim = match key("attention.key_length") {
         Some(v) => u64::from(v),
-        None if n_head > 0 => n_embd / n_head,
-        None => return None,
+        None => n_embd / n_head,
     };
     let v_dim = match key("attention.value_length") {
         Some(v) => u64::from(v),
         None => k_dim,
     };
     let n_vocab = key("vocab_size").map(u64::from).unwrap_or(DEFAULT_VOCAB);
-    if n_head == 0 || n_layer == 0 {
-        return None;
-    }
 
+    // §1.7: hybrid-recurrent architectures (qwen35, qwen3next, …) interleave
+    // full-attention layers with linear-attention (SSM/GDN) layers that hold
+    // NO KV cache. `{arch}.full_attention_interval = k` means every k-th
+    // layer is full attention; counting all `block_count` layers overcounts
+    // the KV by that factor (qwen35-4b: 32 layers → 8, 69632 → 17408
+    // B/token). The recurrent state is a fixed per-sequence cost instead.
+    let interval = key("full_attention_interval").filter(|v| *v > 1);
+    let n_layer_kv = match interval {
+        Some(k) => n_layer.div_ceil(u64::from(k)),
+        None => n_layer,
+    };
     let bytes_per_elem = if kv_q8 {
         Q8_0_BYTES_PER_ELEM
     } else {
         F16_BYTES_PER_ELEM
     };
-    let kv_bytes_per_token = (n_layer * (k_dim + v_dim) * n_head_kv) as f64 * bytes_per_elem;
+    let kv_bytes_per_token = (n_layer_kv * (k_dim + v_dim) * n_head_kv) as f64 * bytes_per_elem;
+
+    let recurrent_state_per_seq = match interval {
+        Some(_) => {
+            let recurrent_layers = n_layer.saturating_sub(n_layer_kv);
+            let state_size = key("ssm.state_size").map(u64::from);
+            let inner = key("ssm.inner_size").map(u64::from);
+            match (state_size, inner) {
+                // GDN state per layer: inner_size × state_size f32 elements
+                // ([v_heads, k_dim, v_dim] with v_heads*v_dim = inner_size).
+                (Some(state), Some(inner)) => recurrent_layers * state * inner * 4,
+                _ => 0,
+            }
+        }
+        None => 0,
+    };
+
+    Some(Geometry {
+        n_embd,
+        n_vocab,
+        kv_bytes_per_token: kv_bytes_per_token as u64,
+        recurrent_state_per_seq,
+    })
+}
+
+/// Estimate the VRAM cost of `gguf` at `n_ctx` context tokens.
+///
+/// `kv_q8` mirrors `[engine] kv_cache = "fp8"` (llama.cpp q8_0 KV);
+/// `n_seq_max` scales the per-sequence logits buffer and the recurrent
+/// state. Returns `None` when the file is unreadable or lacks the
+/// architecture geometry keys.
+pub fn estimate_vram(
+    gguf: &Path,
+    _n_ctx: u32,
+    kv_q8: bool,
+    n_seq_max: usize,
+) -> Option<VramEstimate> {
+    let ctx = GgufContext::from_file(gguf)?;
+    let weights_bytes = std::fs::metadata(gguf).ok()?.len();
+    let g = geometry(&ctx, kv_q8)?;
 
     // Logits: one f32 vocab row per sequence. Activations: the heuristic
-    // above at the estimate batch width.
-    let logits = n_vocab * 4 * n_seq_max.max(1) as u64;
-    let activations = ESTIMATE_BATCH * n_embd * 4 * ACTIVATION_ROWS_PER_BATCH_TOKEN;
-    let compute_bytes = COMPUTE_BASE_BYTES + logits + activations;
+    // above at the estimate batch width. Recurrent state is a fixed
+    // per-sequence cost (§1.7).
+    let n_seq = n_seq_max.max(1) as u64;
+    let logits = g.n_vocab * 4 * n_seq;
+    let activations = ESTIMATE_BATCH * g.n_embd * 4 * ACTIVATION_ROWS_PER_BATCH_TOKEN;
+    let recurrent = g.recurrent_state_per_seq * n_seq;
+    let compute_bytes = COMPUTE_BASE_BYTES + logits + activations + recurrent;
 
     Some(VramEstimate {
         weights_bytes,
-        kv_bytes_per_token: kv_bytes_per_token as u64,
+        kv_bytes_per_token: g.kv_bytes_per_token,
         compute_bytes,
     })
+}
+
+/// Measured CUDA compute-buffer cost per packed rerank token at hidden
+/// width 1024 (residency contract §0: a 2040-token, 6-sequence pass on the
+/// 0.6B Qwen3 reranker reserved 1490.48 MiB ⇒ ~0.73 MiB/token). Cross-encoder
+/// activation buffers scale ~linearly with the hidden width, so this is
+/// scaled by `{arch}.embedding_length / 1024`.
+const RERANK_COMPUTE_BYTES_PER_TOKEN_AT_1024: u64 = 768 * 1024;
+
+/// Precomputed rerank-context cost coefficients for one model (read once
+/// at load; the per-call preflight stays arithmetic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RerankGeometry {
+    base_bytes: u64,
+    compute_bytes_per_token: u64,
+    kv_bytes_per_token: u64,
+}
+
+impl RerankGeometry {
+    /// Explicit coefficients — unit tests only (production reads them from
+    /// the GGUF header in [`rerank_geometry`]).
+    #[cfg(test)]
+    pub fn with_coefficients(
+        base_bytes: u64,
+        compute_bytes_per_token: u64,
+        kv_bytes_per_token: u64,
+    ) -> Self {
+        Self {
+            base_bytes,
+            compute_bytes_per_token,
+            kv_bytes_per_token,
+        }
+    }
+
+    /// Cost of a packed pass of `tokens` tokens over a KV of `kv_cells`
+    /// (split-KV: `max_len` rounded to 256 times the sequence count).
+    pub fn cost(&self, kv_cells: usize, tokens: usize) -> RerankContextCost {
+        RerankContextCost {
+            kv_bytes: self.kv_bytes_per_token * kv_cells as u64,
+            compute_bytes: self.base_bytes + self.compute_bytes_per_token * tokens as u64,
+        }
+    }
+}
+
+/// Estimated cost of one rerank call's context (residency contract §1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RerankContextCost {
+    pub kv_bytes: u64,
+    pub compute_bytes: u64,
+}
+
+impl RerankContextCost {
+    pub fn total(&self) -> u64 {
+        self.kv_bytes.saturating_add(self.compute_bytes)
+    }
+}
+
+/// Read the rerank-context cost coefficients for `gguf`.
+pub fn rerank_geometry(gguf: &Path, kv_q8: bool) -> Option<RerankGeometry> {
+    let ctx = GgufContext::from_file(gguf)?;
+    let g = geometry(&ctx, kv_q8)?;
+    Some(RerankGeometry {
+        base_bytes: COMPUTE_BASE_BYTES,
+        compute_bytes_per_token: RERANK_COMPUTE_BYTES_PER_TOKEN_AT_1024 * g.n_embd / 1024,
+        kv_bytes_per_token: g.kv_bytes_per_token,
+    })
+}
+
+/// Worst-case-per-call cost a rerank slot must budget at admission for a
+/// packed-token cap of `cap_tokens` under a `micro_batch`-sequence shape:
+/// a full pass at the cap with the greedy fill's nominal (roughly even)
+/// sequence lengths. The per-call preflight re-checks the real geometry.
+pub fn rerank_cap_cost(
+    gguf: &Path,
+    cap_tokens: usize,
+    micro_batch: usize,
+    kv_q8: bool,
+) -> Option<RerankContextCost> {
+    let cap = cap_tokens.max(1);
+    let n_seqs = micro_batch.max(1).min(cap);
+    let max_len = cap.div_ceil(n_seqs);
+    let kv_cells = max_len.div_ceil(256) * 256 * n_seqs;
+    rerank_geometry(gguf, kv_q8).map(|g| g.cost(kv_cells, cap))
 }
 
 #[cfg(test)]
@@ -142,16 +274,16 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes()); // tensor count
         buf.extend_from_slice(&8u64.to_le_bytes()); // kv count
 
-        let mut put_str = |buf: &mut Vec<u8>, s: &str| {
+        let put_str = |buf: &mut Vec<u8>, s: &str| {
             buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         };
-        let mut put_kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
+        let put_kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
             put_str(buf, k);
             buf.extend_from_slice(&TYPE_STRING.to_le_bytes());
             put_str(buf, v);
         };
-        let mut put_kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
+        let put_kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
             put_str(buf, k);
             buf.extend_from_slice(&TYPE_UINT32.to_le_bytes());
             buf.extend_from_slice(&v.to_le_bytes());

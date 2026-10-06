@@ -372,6 +372,13 @@ pub struct EngineOptions {
     /// (residency contract §1.4). Default: 60 s.
     #[serde(default)]
     pub ready_timeout_secs: Option<u64>,
+
+    /// Rerank per-call packed-token cap (residency contract §1.1). The
+    /// rerank context's compute buffer scales with this, so it bounds the
+    /// per-call VRAM reservation. Default: 2048; the degradation ladder
+    /// lowers it per slot before dropping the reranker.
+    #[serde(default)]
+    pub rerank_micro_tokens: Option<usize>,
 }
 
 impl Default for EngineOptions {
@@ -386,6 +393,7 @@ impl Default for EngineOptions {
             n_ctx: None,
             vram_margin_bytes: None,
             ready_timeout_secs: None,
+            rerank_micro_tokens: None,
         }
     }
 }

@@ -121,6 +121,10 @@ pub enum EngineResponse {
     Scores(Vec<f32>),
     /// Terminal error for this request.
     Error(String),
+    /// Terminal error that must render as a structured VRAM refusal: the
+    /// per-call rerank context could not fit on the device even at one
+    /// sequence (residency contract §1.1). Carries the preflight detail.
+    ContextVram(String),
 }
 
 /// Errors from engine handle operations (not per-request generation errors,
@@ -172,6 +176,22 @@ pub struct SlotLoadSpec {
     /// Context override for degradation-ladder shrink. `None` = engine
     /// default ([engine] n_ctx).
     pub n_ctx: Option<u32>,
+    /// Rerank-only: per-call packed-token cap. `None` = engine default
+    /// ([engine] rerank_micro_tokens). The degradation ladder lowers it
+    /// before dropping a rerank slot (residency contract §1.1).
+    pub rerank_micro_tokens: Option<usize>,
+}
+
+/// Why a rerank call failed (residency contract §1.1).
+#[derive(Debug, thiserror::Error)]
+pub enum RerankError {
+    /// The per-call rerank context could not fit on the device even at one
+    /// sequence — the 503 `rerank_context_vram` refusal.
+    #[error("{0}")]
+    ContextVram(String),
+    /// Any other engine failure (map to 500).
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Score `documents` against `query` with a resident reranker. One raw
@@ -182,7 +202,7 @@ pub async fn rerank_texts(
     model_alias: &str,
     query: &str,
     documents: &[String],
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>, RerankError> {
     let sender = engine.sender();
     let (tx, mut rx) = mpsc::channel::<EngineResponse>(1);
     let req = EngineRequest {
@@ -193,11 +213,17 @@ pub async fn rerank_texts(
         },
         response: tx,
     };
-    sender.send(req).await.map_err(|e| e.to_string())?;
+    sender
+        .send(req)
+        .await
+        .map_err(|e| RerankError::Other(e.to_string()))?;
     match rx.recv().await {
         Some(EngineResponse::Scores(v)) => Ok(v),
-        Some(EngineResponse::Error(e)) => Err(e),
-        other => Err(format!("unexpected rerank response: {other:?}")),
+        Some(EngineResponse::ContextVram(e)) => Err(RerankError::ContextVram(e)),
+        Some(EngineResponse::Error(e)) => Err(RerankError::Other(e)),
+        other => Err(RerankError::Other(format!(
+            "unexpected rerank response: {other:?}"
+        ))),
     }
 }
 

@@ -71,7 +71,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v1/collections/{name}/documents",
-            post(crate::routes::rag::ingest_document),
+            post(crate::routes::rag::ingest_document).get(crate::routes::rag::list_documents),
+        )
+        .route(
+            "/v1/collections/{name}/documents:batch",
+            post(crate::routes::rag::ingest_documents_batch).layer(
+                axum::extract::DefaultBodyLimit::max(crate::routes::rag::MAX_BATCH_BYTES),
+            ),
         )
         .route(
             "/v1/collections/{name}/documents/{id}",

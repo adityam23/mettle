@@ -9,8 +9,8 @@ use axum::{
 use mettle_core::engine::{EngineRequest, EngineResponse, GenConstraint, RequestKind};
 use mettle_core::hooks::{Hit, RequestCtx};
 use mettle_core::retrieval::{
-    chunk_document, Citation, Document, RagChatRequest, RagChatResponse, RagChatStreamChunk,
-    SearchMode, SearchRequest,
+    chunk_document, Citation, Document, DocumentSummary, RagChatRequest, RagChatResponse,
+    RagChatStreamChunk, SearchMode, SearchRequest,
 };
 use mettle_core::stream::{engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt};
 use mettle_core::timing::timestamp_iso8601;
@@ -363,13 +363,18 @@ pub async fn ingest_document(
     );
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
 
-    let embeddings =
-        match embed_for_collection(&state, &embedding_model, &collection_name, dim, &chunk_texts)
-            .await
-        {
-            Ok(e) => e,
-            Err(resp) => return resp,
-        };
+    let embeddings = match embed_for_collection(
+        &state,
+        &embedding_model,
+        &collection_name,
+        dim,
+        &chunk_texts,
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
 
     let mut coll = match coll_handle.lock() {
         Ok(c) => c,
@@ -396,6 +401,155 @@ pub async fn ingest_document(
             }))
             .into_response()
         }
+        Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// Hard caps on one batch ingest request (docket M3). One filing is the
+/// atomic unit: a 10-K at 220-word chunks is ~700 documents / ~1 MB, so
+/// 1024 documents and 8 MiB keep a whole filing in one batch.
+const MAX_BATCH_DOCUMENTS: usize = 1024;
+pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(serde::Deserialize)]
+pub struct BatchIngestRequest {
+    pub documents: Vec<Document>,
+}
+
+/// POST /v1/collections/:name/documents:batch — ingest many documents in one
+/// embed pass, one turbovec insert, one SQLite transaction and one flush.
+/// **All or nothing**: a duplicate id (in the batch or already stored) or
+/// any engine/SQLite error writes nothing.
+pub async fn ingest_documents_batch(
+    State(state): State<Arc<AppState>>,
+    Path(collection_name): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if body.len() > MAX_BATCH_BYTES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "batch body is {} bytes; the limit is {} bytes",
+                body.len(),
+                MAX_BATCH_BYTES
+            ),
+        )
+        .into_response();
+    }
+    let req: BatchIngestRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {e}"),
+            )
+            .into_response()
+        }
+    };
+    if req.documents.len() > MAX_BATCH_DOCUMENTS {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "batch has {} documents; the limit is {}",
+                req.documents.len(),
+                MAX_BATCH_DOCUMENTS
+            ),
+        )
+        .into_response();
+    }
+
+    let coll_handle = match collection_handle(&state, &collection_name) {
+        Ok(h) => h,
+        Err((status, msg)) => return api_error(status, msg).into_response(),
+    };
+    let (dim, embedding_model) = match coll_handle.lock() {
+        Ok(c) => (c.dim, c.embedding_model.clone()),
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
+        }
+    };
+
+    // Chunk everything, then embed the whole batch in ONE pass: 1024
+    // documents must not become 1024 forward passes.
+    let (chunk_tokens, chunk_overlap) = (
+        state.config.retrieval.chunk_tokens,
+        state.config.retrieval.chunk_overlap,
+    );
+    let mut chunked: Vec<(Document, Vec<mettle_core::retrieval::Chunk>)> =
+        Vec::with_capacity(req.documents.len());
+    let mut all_texts: Vec<String> = Vec::new();
+    for doc in req.documents {
+        let chunks = chunk_document(&doc, chunk_tokens, chunk_overlap);
+        all_texts.extend(chunks.iter().map(|c| c.text.clone()));
+        chunked.push((doc, chunks));
+    }
+
+    let embeddings =
+        match embed_for_collection(&state, &embedding_model, &collection_name, dim, &all_texts)
+            .await
+        {
+            Ok(e) => e,
+            Err(resp) => return resp,
+        };
+
+    let mut coll = match coll_handle.lock() {
+        Ok(c) => c,
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
+        }
+    };
+    match coll.add_documents_chunks(&chunked, &embeddings) {
+        Ok(per_doc) => {
+            let _ = coll.flush();
+            let total_chunks: usize = per_doc.iter().map(|ids| ids.len()).sum();
+            state
+                .metrics
+                .ingest_documents_total
+                .fetch_add(chunked.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .ingest_chunks_total
+                .fetch_add(total_chunks as u64, std::sync::atomic::Ordering::Relaxed);
+            let results: Vec<serde_json::Value> = chunked
+                .iter()
+                .zip(per_doc)
+                .map(|((doc, _), chunk_ids)| {
+                    serde_json::json!({
+                        "document_id": doc.id,
+                        "chunks": chunk_ids.len(),
+                        "chunk_ids": chunk_ids,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "documents": results.len(),
+                "chunks": total_chunks,
+                "results": results,
+            }))
+            .into_response()
+        }
+        Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// GET /v1/collections/:name/documents — every stored document with its
+/// chunk count and metadata, ordered by id, unpaginated (docket M4).
+pub async fn list_documents(
+    State(state): State<Arc<AppState>>,
+    Path(collection_name): Path<String>,
+) -> axum::response::Response {
+    let coll_handle = match collection_handle(&state, &collection_name) {
+        Ok(h) => h,
+        Err((status, msg)) => return api_error(status, msg).into_response(),
+    };
+    let coll = match coll_handle.lock() {
+        Ok(c) => c,
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
+        }
+    };
+    match coll.list_documents() {
+        Ok(docs) => Json::<Vec<DocumentSummary>>(docs).into_response(),
         Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
     }
 }

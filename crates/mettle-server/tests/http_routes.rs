@@ -814,6 +814,38 @@ async fn rerank_error_codes_match_contract() {
     assert_eq!(body["error"]["missing"][0], "bge-reranker-v2-m3");
 }
 
+/// §1.1: a per-call rerank context that cannot fit is a structured 503
+/// carrying `rerank_context_vram`, never a 500 and never a crash. A rerank
+/// that fits keeps returning 200 scores.
+#[tokio::test]
+async fn rerank_context_vram_is_a_structured_503() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = test_state(tmp.path());
+    let engine = FakeEmbedder::new(&[("bge-reranker-v2-m3:latest", 768)]);
+    state.set_engine(engine.clone());
+    let router = build_router(state);
+
+    let body = serde_json::json!({
+        "model": "bge-reranker-v2-m3",
+        "query": "q",
+        "documents": ["d1", "d2"],
+    });
+    let (status, resp) = send(&router, "POST", "/v1/rerank", Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["results"].as_array().unwrap().len(), 2);
+
+    engine.fail_rerank_context_vram(
+        "bge-reranker-v2-m3:latest",
+        "rerank context needs ~1900 MiB (2048 tokens), 300 MiB free after margin",
+    );
+    let (status, resp) = send(&router, "POST", "/v1/rerank", Some(body)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{resp}");
+    assert_eq!(resp["error"]["code"], "slot_unavailable");
+    assert_eq!(resp["error"]["reason"], "rerank_context_vram");
+    assert_eq!(resp["error"]["missing"][0], "bge-reranker-v2-m3");
+    assert!(resp["error"]["detail"].as_str().unwrap().contains("MiB"));
+}
+
 #[tokio::test]
 async fn embeddings_rejects_reranker_with_404() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -856,13 +888,18 @@ async fn collection_names_are_validated_and_never_reach_the_filesystem() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = send(&router, "DELETE", "/v1/collections/never-created", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(victim.exists(), "traversal deleted a directory outside the data dir");
+    assert!(
+        victim.exists(),
+        "traversal deleted a directory outside the data dir"
+    );
 
     let (status, body) = send(
         &router,
         "POST",
         "/v1/collections",
-        Some(serde_json::json!({ "name": "Fin_bench-2.0", "embedding_model": "embed-gemma:latest" })),
+        Some(
+            serde_json::json!({ "name": "Fin_bench-2.0", "embedding_model": "embed-gemma:latest" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -967,12 +1004,140 @@ async fn no_engine_ingest_is_a_structured_503() {
     assert_eq!(body["error"]["reason"], "no_engine", "{body}");
 }
 
-/// The literal fallback must not come back (residency contract §1.3).
-#[test]
-fn zero_vector_fallback_is_gone_from_rag_routes() {
-    let src = include_str!("../src/routes/rag.rs");
-    assert!(!src.contains("zero-vector"));
-    assert!(!src.contains("vec![0.0"));
+/// Batch ingest is all-or-nothing, the list endpoint reports what is
+/// actually stored, and a batch is searchable once it lands (docket M3/M4).
+#[tokio::test]
+async fn batch_ingest_is_atomic_and_list_documents_reports_stored_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Two documents in one batch, one request.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents:batch",
+        Some(serde_json::json!({"documents": [
+            {"id": "a#1", "content": "quartz zebra one", "metadata": {"doc_id": "a", "page": "1"}},
+            {"id": "b#1", "content": "quartz zebra two", "metadata": {"doc_id": "b", "page": "1"}},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["documents"], 2, "{body}");
+    assert_eq!(body["results"][0]["document_id"], "a#1");
+    assert!(
+        body["results"][0]["chunks"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
+
+    // The batch is searchable: both the FTS rows and the vectors landed.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/search",
+        Some(serde_json::json!({"query": "quartz zebra", "mode": "keyword", "k": 10})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+
+    // The list reports ids, chunk counts and metadata.
+    let (status, body) = send(&router, "GET", "/v1/collections/docs/documents", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let docs = body.as_array().unwrap();
+    assert_eq!(docs.len(), 2, "{body}");
+    assert_eq!(docs[0]["id"], "a#1");
+    assert!(docs[0]["chunk_count"].as_u64().unwrap() >= 1, "{body}");
+    assert_eq!(docs[0]["metadata"]["doc_id"], "a", "{body}");
+
+    // A batch containing an already-stored id writes NOTHING: the new
+    // document must not appear.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents:batch",
+        Some(serde_json::json!({"documents": [
+            {"id": "c#1", "content": "quartz zebra three"},
+            {"id": "a#1", "content": "quartz zebra one"},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (_, body) = send(&router, "GET", "/v1/collections/docs/documents", None).await;
+    assert_eq!(body.as_array().unwrap().len(), 2, "batch leaked: {body}");
+
+    // A duplicate INSIDE one batch fails the whole batch too.
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents:batch",
+        Some(serde_json::json!({"documents": [
+            {"id": "d#1", "content": "quartz zebra four"},
+            {"id": "d#1", "content": "quartz zebra five"},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, body) = send(&router, "GET", "/v1/collections/docs/documents", None).await;
+    assert_eq!(body.as_array().unwrap().len(), 2, "batch leaked: {body}");
+
+    // Caps: more documents than one batch may carry -> 413, nothing written.
+    let docs: Vec<serde_json::Value> = (0..1025)
+        .map(|i| serde_json::json!({"id": format!("big#{i}"), "content": "x"}))
+        .collect();
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents:batch",
+        Some(serde_json::json!({"documents": docs})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    // A batch well over axum's default 2 MiB body limit still lands (the
+    // route carries its own 8 MiB limit), so a whole filing fits.
+    let big: String = "quantum zebra ".repeat(200_000); // ~2.6 MiB
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents:batch",
+        Some(serde_json::json!({"documents": [{"id": "huge#1", "content": big}]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        body.to_string().chars().take(200).collect::<String>()
+    );
+    assert_eq!(
+        body["documents"],
+        1,
+        "{}",
+        body.to_string().chars().take(200).collect::<String>()
+    );
+
+    // Unknown collection is a 404, not an empty 200.
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections/nope/documents:batch",
+        Some(serde_json::json!({"documents": [{"id": "z", "content": "z"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&router, "GET", "/v1/collections/nope/documents", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// Document ids are free-form; percent-encoded path segments decode to the

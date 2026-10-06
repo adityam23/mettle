@@ -12,7 +12,7 @@ use axum::{
 };
 use mettle_core::engine::{
     embed_texts, rerank_texts, EngineRequest, EngineResponse, GenConstraint, RequestKind,
-    SamplingParams,
+    RerankError, SamplingParams,
 };
 use mettle_core::hooks::RequestCtx;
 use mettle_core::ollama_types::{ChatMessage, OneOrMany};
@@ -31,6 +31,7 @@ use uuid::Uuid;
 use super::error::{api_error, api_error_code};
 use crate::response_stream::SseStream;
 use crate::state::AppState;
+use crate::unavailable::{Unavailable, UnavailableReason};
 use futures::StreamExt;
 
 /// Map OpenAI sampling fields to the neutral params.
@@ -537,9 +538,24 @@ pub async fn rerank_handler(
             })
             .into_response()
         }
+        // Residency contract §1.1: a per-call context that cannot fit is a
+        // structured 503 (the request never allocated GPU memory), not a
+        // crash and not a 500 a consumer would retry blindly.
+        Err(RerankError::ContextVram(detail)) => {
+            state.profiles.note_runtime_failure(&entry.alias, &detail);
+            Unavailable {
+                id: model_id,
+                reason: UnavailableReason::RerankContextVram,
+                detail: Some(detail),
+                profile_degraded: state.profiles.profile_degraded(),
+            }
+            .into_response()
+        }
         Err(e) => {
-            state.profiles.note_runtime_failure(&entry.alias, &e);
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+            state
+                .profiles
+                .note_runtime_failure(&entry.alias, &e.to_string());
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
 }

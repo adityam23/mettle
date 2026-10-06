@@ -157,7 +157,7 @@ where
                         return;
                     }
                 }
-                EngineResponse::Error(e) => {
+                EngineResponse::Error(e) | EngineResponse::ContextVram(e) => {
                     yield Err(e);
                     return;
                 }
@@ -221,7 +221,9 @@ pub async fn engine_accumulate<T>(
                     hooks.on_token(&ctx, &token_info(&content, logprob.as_ref()));
                 }
             }
-            EngineResponse::Error(e) => {
+            // Generation paths never produce ContextVram; surface either as
+            // a plain engine error.
+            EngineResponse::Error(e) | EngineResponse::ContextVram(e) => {
                 return Err((500, e));
             }
             EngineResponse::Embeddings(_) | EngineResponse::Scores(_) => {}

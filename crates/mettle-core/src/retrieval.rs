@@ -23,6 +23,16 @@ pub struct Document {
     pub metadata: HashMap<String, String>,
 }
 
+/// One stored document as reported by the list endpoint: the id is the
+/// consumer's reconciliation key, `chunk_count` its footprint here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentSummary {
+    pub id: String,
+    pub chunk_count: u64,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
 /// A chunk produced by splitting a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
@@ -479,38 +489,70 @@ impl Collection {
         chunks: &[Chunk],
         embeddings: &[f32],
     ) -> Result<Vec<String>, CoreError> {
-        // Check if document already exists.
+        let per_doc = self.add_documents_chunks(&[(doc.clone(), chunks.to_vec())], embeddings)?;
+        Ok(per_doc.into_iter().next().unwrap_or_default())
+    }
+
+    /// Insert a batch of pre-chunked, pre-embedded documents **all or
+    /// nothing**: any failure (duplicate id — in the batch or already
+    /// stored — a vector-count mismatch, a SQLite or turbovec error) leaves
+    /// the collection byte-identical. One `add_with_ids`, one SQLite
+    /// transaction, one caller-side flush.
+    ///
+    /// `embeddings` is the flat `[f32; total_chunks * dim]` array for every
+    /// document in `docs`, in order. Chunk-less documents write nothing and
+    /// come back with an empty id list.
+    pub fn add_documents_chunks(
+        &mut self,
+        docs: &[(Document, Vec<Chunk>)],
+        embeddings: &[f32],
+    ) -> Result<Vec<Vec<String>>, CoreError> {
         let db_path = self.data_dir.join("metadata.db");
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
-        let existing: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM documents WHERE id = ?1",
-                [&doc.id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if existing {
-            return Err(CoreError::Conflict(format!(
-                "document '{}' already exists in collection '{}'",
-                doc.id, self.name
-            )));
+        let total_chunks: usize = docs
+            .iter()
+            .filter(|(_, chunks)| !chunks.is_empty())
+            .map(|(_, chunks)| chunks.len())
+            .sum();
+        if total_chunks == 0 {
+            return Ok(docs.iter().map(|_| Vec::new()).collect());
         }
-
-        if chunks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        if embeddings.len() != chunks.len() * self.dim {
+        if embeddings.len() != total_chunks * self.dim {
             return Err(CoreError::Retrieval(format!(
                 "embed_fn returned {} floats, expected {} ({} chunks * dim {})",
                 embeddings.len(),
-                chunks.len() * self.dim,
-                chunks.len(),
+                total_chunks * self.dim,
+                total_chunks,
                 self.dim
             )));
+        }
+
+        // Pre-flight every document: an id that already exists, or that
+        // appears twice in the batch, fails the whole batch before a single
+        // row is written.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (doc, _) in docs {
+            if !seen.insert(doc.id.as_str()) {
+                return Err(CoreError::Conflict(format!(
+                    "document '{}' appears twice in the batch",
+                    doc.id
+                )));
+            }
+            let existing: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM documents WHERE id = ?1",
+                    [&doc.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if existing {
+                return Err(CoreError::Conflict(format!(
+                    "document '{}' already exists in collection '{}'",
+                    doc.id, self.name
+                )));
+            }
         }
 
         // turbovec scores estimate the inner product <v, q>; the served models
@@ -521,47 +563,62 @@ impl Collection {
             l2_normalize(row);
         }
 
-        // Atomic per document: stage every SQLite row in one transaction,
-        // insert the vectors, then commit. Any failure before the commit
-        // rolls the rows back (the transaction drops), and a failed commit
-        // removes the vectors again — no half-written document survives.
+        // Atomic all-or-nothing: every SQLite row in ONE transaction, every
+        // vector in ONE turbovec insert, then commit. Any failure before the
+        // commit rolls the rows back (the transaction drops) and a failed
+        // commit removes the vectors again — no half-written batch survives.
+        // One index write per batch is also what makes a ~1000-document
+        // ingest feasible: the single-document path rewrites the whole
+        // index.bin on every call.
         let base_id = self.next_int_id;
-        let int_ids: Vec<u64> = (base_id..base_id + chunks.len() as u64).collect();
+        let int_ids: Vec<u64> = (base_id..base_id + total_chunks as u64).collect();
 
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| CoreError::Retrieval(format!("sqlite begin: {}", e)))?;
-        tx.execute(
-            "INSERT INTO documents (id, metadata_json) VALUES (?1, ?2)",
-            rusqlite::params![
-                doc.id,
-                serde_json::to_string(&doc.metadata).unwrap_or_default()
-            ],
-        )
-        .map_err(|e| CoreError::Retrieval(format!("sqlite insert document: {}", e)))?;
 
-        let mut chunk_ids = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.iter().enumerate() {
-            let chunk_id = format!("{}/chunk/{}", doc.id, i);
+        let mut per_doc = Vec::with_capacity(docs.len());
+        let mut next_int = 0usize;
+        for (doc, chunks) in docs {
+            // A chunk-less document writes no row at all (single-path parity).
+            if chunks.is_empty() {
+                per_doc.push(Vec::new());
+                continue;
+            }
             tx.execute(
-                "INSERT INTO chunks (id, int_id, document_id, text, char_offset) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO documents (id, metadata_json) VALUES (?1, ?2)",
                 rusqlite::params![
-                    chunk_id,
-                    int_ids[i] as i64,
                     doc.id,
-                    chunk.text,
-                    chunk.char_offset as i64,
+                    serde_json::to_string(&doc.metadata).unwrap_or_default()
                 ],
             )
-            .map_err(|e| CoreError::Retrieval(format!("sqlite insert chunk: {}", e)))?;
+            .map_err(|e| CoreError::Retrieval(format!("sqlite insert document: {}", e)))?;
 
-            tx.execute(
-                "INSERT INTO chunks_fts (chunk_id, text) VALUES (?1, ?2)",
-                rusqlite::params![chunk_id, chunk.text],
-            )
-            .map_err(|e| CoreError::Retrieval(format!("sqlite fts insert: {}", e)))?;
+            let mut chunk_ids = Vec::with_capacity(chunks.len());
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_id = format!("{}/chunk/{}", doc.id, i);
+                tx.execute(
+                    "INSERT INTO chunks (id, int_id, document_id, text, char_offset) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        chunk_id,
+                        int_ids[next_int] as i64,
+                        doc.id,
+                        chunk.text,
+                        chunk.char_offset as i64,
+                    ],
+                )
+                .map_err(|e| CoreError::Retrieval(format!("sqlite insert chunk: {}", e)))?;
 
-            chunk_ids.push(chunk_id);
+                tx.execute(
+                    "INSERT INTO chunks_fts (chunk_id, text) VALUES (?1, ?2)",
+                    rusqlite::params![chunk_id, chunk.text],
+                )
+                .map_err(|e| CoreError::Retrieval(format!("sqlite fts insert: {}", e)))?;
+
+                chunk_ids.push(chunk_id);
+                next_int += 1;
+            }
+            per_doc.push(chunk_ids);
         }
 
         self.index
@@ -574,9 +631,45 @@ impl Collection {
             }
             return Err(CoreError::Retrieval(format!("sqlite commit: {}", e)));
         }
-        self.next_int_id += chunks.len() as u64;
+        self.next_int_id += total_chunks as u64;
 
-        Ok(chunk_ids)
+        Ok(per_doc)
+    }
+
+    /// Every document in the collection with its chunk count and metadata.
+    /// The ids are the reconciliation key for a consumer tracking its own
+    /// lineage (list endpoint).
+    pub fn list_documents(&self) -> Result<Vec<DocumentSummary>, CoreError> {
+        let db_path = self.data_dir.join("metadata.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.id, d.metadata_json, \
+                 (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) \
+                 FROM documents d ORDER BY d.id",
+            )
+            .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, metadata_json, chunk_count) =
+                row.map_err(|e| CoreError::Retrieval(format!("sqlite row: {}", e)))?;
+            out.push(DocumentSummary {
+                id,
+                chunk_count: chunk_count.max(0) as u64,
+                metadata: serde_json::from_str(&metadata_json).unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     /// Delete a document and all its chunks.

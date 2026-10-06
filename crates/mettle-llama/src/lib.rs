@@ -37,10 +37,12 @@ use tokio::sync::mpsc;
 
 use mettle_core::engine::{
     Engine, EngineError, EngineRequest, EngineResponse, GenConstraint, ModelKind, ModelLoadSpec,
-    RequestKind, SamplingParams, SlotLoadSpec, TokenLogprob,
+    RequestKind, RerankError, SamplingParams, SlotLoadSpec, TokenLogprob,
 };
 use mettle_core::model_registry::Pooling;
 
+use crate::scheduler::flash_policy;
+use crate::vram::RerankGeometry;
 use mtp::{MtpLane, MtpParams};
 // Re-exported for integration tests (crash_repro drives the scheduler
 // directly instead of through the engine worker).
@@ -95,8 +97,19 @@ pub struct LlamaConfig {
     /// q8_0 KV quantisation (llama.cpp has no FP8; q8_0 is the stand-in).
     pub kv_cache_q8: bool,
     pub flash_attn: bool,
+    /// Rerank per-call packed-token cap (residency contract §1.1). Bounds
+    /// the per-call rerank compute buffer; a slot may override it lower.
+    pub rerank_micro_tokens: usize,
     pub speculative: SpecConfig,
 }
+
+/// Default rerank per-call packed-token cap ([engine] rerank_micro_tokens).
+pub const DEFAULT_RERANK_MICRO_TOKENS: usize = 2048;
+
+/// Floor the planner will shrink a rerank slot's packed-token cap to
+/// before dropping the slot (residency contract §1.1). One sequence of a
+/// typical query/document pair still fits at this cap.
+pub const MIN_RERANK_MICRO_TOKENS: usize = 256;
 
 impl Default for LlamaConfig {
     fn default() -> Self {
@@ -112,6 +125,7 @@ impl Default for LlamaConfig {
             default_max_tokens: 512,
             kv_cache_q8: true,
             flash_attn: true,
+            rerank_micro_tokens: DEFAULT_RERANK_MICRO_TOKENS,
             speculative: SpecConfig::default(),
         }
     }
@@ -149,6 +163,17 @@ struct ModelRuntime {
     /// The GGUF's named "rerank" chat template, resolved at load time
     /// (`Some` only for reranker models that embed one).
     rerank_template: Option<String>,
+    /// Whether ops run on the GPU for this model's inline (embed/rerank)
+    /// contexts. `placement = "cpu"` slots set this false so their compute
+    /// buffers never land on CUDA0 (residency contract §1.2).
+    op_offload: bool,
+    /// Per-call packed-token cap for this reranker (slot override, else
+    /// engine default). Ignored for non-rerank kinds.
+    rerank_micro_tokens: usize,
+    /// Cost coefficients for this reranker's per-call context, read at load
+    /// time. `None` for non-rerank kinds or a CPU-placed reranker (no GPU
+    /// context to preflight).
+    rerank_geometry: Option<RerankGeometry>,
 }
 
 /// llama.cpp-backed engine handle shared via `AppState`.
@@ -221,6 +246,7 @@ impl Engine for LlamaEngine {
             mtp_draft: None,
             draft: None,
             n_ctx: None,
+            rerank_micro_tokens: None,
         })
     }
 
@@ -286,6 +312,7 @@ fn worker_main(
             mtp_draft: None,
             draft: None,
             n_ctx: None,
+            rerank_micro_tokens: None,
         };
         match load_runtime(&backend, &slot, &cfg) {
             Ok(rt) => {
@@ -392,12 +419,24 @@ fn load_runtime(
                 ModelKind::Rerank => gguf_rerank_template(&spec.gguf_path),
                 _ => None,
             };
+            let op_offload = spec.n_gpu_layers.unwrap_or(cfg.n_gpu_layers) > 0;
+            // Rerank preflight coefficients (§1.1); only meaningful when the
+            // context will hold GPU buffers.
+            let rerank_geometry = (matches!(kind, ModelKind::Rerank) && op_offload)
+                .then(|| vram::rerank_geometry(&spec.gguf_path, cfg.kv_cache_q8))
+                .flatten();
             return Ok(ModelRuntime {
                 sched: None,
                 mtp: None,
                 model,
                 kind,
                 rerank_template,
+                // §1.2: CPU-placed models must not reserve CUDA compute
+                // buffers, so op offload follows the same n_gpu_layers
+                // signal the generation path uses.
+                op_offload,
+                rerank_micro_tokens: slot.rerank_micro_tokens.unwrap_or(cfg.rerank_micro_tokens),
+                rerank_geometry,
             });
         }
     }
@@ -471,6 +510,9 @@ fn load_runtime(
             model,
             kind: ModelKind::Generation,
             rerank_template: None,
+            op_offload,
+            rerank_micro_tokens: cfg.rerank_micro_tokens,
+            rerank_geometry: None,
         });
     }
 
@@ -492,6 +534,9 @@ fn load_runtime(
         model,
         kind: ModelKind::Generation,
         rerank_template: None,
+        op_offload,
+        rerank_micro_tokens: cfg.rerank_micro_tokens,
+        rerank_geometry: None,
     })
 }
 
@@ -569,7 +614,7 @@ fn route_request(
                     return;
                 }
             };
-            match embed(backend, &rt.model, pooling, &input) {
+            match embed(backend, &rt.model, pooling, &input, rt.op_offload) {
                 Ok(v) => {
                     let _ = response.blocking_send(EngineResponse::Embeddings(v));
                 }
@@ -591,12 +636,18 @@ fn route_request(
                 rt.rerank_template.as_deref(),
                 &query,
                 &documents,
+                rt.rerank_micro_tokens,
+                rt.rerank_geometry,
+                rt.op_offload,
             ) {
                 Ok(v) => {
                     let _ = response.blocking_send(EngineResponse::Scores(v));
                 }
-                Err(e) => {
-                    let _ = response.blocking_send(EngineResponse::Error(e.to_string()));
+                Err(RerankError::ContextVram(e)) => {
+                    let _ = response.blocking_send(EngineResponse::ContextVram(e));
+                }
+                Err(RerankError::Other(e)) => {
+                    let _ = response.blocking_send(EngineResponse::Error(e));
                 }
             }
         }
@@ -632,6 +683,7 @@ fn embed(
     model: &LlamaModel,
     pooling: Pooling,
     input: &str,
+    op_offload: bool,
 ) -> Result<Vec<f32>> {
     let tokens = model.str_to_token(input, AddBos::Always)?;
     anyhow::ensure!(!tokens.is_empty(), "empty embedding input");
@@ -649,7 +701,7 @@ fn embed(
 
     let mut ctx = model.new_context(
         backend,
-        embed_ctx_params(pooling, tokens.len(), tokens.len(), 1),
+        embed_ctx_params(pooling, tokens.len(), tokens.len(), 1, op_offload),
     )?;
     let mut batch = LlamaBatch::new(tokens.len().max(8), 1);
     for (i, tok) in tokens.iter().enumerate() {
@@ -661,6 +713,54 @@ fn embed(
         .embeddings_seq_ith(0)
         .map_err(|e| anyhow::anyhow!("embeddings: {e}"))?;
     Ok(emb.to_vec())
+}
+
+/// Rerank micro-batch shape: at most this many sequences per context
+/// (bounded further by the packed-token cap). Matches the cap the planner
+/// budgets for (residency contract §1.1).
+pub const RERANK_MICRO_BATCH: usize = 8;
+
+/// Margin held back from the device's free memory when preflighting an
+/// inline (rerank/embed) context, matching the planner's default.
+const INLINE_VRAM_MARGIN: u64 = 512 * 1024 * 1024;
+
+/// Cached accelerator probe for the inline-context preflight (residency
+/// contract §1.1). Probed once; `memory()` shells out per call.
+static DEVICE_PROBE: std::sync::LazyLock<Option<Box<dyn mettle_core::device::Device>>> =
+    std::sync::LazyLock::new(mettle_core::device::detect);
+
+/// Current free VRAM minus the inline margin, or `None` when no
+/// accelerator is reachable (CPU-only host: no GPU context to preflight).
+fn inline_vram_budget() -> Option<u64> {
+    let dev = DEVICE_PROBE.as_ref()?;
+    Some(dev.memory()?.free_bytes.saturating_sub(INLINE_VRAM_MARGIN))
+}
+
+/// Estimated cost of the context one rerank micro-batch of `chunk` needs.
+fn rerank_batch_cost(geo: &RerankGeometry, chunk: &[Vec<LlamaToken>]) -> vram::RerankContextCost {
+    let total: usize = chunk.iter().map(|s| s.len()).sum();
+    let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(1);
+    let kv_cells = max_len.div_ceil(256) * 256 * chunk.len();
+    geo.cost(kv_cells, total)
+}
+
+/// Shrink a greedy-filled batch (whole sequences only) until its estimated
+/// per-call context fits `budget`. Returns `(n, fits)`: the number of
+/// leading sequences to use and whether that batch fits. `budget = None`
+/// (no reachable accelerator) keeps the batch unchanged.
+fn fit_rerank_batch(
+    geo: &RerankGeometry,
+    chunk: &[Vec<LlamaToken>],
+    budget: Option<u64>,
+) -> (usize, bool) {
+    let mut n = chunk.len();
+    let Some(budget) = budget else {
+        return (n, true);
+    };
+    while n > 1 && rerank_batch_cost(geo, &chunk[..n]).total() > budget {
+        n = n.div_ceil(2);
+    }
+    (n, rerank_batch_cost(geo, &chunk[..n]).total() <= budget)
 }
 
 /// Score (query, document) pairs with a cross-encoder reranker.
@@ -677,7 +777,104 @@ fn rerank(
     template: Option<&str>,
     query: &str,
     documents: &[String],
-) -> Result<Vec<f32>> {
+    micro_tokens: usize,
+    geometry: Option<RerankGeometry>,
+    op_offload: bool,
+) -> Result<Vec<f32>, mettle_core::engine::RerankError> {
+    // Everything that can fail is an ordinary engine error except the §1.1
+    // preflight refusal, which returns `ContextVram`.
+    fn other(e: impl std::fmt::Display) -> RerankError {
+        RerankError::Other(e.to_string())
+    }
+    let seqs = rerank_sequences(model, template, query, documents).map_err(other)?;
+    if seqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut scores = Vec::with_capacity(seqs.len());
+    let mut batch_seqs: &[Vec<LlamaToken>] = &seqs;
+    while !batch_seqs.is_empty() {
+        // Greedy fill: take whole sequences while both caps hold (at least
+        // one sequence per context, even when it alone exceeds the token cap).
+        let mut n = 0usize;
+        let mut tokens = 0usize;
+        for seq in batch_seqs {
+            let len = seq.len();
+            if n > 0 && (n >= RERANK_MICRO_BATCH || tokens + len > micro_tokens) {
+                break;
+            }
+            n += 1;
+            tokens += len;
+        }
+        // §1.1 preflight: a ggml/CUDA allocation failure aborts the whole
+        // process, so never attempt a context we cannot fit. Halve the
+        // batch (whole sequences) until it fits; if even one sequence does
+        // not, refuse with the structured reason and keep the process up.
+        if let Some(geo) = geometry {
+            let budget = inline_vram_budget();
+            let (fit_n, fits) = fit_rerank_batch(&geo, &batch_seqs[..n], budget);
+            n = fit_n;
+            if !fits {
+                let cost = rerank_batch_cost(&geo, &batch_seqs[..n]);
+                let budget = budget.unwrap_or(0);
+                return Err(RerankError::ContextVram(format!(
+                    "rerank context needs ~{} MiB ({} tokens), {} MiB free after margin",
+                    cost.total() / (1024 * 1024),
+                    batch_seqs[..n].iter().map(|s| s.len()).sum::<usize>(),
+                    budget / (1024 * 1024)
+                )));
+            }
+        }
+        let (chunk, rest) = batch_seqs.split_at(n);
+        batch_seqs = rest;
+        let total: usize = chunk.iter().map(|s| s.len()).sum();
+        let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(1);
+        let kv_cells = max_len.div_ceil(256) * 256 * chunk.len();
+        let params = embed_ctx_params(Pooling::Rank, kv_cells, total, chunk.len(), op_offload);
+        let t0 = std::time::Instant::now();
+        let mut ctx = model.new_context(backend, params).map_err(other)?;
+        let create_ms = t0.elapsed().as_millis();
+        let mut batch = LlamaBatch::new(total.max(8), chunk.len() as i32);
+        for (seq_i, seq) in chunk.iter().enumerate() {
+            for (pos, tok) in seq.iter().enumerate() {
+                batch
+                    .add(*tok, pos as i32, &[seq_i as i32], false)
+                    .map_err(other)?;
+            }
+        }
+        let t1 = std::time::Instant::now();
+        ctx.decode(&mut batch).map_err(other)?;
+        tracing::debug!(
+            rerank_batch = %format!(
+                "n_seq={} tokens={total} ctx_create={create_ms}ms decode={}ms",
+                chunk.len(),
+                t1.elapsed().as_millis()
+            ),
+            "rerank micro-batch"
+        );
+        for seq_i in 0..chunk.len() {
+            let emb = ctx
+                .embeddings_seq_ith(seq_i as i32)
+                .map_err(|e| other(format!("rerank scores: {e}")))?;
+            if emb.is_empty() {
+                return Err(other(
+                    "model produced no rerank score (missing classifier head?)",
+                ));
+            }
+            scores.push(emb[0]);
+        }
+    }
+    Ok(scores)
+}
+
+/// Build one token sequence per (query, document) pair, truncating docs so
+/// each pair fits the training context (positions beyond it are
+/// out-of-distribution).
+fn rerank_sequences(
+    model: &LlamaModel,
+    template: Option<&str>,
+    query: &str,
+    documents: &[String],
+) -> Result<Vec<Vec<LlamaToken>>> {
     let limit = model.n_ctx_train() as usize;
     let bos = model.token_bos();
     let eos = model.token_eos();
@@ -734,89 +931,7 @@ fn rerank(
         anyhow::ensure!(!seq.is_empty(), "empty rerank input");
         seqs.push(seq);
     }
-    if seqs.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Micro-batched multi-sequence decode (adoption-contract §1.3, 2026-09-10):
-    // pairs are grouped into ONE context with n_seq sequences and decoded in a
-    // single pass — the same geometry upstream llama-server's rerank endpoint
-    // uses. The per-pair-loop this replaces measured p50 12.5 s per 40-doc
-    // call; batching must land p50 <= 4 s (gate) while preserving score
-    // ORDER: multi-seq batching perturbs decoder-arch rerankers (Qwen3) at
-    // the sub-0.1% score level, so order survives (rho >= 0.99 gate on the
-    // probe baseline) — bit-exact logits are NOT preserved, by contract.
-    //
-    // Micro-batch bounds: at most RERANK_MICRO_BATCH sequences AND
-    // RERANK_MICRO_TOKENS total tokens per context. KV is split per
-    // sequence in this llama.cpp build (kv_unified=false, no context-params
-    // knob), so n_ctx MUST be max_len * n_seqs (each seq needs max_len
-    // cells); the compute buffer scales with the ubatch (= whole pass) and a
-    // 3751-token pass reserved 2.2 GiB — enough to fail next to the resident
-    // models on the 6 GB card, hence the 2048-token cap. n_ubatch must cover
-    // the whole pass: encoder contexts cannot split a sequence across
-    // ubatches.
-    const RERANK_MICRO_BATCH: usize = 8;
-    const RERANK_MICRO_TOKENS: usize = 2048;
-
-    let mut scores = Vec::with_capacity(seqs.len());
-    let mut batch_seqs: &[Vec<LlamaToken>] = &seqs;
-    while !batch_seqs.is_empty() {
-        // Greedy fill: take whole sequences while both caps hold (at least
-        // one sequence per context, even when it alone exceeds the budget).
-        let mut n = 0usize;
-        let mut tokens = 0usize;
-        for seq in batch_seqs {
-            let len = seq.len();
-            if n > 0 && (n >= RERANK_MICRO_BATCH || tokens + len > RERANK_MICRO_TOKENS) {
-                break;
-            }
-            n += 1;
-            tokens += len;
-        }
-        let (chunk, rest) = batch_seqs.split_at(n);
-        batch_seqs = rest;
-
-        // Split-KV layout: per-seq capacity is kv_cells / n_seqs, so size
-        // kv_cells = max_len * n_seqs (256-granular per sequence, which also
-        // keeps n_ctx divisible by n_seq_max — llama.cpp silently rounds
-        // n_ctx DOWN). Compute (pp) stays at the actually-packed token
-        // total: reserving it for the KV-shaped worst case OOMs the 6 GB
-        // card (a 4608-cell shape wanted a 2.5 GiB compute buffer).
-        let total: usize = chunk.iter().map(|s| s.len()).sum();
-        let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(1);
-        let kv_cells = max_len.div_ceil(256) * 256 * chunk.len();
-        let params = embed_ctx_params(Pooling::Rank, kv_cells, total, chunk.len());
-        let t0 = std::time::Instant::now();
-        let mut ctx = model.new_context(backend, params)?;
-        let create_ms = t0.elapsed().as_millis();
-        let mut batch = LlamaBatch::new(total.max(8), chunk.len() as i32);
-        for (seq_i, seq) in chunk.iter().enumerate() {
-            for (pos, tok) in seq.iter().enumerate() {
-                batch.add(*tok, pos as i32, &[seq_i as i32], false)?;
-            }
-        }
-        let t1 = std::time::Instant::now();
-        ctx.decode(&mut batch)?;
-        let decode_ms = t1.elapsed().as_millis();
-        tracing::debug!(
-            rerank_batch = %format!(
-                "n_seq={} tokens={total} ctx_create={create_ms}ms decode={decode_ms}ms",
-                chunk.len()
-            ),
-            "rerank micro-batch"
-        );
-        for seq_i in 0..chunk.len() {
-            let emb = ctx
-                .embeddings_seq_ith(seq_i as i32)
-                .map_err(|e| anyhow::anyhow!("rerank scores: {e}"))?;
-            anyhow::ensure!(
-                !emb.is_empty(),
-                "model produced no rerank score (missing classifier head?)"
-            );
-            scores.push(emb[0]);
-        }
-    }
-    Ok(scores)
+    Ok(seqs)
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1098,7 @@ fn embed_ctx_params(
     kv_cells: usize,
     pp_tokens: usize,
     n_seqs: usize,
+    op_offload: bool,
 ) -> LlamaContextParams {
     // `pp_tokens` sizes the prefill compute buffer (n_batch / n_ubatch must
     // cover the whole pass — encoder contexts cannot split a sequence across
@@ -1013,6 +1129,11 @@ fn embed_ctx_params(
                 .map(|n| n.get() as i32)
                 .unwrap_or(4),
         )
+        // §1.2: a CPU-placed model must not reserve a CUDA compute buffer;
+        // op offload follows the same signal as the generation path (the
+        // scheduler sets flash attention from it too).
+        .with_flash_attention_policy(flash_policy(op_offload))
+        .with_op_offload(op_offload)
         .with_embeddings(true)
         .with_pooling_type(match pooling {
             Pooling::Mean => LlamaPoolingType::Mean,
@@ -1049,4 +1170,45 @@ pub fn gguf_embedding_dim(path: &std::path::Path) -> Option<u32> {
         .to_owned();
     let idx = ctx.find_key(&format!("{arch}.embedding_length"));
     (idx >= 0).then(|| ctx.val_u32(idx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seqs(lens: &[usize]) -> Vec<Vec<LlamaToken>> {
+        lens.iter()
+            .map(|n| (0..*n).map(|i| LlamaToken::new(i as i32)).collect())
+            .collect()
+    }
+
+    /// §1.1: the preflight halves the batch while the estimated context does
+    /// not fit, and reports failure (rather than allocating) when even one
+    /// sequence cannot fit.
+    #[test]
+    fn rerank_preflight_shrinks_then_refuses() {
+        // 1 KiB/token compute, no base, no KV: cost = 2048 tokens * 1 KiB.
+        let geo = RerankGeometry::with_coefficients(0, 1024, 0);
+        let batch = seqs(&[512, 512, 512, 512]);
+
+        // Everything fits.
+        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(4096 * 1024));
+        assert_eq!((n, fits), (4, true));
+
+        // 2 sequences (1024 tokens = 1 MiB) fit, 4 (2 MiB) do not.
+        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(1500 * 1024));
+        assert_eq!((n, fits), (2, true));
+
+        // One sequence (512 tokens = 512 KiB) is the last rung that fits.
+        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(600 * 1024));
+        assert_eq!((n, fits), (1, true));
+
+        // Below one sequence: refuse instead of allocating.
+        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(100 * 1024));
+        assert_eq!((n, fits), (1, false));
+
+        // No reachable accelerator: no preflight at all.
+        let (n, fits) = fit_rerank_batch(&geo, &batch, None);
+        assert_eq!((n, fits), (4, true));
+    }
 }
