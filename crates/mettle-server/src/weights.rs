@@ -312,6 +312,41 @@ pub fn is_downloadable(entry: &RegistryEntry) -> bool {
     entry.local_path.is_none() && entry.hf_quant_filename.is_some()
 }
 
+/// Is every file this entry needs already resolvable on disk?
+///
+/// Non-vision entries need only the GGUF, so this is the old GGUF-only test
+/// (`resolve_gguf_path`, strict named-file rule included) for them. A
+/// [`LoaderKind::GgufVision`](mettle_core::model_registry::LoaderKind::GgufVision)
+/// entry also needs its projector: a download interrupted between the two
+/// files would otherwise leave the model text-only forever, because a
+/// GGUF-only presence test reports it as complete and nothing else re-derives
+/// presence from the mmproj.
+pub fn model_files_present(entry: &RegistryEntry) -> bool {
+    crate::llama_bridge::resolve_gguf_path(entry).is_ok() && mmproj_present(entry)
+}
+
+/// Non-logging twin of the lookup `llama_bridge::resolve_mmproj_path`
+/// performs for a vision entry: the configured `mmproj_path` first, then the
+/// HF cache. `true` for entries that declare no projector at all.
+///
+/// Presence is probed for every pinned entry on every boot, so unlike the
+/// loader's resolver this must not warn about a configured-but-missing
+/// `mmproj_path` — an incomplete entry is exactly what the probe is for.
+fn mmproj_present(entry: &RegistryEntry) -> bool {
+    let mettle_core::model_registry::LoaderKind::GgufVision {
+        mmproj_filename, ..
+    } = &entry.loader_kind
+    else {
+        return true;
+    };
+    if let Some(p) = &entry.mmproj_path {
+        if p.exists() {
+            return true;
+        }
+    }
+    cached_file(&entry.hf_repo_id, mmproj_filename).is_some()
+}
+
 /// Ensure an entry's weights are on disk and return the GGUF path.
 ///
 /// Order: configured local path → HF cache → download (when the registry
@@ -321,7 +356,24 @@ pub async fn ensure_weights(
     offline: bool,
     sink: Option<ProgressSink>,
 ) -> Result<PathBuf, String> {
+    if model_files_present(entry) {
+        return crate::llama_bridge::resolve_gguf_path(entry);
+    }
+    // Not complete, but the GGUF itself resolves: the only file
+    // `model_files_present` can be missing here is a vision entry's mmproj
+    // (it is in `hf_filenames`, so `fetch_model_files` re-checks it and
+    // downloads just that file). When there is no source to fetch from — a
+    // configured local path, no HF source, or offline mode — return the GGUF
+    // so the entry still loads text-only, exactly as the GGUF-only test did.
     if let Ok(path) = crate::llama_bridge::resolve_gguf_path(entry) {
+        if is_downloadable(entry) && !offline {
+            tracing::info!(
+                "model '{}' is partially on disk; fetching its missing files from {}",
+                entry.alias,
+                entry.hf_repo_id
+            );
+            fetch_model_files(entry, sink).await?;
+        }
         return Ok(path);
     }
     if let Some(p) = &entry.local_path {
@@ -390,6 +442,37 @@ mod tests {
         // Offline proves no network path was taken.
         let got = ensure_weights(&e, true, None).await.unwrap();
         assert_eq!(got, path);
+    }
+
+    #[tokio::test]
+    async fn vision_entry_is_incomplete_without_its_mmproj() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"GGUF").unwrap();
+        let mmproj = dir.path().join("mmproj.gguf");
+        std::fs::write(&mmproj, b"MMPROJ").unwrap();
+
+        let mut e = entry("unlimited-ocr:latest");
+        assert!(matches!(e.loader_kind, LoaderKind::GgufVision { .. }));
+        // A repo that cannot exist in the local HF cache, so presence depends
+        // only on the two paths above.
+        e.hf_repo_id = "mettle-tests/nonexistent-vision-repo".into();
+        e.loader_kind = LoaderKind::GgufVision {
+            quant_filename: "model.gguf".into(),
+            mmproj_filename: "mmproj-not-in-cache.gguf".into(),
+        };
+        e.local_path = Some(gguf.clone());
+        e.mmproj_path = Some(mmproj.clone());
+        assert!(model_files_present(&e));
+
+        // The GGUF alone is not enough: a missing projector is detected even
+        // though the weight file resolves.
+        std::fs::remove_file(&mmproj).unwrap();
+        assert!(!model_files_present(&e));
+
+        // A local-path entry has no source to fetch the mmproj from, so it
+        // still degrades to the text-only GGUF instead of failing the boot.
+        assert_eq!(ensure_weights(&e, true, None).await.unwrap(), gguf);
     }
 
     #[tokio::test]

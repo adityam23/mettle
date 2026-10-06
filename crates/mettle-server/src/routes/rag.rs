@@ -66,7 +66,12 @@ async fn embed_for_collection(
         embedding_model.to_string()
     };
 
-    let (_, engine) = state.v1_engine_for(&alias)?;
+    // The engine keys loaded models by their canonical registry alias, so the
+    // request must carry it: a collection created with a short name
+    // (`bge-m3`, resolving to `bge-m3:latest`) would otherwise fail with
+    // "model 'bge-m3' is not loaded" on every ingest and dense search.
+    let (entry, engine) = state.v1_engine_for(&alias)?;
+    let alias = entry.alias.clone();
     let vectors = mettle_core::engine::embed_texts(engine.as_ref(), &alias, texts)
         .await
         .map_err(|e| {
@@ -126,6 +131,15 @@ pub async fn create_collection(
         }
     } else {
         req.embedding_model.clone()
+    };
+
+    // Canonicalise before storing. `resolve_model` is what applies the
+    // `:latest` fallback, and the engine keys loaded models by that canonical
+    // alias, so a collection created as "bge-m3" must be stored (and used) as
+    // "bge-m3:latest" - the same thing the "default" arm above already does.
+    let embedding_model = match state.resolve_model(&embedding_model) {
+        Ok(entry) => entry.alias,
+        Err(e) => return api_error(StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
 
     // The collection's turbovec index is built at the embedding model's real
@@ -196,6 +210,126 @@ pub async fn list_collections(State(state): State<Arc<AppState>>) -> axum::respo
         Ok(store) => Json(store.list()).into_response(),
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
     }
+}
+
+/// GET /v1/collections/:name — one collection's shape and whether its
+/// stored vectors predate the L2-normalisation change (in which case its
+/// dense/hybrid scores carry a scale bias and it needs `POST .../reindex`).
+pub async fn get_collection(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let handle = match collection_handle(&state, &name) {
+        Ok(h) => h,
+        Err((status, msg)) => return api_error(status, &msg).into_response(),
+    };
+    let collection = match handle.lock() {
+        Ok(c) => c,
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
+        }
+    };
+    let documents = match collection.list_documents() {
+        Ok(d) => d.len(),
+        Err(e) => return api_error(core_error_status(&e), e.to_string()).into_response(),
+    };
+    Json(serde_json::json!({
+        "name": name,
+        "dim": collection.dim,
+        "embedding_model": collection.embedding_model.clone(),
+        "documents": documents,
+        "chunks": collection.len(),
+        "needs_reindex": collection.needs_reindex(),
+    }))
+    .into_response()
+}
+
+/// Texts embedded per engine call while reindexing. One call per slice
+/// keeps peak memory at `batch * dim` floats for arbitrarily large
+/// collections.
+const REINDEX_EMBED_BATCH: usize = 64;
+
+/// POST /v1/collections/:name/reindex — re-embed every chunk from its stored
+/// text, L2-normalise, and rebuild the turbovec index in place (SQLite rows,
+/// FTS5 and document ids are untouched, so `int_id`s are preserved and
+/// deletes/allowlists keep working).
+///
+/// This is the repair path for a collection whose vectors predate
+/// normalisation (bug: unnormalised vectors score `||v|| * cos(v, q)` and
+/// outrank closer rows) and for chunks written as all-zero vectors by the
+/// old silent-fallback ingest. Fail loud: if the collection's embedder is
+/// not servable, nothing is written and the 503 is returned unchanged.
+pub async fn reindex_collection(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let handle = match collection_handle(&state, &name) {
+        Ok(h) => h,
+        Err((status, msg)) => return api_error(status, &msg).into_response(),
+    };
+    let (embedding_model, dim) = {
+        let collection = match handle.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
+                    .into_response()
+            }
+        };
+        (collection.embedding_model.clone(), collection.dim)
+    };
+
+    // Read the stored text in index order; this is the whole corpus, so it
+    // must not hold a lock across the embedding awaits below.
+    let stored = {
+        let collection = match handle.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
+                    .into_response()
+            }
+        };
+        match collection.texts_for_reindex() {
+            Ok(t) => t,
+            Err(e) => return api_error(core_error_status(&e), e.to_string()).into_response(),
+        }
+    };
+    let int_ids: Vec<u64> = stored.iter().map(|(id, _)| *id).collect();
+    let texts: Vec<String> = stored.into_iter().map(|(_, text)| text).collect();
+
+    let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * dim);
+    for slice in texts.chunks(REINDEX_EMBED_BATCH) {
+        let flat = match embed_for_collection(&state, &embedding_model, &name, dim, slice).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        vectors.extend(flat);
+    }
+
+    let (chunks, documents) = {
+        let mut collection = match handle.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
+                    .into_response()
+            }
+        };
+        if let Err(e) = collection.rebuild_index(&vectors, &int_ids) {
+            return api_error(core_error_status(&e), e.to_string()).into_response();
+        }
+        let documents = match collection.list_documents() {
+            Ok(d) => d.len(),
+            Err(e) => return api_error(core_error_status(&e), e.to_string()).into_response(),
+        };
+        (collection.len(), documents)
+    };
+
+    Json(serde_json::json!({
+        "collection": name,
+        "documents": documents,
+        "chunks": chunks,
+        "reindexed": true,
+    }))
+    .into_response()
 }
 
 /// DELETE /v1/collections/:name

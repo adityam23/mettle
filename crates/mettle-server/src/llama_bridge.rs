@@ -117,6 +117,10 @@ pub fn build_llama_config(config: &RootConfig) -> LlamaConfig {
             .engine
             .rerank_micro_tokens
             .unwrap_or(mettle_llama::DEFAULT_RERANK_MICRO_TOKENS),
+        vram_margin_bytes: config
+            .engine
+            .vram_margin_bytes
+            .unwrap_or(mettle_llama::DEFAULT_VRAM_MARGIN_BYTES),
         speculative: SpecConfig {
             gamma: 5,
             mtp: Vec::new(),

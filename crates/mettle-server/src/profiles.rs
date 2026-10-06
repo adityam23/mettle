@@ -524,26 +524,33 @@ impl ProfileManager {
     }
 
     fn slot_cost(&self, reg_entry: &RegistryEntry, rerank_cap: Option<usize>) -> Option<SlotCost> {
-        let mut cost = self
-            .measured_cost(&reg_entry.alias, reg_entry)
-            .or_else(|| {
-                // The header estimate already accounts for the cap; the measured
-                // path cannot (a measurement sees the resident delta only), so
-                // add the per-call context here.
-                self.estimate_cost(reg_entry, None)
-            })?;
-        if let Some(cap) = rerank_cap {
-            let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
-            let per_call = mettle_llama::vram::rerank_cap_cost(
-                &gguf,
-                cap,
-                mettle_llama::RERANK_MICRO_BATCH,
-                self.kv_q8(),
-            )?;
-            cost.anchor_bytes = cost.anchor_bytes.saturating_add(per_call.total());
-            cost.kv_per_token = 0;
+        match self.measured_cost(&reg_entry.alias, reg_entry) {
+            // A measurement sees the resident delta at load; a rerank slot's
+            // per-call context is created per call, so the cap cost must be
+            // added here. The cached measurement carries no ctx-projected
+            // slope for a rerank slot (`kv_per_token = 0`).
+            Some(mut cost) => {
+                if let Some(cap) = rerank_cap {
+                    let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
+                    let per_call = mettle_llama::vram::rerank_cap_cost(
+                        &gguf,
+                        cap,
+                        mettle_llama::RERANK_MICRO_BATCH,
+                        self.kv_q8(),
+                    )?;
+                    cost.anchor_bytes = cost.anchor_bytes.saturating_add(per_call.total());
+                    cost.kv_per_token = 0;
+                }
+                Some(cost)
+            }
+            // Header estimate: cap-aware, so the rerank slot is charged
+            // weights + compute + ONE capped context and never the resident
+            // full-ctx KV it does not hold (§1.1). Passing the cap here (and
+            // not adding it again) is what keeps the planner honest: the
+            // full-ctx slope on top of the cap double-charged the slot by
+            // `kv_per_token * full_ctx` — ~900 MiB on the qwen3 reranker.
+            None => self.estimate_cost(reg_entry, rerank_cap),
         }
-        Some(cost)
     }
 
     // -- engine plumbing ----------------------------------------------------
@@ -660,11 +667,17 @@ impl ProfileManager {
 
         // First run: mettle owns its weights. Download anything the target
         // profile pins that is not on disk yet, reporting progress through
-        // the readiness phase, before the planner tries to size it. On
-        // failure the phase is already `failed` with the failing model id.
-        if let Err(e) = self.ensure_profile_weights(&name).await {
-            tracing::error!("boot: cannot acquire weights for profile '{name}': {e}");
-            return;
+        // the readiness phase, before the planner tries to size it. A
+        // failure is recorded, NOT fatal: this process must still load the
+        // weights that ARE on disk (a partial profile can cover every role
+        // it declares), and the acquisition is retried inside the window
+        // below so a transient failure needs no restart.
+        let mut acquire_err = self.ensure_profile_weights(&name).await.err();
+        if let Some((model, error)) = &acquire_err {
+            tracing::error!(
+                "boot: weight acquisition for profile '{name}' failed for '{}': {error}",
+                model.as_deref().unwrap_or("unknown")
+            );
         }
 
         // Bounded retry with backoff (§1.4): another process holding VRAM
@@ -674,7 +687,21 @@ impl ProfileManager {
         let started = Instant::now();
         let mut delay = Duration::from_secs(1);
         let mut attempt = 0u32;
+        // Generation this boot loop left behind. An operator switch
+        // (`PUT /engine/profiles/active`) during the window bumps the
+        // generation and owns the engine from then on — the boot loop must
+        // stop rather than supersede it on the next retry (and it must not
+        // touch the phase, which the newer run settles).
+        let mut last_gen: Option<u64> = None;
         loop {
+            let seen_gen = self.generation.load(Ordering::SeqCst);
+            if last_gen.is_some_and(|prev| seen_gen != prev) {
+                tracing::info!(
+                    "boot: another profile was activated during the retry window; \
+                     stopping retries for '{name}'"
+                );
+                return;
+            }
             attempt += 1;
             self.set_phase(Phase {
                 phase: "loading",
@@ -686,6 +713,17 @@ impl ProfileManager {
             if let Err(e) = Arc::clone(&self).activate_inner(name.clone(), true).await {
                 tracing::warn!("boot activation attempt {attempt} failed: {e}");
             }
+            // Our own run must be the newest one. Anything else means a
+            // concurrent activation took the engine mid-attempt.
+            let now_gen = self.generation.load(Ordering::SeqCst);
+            if now_gen != seen_gen + 1 {
+                tracing::info!(
+                    "boot: activation superseded during attempt {attempt} \
+                     (generation {seen_gen} -> {now_gen}); stopping retries for '{name}'"
+                );
+                return;
+            }
+            last_gen = Some(now_gen);
             if self.is_serving() {
                 self.set_phase(Phase {
                     phase: "ready",
@@ -699,6 +737,28 @@ impl ProfileManager {
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(15));
+            // Between attempts: acquisition may succeed now (a transient
+            // network failure, or the operator restored the cache), and the
+            // next activation then sizes the real weights.
+            match self.ensure_profile_weights(&name).await {
+                Ok(()) => acquire_err = None,
+                Err(e) => acquire_err = Some(e),
+            }
+        }
+        // A failed acquisition is the honest reason a profile that never
+        // came up is not serving — report its model and error instead of
+        // the generic slot-derived reason.
+        if let Some((model, error)) = acquire_err {
+            tracing::warn!("boot: profile '{name}' not ready; weight acquisition failed: {error}");
+            self.set_phase(Phase {
+                phase: "failed",
+                model,
+                error: Some(error.clone()),
+                reason: Some(UnavailableReason::NotResident.as_str().to_string()),
+                detail: Some(error),
+                ..Default::default()
+            });
+            return;
         }
         let (reason, detail) = self.failure_reason();
         tracing::warn!(
@@ -722,7 +782,16 @@ impl ProfileManager {
     /// the first-run contract). Local-path entries are never downloaded: a
     /// missing one stays the config error the activation path already
     /// reports (§M6 decision).
-    async fn ensure_profile_weights(self: &Arc<Self>, name: &str) -> Result<(), String> {
+    ///
+    /// Every pinned model is attempted even when one fails — an unreachable
+    /// repo must not skip the rest — and the first failure is returned as
+    /// `(model, error)` so the caller can name it in the readiness phase.
+    /// Callers treat a failure as non-fatal: whatever is on disk still
+    /// loads, and a partial profile can still cover every role it declares.
+    async fn ensure_profile_weights(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<(), (Option<String>, String)> {
         let Some(profile) = self.profile(name) else {
             return Ok(());
         };
@@ -730,7 +799,7 @@ impl ProfileManager {
         let pinned: Vec<RegistryEntry> = {
             let reg = match self.deps.registry.read() {
                 Ok(r) => r,
-                Err(_) => return Err("registry lock poisoned".into()),
+                Err(_) => return Err((None, "registry lock poisoned".into())),
             };
             profile
                 .slots
@@ -738,8 +807,17 @@ impl ProfileManager {
                 .filter_map(|slot| reg.resolve(&slot.id).ok().cloned())
                 .collect()
         };
+        let mut first_err: Option<(Option<String>, String)> = None;
         for entry in pinned {
-            if crate::llama_bridge::resolve_gguf_path(&entry).is_ok() {
+            if crate::weights::model_files_present(&entry) {
+                continue;
+            }
+            // A resolvable GGUF with only a projector missing is not a config
+            // error: it is repairable when the entry is downloadable, and a
+            // local-path entry must not be reported as "path does not exist".
+            if crate::llama_bridge::resolve_gguf_path(&entry).is_ok()
+                && !crate::weights::is_downloadable(&entry)
+            {
                 continue;
             }
             // Not downloadable: never a boot failure (other slots may cover
@@ -781,28 +859,34 @@ impl ProfileManager {
                         ..Default::default()
                     });
                 });
-            crate::weights::ensure_weights(&entry, offline, Some(sink))
-                .await
-                .map_err(|e| format!("{model}: {e}"))
-                .inspect_err(|e| {
-                    // The consumer wants to know WHICH model failed, not
-                    // which profile was booting.
-                    self.set_phase(Phase {
-                        phase: "failed",
-                        model: Some(model.clone()),
-                        error: Some(e.clone()),
-                        reason: Some(UnavailableReason::NotResident.as_str().to_string()),
-                        detail: Some(e.clone()),
-                        ..Default::default()
-                    });
-                })?;
+            if let Err(e) = crate::weights::ensure_weights(&entry, offline, Some(sink)).await {
+                let msg = format!("{e}");
+                // The consumer wants to know WHICH model failed, not which
+                // profile was booting.
+                self.set_phase(Phase {
+                    phase: "failed",
+                    model: Some(model.clone()),
+                    error: Some(msg.clone()),
+                    reason: Some(UnavailableReason::NotResident.as_str().to_string()),
+                    detail: Some(msg.clone()),
+                    ..Default::default()
+                });
+                tracing::warn!("profile '{name}': acquiring '{model}' failed: {msg}");
+                if first_err.is_none() {
+                    first_err = Some((Some(model.clone()), msg));
+                }
+                continue;
+            }
             self.set_phase(Phase {
                 phase: "loading",
                 model: Some(model),
                 ..Default::default()
             });
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn ready_timeout(&self) -> Duration {
@@ -862,6 +946,17 @@ impl ProfileManager {
     /// events (`profile.active` / `profile.degraded`); the returned Result
     /// is for the caller's logs.
     pub async fn activate(self: Arc<Self>, name: String) -> Result<(), String> {
+        // Weights are ensured on every activation, not only at boot: a
+        // download that failed (offline, transient network) must be
+        // recoverable by re-activating instead of restarting the daemon.
+        // A failure is reported through the phase and does not abort the
+        // activation — whatever is on disk may still cover every role.
+        if let Err((model, error)) = self.ensure_profile_weights(&name).await {
+            tracing::warn!(
+                "activation of '{name}': weight acquisition failed for '{}': {error}",
+                model.as_deref().unwrap_or("unknown")
+            );
+        }
         self.activate_inner(name, false).await
     }
 

@@ -382,6 +382,142 @@ async fn collection_crud_ingest_search_delete() {
 }
 
 #[tokio::test]
+async fn collection_short_embedder_name_resolves_to_its_alias() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
+
+    // "embed-gemma" only resolves through the registry's `:latest` fallback.
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({"name": "short", "embedding_model": "embed-gemma"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The engine keys its loaded models by the canonical alias, so ingest
+    // and dense search must address "embed-gemma:latest", not the raw name.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/short/documents",
+        Some(serde_json::json!({"id": "d1", "content": "short embedder name ingest"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ingest failed: {body}");
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/short/search",
+        Some(serde_json::json!({"query": "short embedder ingest", "mode": "dense", "k": 3})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "dense search failed: {body}");
+    assert!(!body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn collection_reindex_rebuilds_in_place_and_fails_loud() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (state, embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
+
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for (id, content) in [
+        (
+            "d1",
+            "machine learning is a subset of artificial intelligence",
+        ),
+        (
+            "d2",
+            "quantum computing breakthroughs accelerate everything",
+        ),
+    ] {
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/collections/docs/documents",
+            Some(serde_json::json!({"id": id, "content": content})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // A freshly ingested collection is stamped as normalised.
+    let (status, body) = send(&router, "GET", "/v1/collections/docs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["needs_reindex"], serde_json::json!(false));
+    assert_eq!(body["documents"], serde_json::json!(2));
+    let chunks = body["chunks"].as_u64().unwrap();
+    assert!(chunks >= 2);
+
+    // Reindex rebuilds in place: same chunk count, still stamped, still
+    // searchable (the int_ids survive, so dense search keeps working).
+    let (status, body) = send(&router, "POST", "/v1/collections/docs/reindex", None).await;
+    assert_eq!(status, StatusCode::OK, "reindex failed: {body}");
+    assert_eq!(body["reindexed"], serde_json::json!(true));
+    assert_eq!(body["chunks"].as_u64().unwrap(), chunks);
+
+    let (status, body) = send(&router, "GET", "/v1/collections/docs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["needs_reindex"], serde_json::json!(false));
+    assert_eq!(body["chunks"].as_u64().unwrap(), chunks);
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/search",
+        Some(serde_json::json!({"query": "machine learning", "mode": "dense", "k": 3})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["document_id"] == "d1"),
+        "rebuilt index must still return the ingested document: {body}"
+    );
+
+    // Fail loud, never corrupt: with the embedder gone the reindex is a 503
+    // and the existing index still answers keyword search.
+    embedder.unload("embed-gemma:latest");
+    let (status, body) = send(&router, "POST", "/v1/collections/docs/reindex", None).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "reindex without a resident embedder must fail loud: {body}"
+    );
+    assert_eq!(body["error"]["code"], serde_json::json!("slot_unavailable"));
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/search",
+        Some(serde_json::json!({"query": "machine learning", "mode": "keyword", "k": 3})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.as_array().unwrap().is_empty());
+
+    // Unknown collection → 404 on both new routes.
+    let (status, _) = send(&router, "GET", "/v1/collections/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&router, "POST", "/v1/collections/nope/reindex", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn collections_persist_across_restart() {
     let tmp = tempfile::TempDir::new().unwrap();
 

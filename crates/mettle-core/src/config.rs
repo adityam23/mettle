@@ -416,13 +416,31 @@ pub enum KVCacheSetting {
     Fp8,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SpeculativeSetting {
     #[default]
     Auto,
     Off,
     Model(String),
+}
+
+impl Serialize for SpeculativeSetting {
+    // Every variant is a bare string (`"auto"`, `"off"`, or a drafter
+    // alias), mirroring the hand-written `Deserialize` impl and the
+    // documented config format. The derived externally-tagged form would
+    // serialize `Model` as the JSON object `{"model":"…"}`, which is not
+    // what the config file accepts — an asymmetry that made `mettled tune`
+    // write an unparseable `speculative` line.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            SpeculativeSetting::Auto => "auto",
+            SpeculativeSetting::Off => "off",
+            SpeculativeSetting::Model(model) => model.as_str(),
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for SpeculativeSetting {
@@ -610,6 +628,38 @@ speculative = "gemma4:e2b"
             cfg.engine.speculative,
             SpeculativeSetting::Model(ref m) if m == "gemma4:e2b"
         ));
+    }
+
+    /// `speculative` must round-trip through the config format for every
+    /// variant — including `Model`, whose derived (externally tagged) form
+    /// was a JSON object and broke `mettled tune`'s generated config.
+    #[test]
+    fn speculative_setting_round_trips_through_toml() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct SpecWrapper {
+            speculative: SpeculativeSetting,
+        }
+
+        for case in [
+            SpeculativeSetting::Auto,
+            SpeculativeSetting::Off,
+            SpeculativeSetting::Model("gemma4:e2b-mtp".to_owned()),
+        ] {
+            let text = toml::to_string(&SpecWrapper {
+                speculative: case.clone(),
+            })
+            .unwrap();
+            // Bare TOML string, never a `{ model = … }` inline table.
+            assert!(!text.contains('{'), "not a bare string: {text:?}");
+            let back: SpecWrapper = toml::from_str(&text).unwrap();
+            assert_eq!(back.speculative, case, "round-trip failed: {text:?}");
+        }
+
+        let model = toml::to_string(&SpecWrapper {
+            speculative: SpeculativeSetting::Model("gemma4:e2b-mtp".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(model.trim(), "speculative = \"gemma4:e2b-mtp\"");
     }
 
     #[test]

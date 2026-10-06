@@ -334,6 +334,13 @@ pub struct Collection {
     index: IdMapIndex,
     /// Counter for allocating sequential chunk IDs for the index.
     next_int_id: u64,
+    /// Quantisation width of the turbovec index; needed to rebuild it.
+    bit_width: usize,
+    /// True when *every* vector in `index` was L2-normalised on write
+    /// (`collection_meta.vectors_normalized = "1"`). A collection created
+    /// before that change loads as false — its rows score `||v|| * cos(v, q)`
+    /// — and the `rebuild_index` repair path is the only fix.
+    vectors_normalized: bool,
 }
 
 impl Collection {
@@ -384,7 +391,8 @@ impl Collection {
 
         conn.execute(
             "INSERT OR REPLACE INTO collection_meta (key, value) VALUES
-                ('embedding_model', ?1), ('dim', ?2), ('bit_width', ?3)",
+                ('embedding_model', ?1), ('dim', ?2), ('bit_width', ?3),
+                ('vectors_normalized', '1')",
             rusqlite::params![embedding_model, dim as i64, bit_width as i64],
         )
         .map_err(|e| CoreError::Retrieval(format!("failed to write collection meta: {}", e)))?;
@@ -396,6 +404,8 @@ impl Collection {
             data_dir: data_dir.to_path_buf(),
             index,
             next_int_id: 1,
+            bit_width,
+            vectors_normalized: true,
         })
     }
 
@@ -441,12 +451,28 @@ impl Collection {
             })?
         };
 
-        // Determine the next int_id from existing chunks.
+        // The next int_id from existing chunks.
         let max_int_id: u64 = conn
             .query_row("SELECT COALESCE(MAX(int_id), 0) FROM chunks", [], |row| {
                 row.get::<_, i64>(0).map(|v| v as u64)
             })
             .unwrap_or(0);
+
+        // A missing stamp means the collection predates L2 normalisation
+        // (or was written by the zero-vector fallback era): its dense/hybrid
+        // scores carry a magnitude bias and only a whole-collection re-embed
+        // can repair it. Warn once per collection, and only when there is
+        // actually a stored vector to be biased by it.
+        let vectors_normalized = meta("vectors_normalized").as_deref() == Some("1");
+        if !vectors_normalized && !index.is_empty() {
+            tracing::warn!(
+                "collection '{}' was written before vectors were L2-normalised: \
+                 dense and hybrid scores are scale-biased; repair it with \
+                 POST /v1/collections/{}/reindex",
+                name,
+                name
+            );
+        }
 
         Ok(Self {
             name: name.to_string(),
@@ -455,6 +481,8 @@ impl Collection {
             data_dir: data_dir.to_path_buf(),
             index,
             next_int_id: max_int_id + 1,
+            bit_width,
+            vectors_normalized,
         })
     }
 
@@ -528,6 +556,14 @@ impl Collection {
                 self.dim
             )));
         }
+
+        // Whether the whole index will be normalised once this batch lands:
+        // true for a stamped collection, and for an unstamped one that has no
+        // vector yet (nothing biased could be left behind). An unstamped
+        // collection that *does* hold rows stays mixed — those legacy rows
+        // keep their magnitude bias until `rebuild_index` replaces them, so
+        // it must not be stamped here.
+        let all_normalized_after_insert = self.vectors_normalized || self.index.is_empty();
 
         // Pre-flight every document: an id that already exists, or that
         // appears twice in the batch, fails the whole batch before a single
@@ -625,6 +661,18 @@ impl Collection {
             .add_with_ids(&normalized, &int_ids)
             .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
 
+        // The rows above are normalised, so stamp the collection inside the
+        // same transaction: a failed commit then leaves neither the rows nor
+        // the flag behind.
+        if all_normalized_after_insert {
+            tx.execute(
+                "INSERT OR REPLACE INTO collection_meta (key, value) \
+                 VALUES ('vectors_normalized', '1')",
+                [],
+            )
+            .map_err(|e| CoreError::Retrieval(format!("sqlite stamp vectors_normalized: {}", e)))?;
+        }
+
         if let Err(e) = tx.commit() {
             for id in &int_ids {
                 self.index.remove(*id);
@@ -632,6 +680,9 @@ impl Collection {
             return Err(CoreError::Retrieval(format!("sqlite commit: {}", e)));
         }
         self.next_int_id += total_chunks as u64;
+        if all_normalized_after_insert {
+            self.vectors_normalized = true;
+        }
 
         Ok(per_doc)
     }
@@ -715,7 +766,9 @@ impl Collection {
     /// Search the collection. `query_embedding` is the dense embedding of
     /// the query text (dim must match `self.dim`). `allowlist` is an optional
     /// caller-supplied set of document IDs; results outside it are excluded
-    /// (in-kernel for dense/hybrid via turbovec's filtered search).
+    /// (in-kernel for the dense leg via turbovec's filtered search, and pushed
+    /// into the FTS predicate for the keyword/hybrid leg so the keyword `LIMIT`
+    /// counts in-scope rows). `Some(empty)` means nothing is eligible.
     pub fn search(
         &self,
         query_embedding: &[f32],
@@ -745,6 +798,14 @@ impl Collection {
                 Some(ids)
             }
         };
+
+        // `Some(empty)` means nothing is eligible: no document id resolved to a
+        // chunk (or the caller passed an empty list). Return early because
+        // turbovec's in-kernel filter panics on an empty allowlist; the keyword
+        // leg would yield no rows anyway (an empty `json_each` is empty).
+        if matches!(&allow_ids, Some(ids) if ids.is_empty()) {
+            return Ok(Vec::new());
+        }
 
         // Queries are normalized to the same cosine space as stored vectors.
         let mut q = query_embedding.to_vec();
@@ -777,41 +838,52 @@ impl Collection {
                     return Ok(Vec::new());
                 }
                 let fts_query = tokens.join(" OR ");
-                let allowed_docs: Option<std::collections::HashSet<&str>> =
-                    allowlist.map(|d| d.iter().map(String::as_str).collect());
 
+                // Scope pushdown: with an allowlist the document filter runs
+                // inside SQLite, so `ORDER BY bm25` and `LIMIT` count in-scope
+                // rows only. Filtering *after* a global LIMIT silently drops
+                // every in-scope keyword hit that ranks below the global pool
+                // (the hybrid leg's bug). `None` keeps the original statement.
+                let allow_json = allowlist_json(allowlist)?;
+                let sql = if allow_json.is_some() {
+                    "SELECT c.id, c.document_id, c.text, c.char_offset, bm25(chunks_fts)
+                     FROM chunks_fts fts
+                     JOIN chunks c ON c.id = fts.chunk_id
+                     WHERE chunks_fts MATCH ?1
+                       AND c.document_id IN (SELECT value FROM json_each(?2))
+                     ORDER BY bm25(chunks_fts)
+                     LIMIT ?3"
+                } else {
+                    "SELECT c.id, c.document_id, c.text, c.char_offset, bm25(chunks_fts)
+                     FROM chunks_fts fts
+                     JOIN chunks c ON c.id = fts.chunk_id
+                     WHERE chunks_fts MATCH ?1
+                     ORDER BY bm25(chunks_fts)"
+                };
                 let mut stmt = conn
-                    .prepare(
-                        "SELECT c.id, c.document_id, c.text, c.char_offset, bm25(chunks_fts)
-                         FROM chunks_fts fts
-                         JOIN chunks c ON c.id = fts.chunk_id
-                         WHERE chunks_fts MATCH ?1
-                         ORDER BY bm25(chunks_fts)",
-                    )
+                    .prepare(sql)
                     .map_err(|e| CoreError::Retrieval(format!("fts query: {}", e)))?;
 
                 // bm25() is smaller-is-better (SQLite returns negative
                 // relevance); negate so score is higher-is-better like dense.
-                let results: Vec<ScoredChunk> = stmt
-                    .query_map([&fts_query], |row| {
-                        let bm25: f64 = row.get(4)?;
-                        Ok(ScoredChunk {
-                            chunk_id: row.get(0)?,
-                            document_id: row.get(1)?,
-                            text: row.get(2)?,
-                            score: -bm25,
-                            source_span: Some((row.get::<_, i64>(3)? as usize, 0)),
-                        })
+                let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ScoredChunk> {
+                    let bm25: f64 = row.get(4)?;
+                    Ok(ScoredChunk {
+                        chunk_id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        text: row.get(2)?,
+                        score: -bm25,
+                        source_span: Some((row.get::<_, i64>(3)? as usize, 0)),
                     })
-                    .map_err(|e| CoreError::Retrieval(format!("fts query: {}", e)))?
-                    .filter_map(|r| r.ok())
-                    .filter(|c| {
-                        allowed_docs
-                            .as_ref()
-                            .is_none_or(|docs| docs.contains(c.document_id.as_str()))
-                    })
-                    .take(k)
-                    .collect();
+                };
+                let rows = if let Some(json) = &allow_json {
+                    stmt.query_map(rusqlite::params![&fts_query, json, k as i64], map_row)
+                } else {
+                    stmt.query_map([&fts_query], map_row)
+                }
+                .map_err(|e| CoreError::Retrieval(format!("fts query: {}", e)))?;
+
+                let results: Vec<ScoredChunk> = rows.filter_map(|r| r.ok()).take(k).collect();
 
                 Ok(results)
             }
@@ -861,8 +933,9 @@ impl Collection {
                 //    displacing a dense gold with a keyword one.
                 //
                 // The allowlist is enforced on BOTH candidate lists before
-                // fusion (keyword rows by document id, dense in-kernel), so
-                // the fused result cannot contain excluded ids.
+                // fusion: keyword rows by document id *inside* the SQL
+                // statement (so the keyword `LIMIT` counts in-scope rows, not
+                // global ones), dense in-kernel via turbovec.
                 const RRF_K: f64 = 60.0;
                 const POOL: usize = 40;
                 const HEAD: usize = 10;
@@ -876,32 +949,45 @@ impl Collection {
                 let mut rrf: HashMap<u64, f64> = HashMap::new();
                 if !tokens.is_empty() {
                     let fts_query = tokens.join(" OR ");
-                    let allowed_docs: Option<std::collections::HashSet<&str>> =
-                        allowlist.map(|d| d.iter().map(String::as_str).collect());
+                    // Same scope pushdown as the keyword-only leg: the document
+                    // filter is part of the statement, so `LIMIT pool` is the
+                    // in-scope top-`pool`. Taking the global top-`pool` and
+                    // filtering afterwards empties the keyword leg whenever the
+                    // scope's hits all rank below it (hybrid degenerates to
+                    // dense-only).
+                    let allow_json = allowlist_json(allowlist)?;
+                    let sql = if allow_json.is_some() {
+                        "SELECT c.int_id, c.document_id
+                         FROM chunks_fts fts
+                         JOIN chunks c ON c.id = fts.chunk_id
+                         WHERE chunks_fts MATCH ?1
+                           AND c.document_id IN (SELECT value FROM json_each(?2))
+                         ORDER BY bm25(chunks_fts)
+                         LIMIT ?3"
+                    } else {
+                        "SELECT c.int_id, c.document_id
+                         FROM chunks_fts fts
+                         JOIN chunks c ON c.id = fts.chunk_id
+                         WHERE chunks_fts MATCH ?1
+                         ORDER BY bm25(chunks_fts)
+                         LIMIT ?2"
+                    };
                     let mut stmt = conn
-                        .prepare(
-                            "SELECT c.int_id, c.document_id
-                             FROM chunks_fts fts
-                             JOIN chunks c ON c.id = fts.chunk_id
-                             WHERE chunks_fts MATCH ?1
-                             ORDER BY bm25(chunks_fts)
-                             LIMIT ?2",
-                        )
+                        .prepare(sql)
                         .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?;
 
                     let pool = pool as i64;
-                    let rows: Vec<(u64, String)> = stmt
-                        .query_map(rusqlite::params![fts_query, pool], |row| {
-                            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
-                        })
-                        .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?
-                        .filter_map(|r| r.ok())
-                        .filter(|(_, doc)| {
-                            allowed_docs
-                                .as_ref()
-                                .is_none_or(|docs| docs.contains(doc.as_str()))
-                        })
-                        .collect();
+                    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(u64, String)> {
+                        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                    };
+                    let rows: Vec<(u64, String)> = if let Some(json) = &allow_json {
+                        stmt.query_map(rusqlite::params![&fts_query, json, pool], map_row)
+                    } else {
+                        stmt.query_map(rusqlite::params![&fts_query, pool], map_row)
+                    }
+                    .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?
+                    .filter_map(|r| r.ok())
+                    .collect();
                     for (rank, (int_id, _)) in rows.into_iter().enumerate() {
                         *rrf.entry(int_id).or_default() += KEYWORD_W / (RRF_K + rank as f64 + 1.0);
                     }
@@ -975,10 +1061,139 @@ impl Collection {
 
     /// Flush the turbovec index to disk.
     pub fn flush(&self) -> Result<(), CoreError> {
+        self.write_index(&self.index)
+    }
+
+    /// Write an index (usually the live one) to `<data_dir>/index.bin`.
+    fn write_index(&self, index: &IdMapIndex) -> Result<(), CoreError> {
         let path = self.data_dir.join("index.bin");
-        self.index
+        index
             .write(&path)
             .map_err(|e| CoreError::Retrieval(format!("failed to write index: {}", e)))
+    }
+
+    /// Stamp `collection_meta` as holding only L2-normalised vectors. Written
+    /// by every path that normalises (`new`, the insert paths, `rebuild_index`)
+    /// so `load` can tell a repaired collection from a legacy one.
+    fn stamp_normalized(&self) -> Result<(), CoreError> {
+        let db_path = self.data_dir.join("metadata.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO collection_meta (key, value) \
+             VALUES ('vectors_normalized', '1')",
+            [],
+        )
+        .map_err(|e| CoreError::Retrieval(format!("failed to stamp vectors_normalized: {}", e)))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Reindex (repair an un-normalised / zero-vector collection)
+    // -----------------------------------------------------------------------
+
+    /// True when this collection's stored vectors predate L2 normalisation
+    /// (or come from the zero-vector fallback era): dense/hybrid scores carry
+    /// a scale bias and [`Self::rebuild_index`] is the repair. A collection
+    /// with no stored vector has nothing biased, so it needs no reindex even
+    /// when unstamped.
+    pub fn needs_reindex(&self) -> bool {
+        !self.vectors_normalized && !self.index.is_empty()
+    }
+
+    /// Every stored chunk as `(int_id, text)` in ascending `int_id` order —
+    /// the input for a re-embed. Locking/SQLite only, no engine access.
+    pub fn texts_for_reindex(&self) -> Result<Vec<(u64, String)>, CoreError> {
+        let db_path = self.data_dir.join("metadata.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
+        let mut stmt = conn
+            .prepare("SELECT int_id, text FROM chunks ORDER BY int_id ASC")
+            .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| CoreError::Retrieval(format!("sqlite row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    /// Replace the whole vector index with `vectors` (row-major, `dim` per
+    /// row, one row per entry of `int_ids`, in the same order), L2-normalising
+    /// each row exactly as insert does, then flush the index to disk and stamp
+    /// the collection as normalised. SQLite rows, FTS5 and `int_id`s are
+    /// untouched, so `delete_document` and allowlists keep working.
+    ///
+    /// Errors — without touching the live index — if `int_ids` is not exactly
+    /// the stored chunk set or the vector count is not `int_ids.len() * dim`.
+    pub fn rebuild_index(&mut self, vectors: &[f32], int_ids: &[u64]) -> Result<(), CoreError> {
+        let db_path = self.data_dir.join("metadata.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
+
+        // Validate before a single fallible build step: a mismatch is a caller
+        // bug and must leave the previous index in place, never half-replaced.
+        let mut stored: Vec<u64> = {
+            let mut stmt = conn
+                .prepare("SELECT int_id FROM chunks ORDER BY int_id ASC")
+                .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, i64>(0).map(|v| v as u64))
+                .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(|e| CoreError::Retrieval(format!("sqlite row: {}", e)))?);
+            }
+            ids
+        };
+        let mut given = int_ids.to_vec();
+        given.sort_unstable();
+        stored.sort_unstable();
+        if given != stored {
+            return Err(CoreError::Retrieval(format!(
+                "rebuild_index for collection '{}' got {} int_ids, but the stored chunk set \
+                 has {} (ids must match exactly)",
+                self.name,
+                int_ids.len(),
+                stored.len()
+            )));
+        }
+        if vectors.len() != int_ids.len() * self.dim {
+            return Err(CoreError::Retrieval(format!(
+                "rebuild_index for collection '{}' got {} floats, expected {} ({} chunks * dim {})",
+                self.name,
+                vectors.len(),
+                int_ids.len() * self.dim,
+                int_ids.len(),
+                self.dim
+            )));
+        }
+
+        // Same normalisation the insert path applies.
+        let mut normalized = vectors.to_vec();
+        for row in normalized.chunks_exact_mut(self.dim) {
+            l2_normalize(row);
+        }
+
+        let mut rebuilt = IdMapIndex::new(self.dim, self.bit_width)
+            .map_err(|e| CoreError::Retrieval(format!("failed to create turbovec index: {}", e)))?;
+        rebuilt
+            .add_with_ids(&normalized, int_ids)
+            .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
+
+        // Every fallible build step has succeeded; only now overwrite the
+        // on-disk index and swap the live one. A failure at the stamp below
+        // leaves a repaired but unstamped collection, which simply reports
+        // `needs_reindex()` again (idempotent re-run), never a false claim.
+        self.write_index(&rebuilt)?;
+        self.index = rebuilt;
+        self.stamp_normalized()?;
+        self.vectors_normalized = true;
+        Ok(())
     }
 
     /// Number of vectors currently stored.
@@ -1060,6 +1275,23 @@ fn keyword_tokens(query: &str) -> Vec<String> {
         tokens.push(lowered[s..].to_string());
     }
     tokens
+}
+
+/// JSON-encode a document-id allowlist for SQLite's `json_each`, the scoping
+/// mechanism shared by the two FTS legs (`search`).
+///
+/// `None` means unrestricted and is returned as-is so callers can keep their
+/// original, unfiltered statement; `Some(json)` is passed as a single bound
+/// parameter, so the keyword `LIMIT` applies to the filtered set without any
+/// dependence on the allowlist's length (`json_each` needs one parameter for
+/// an arbitrarily long list, unlike an `IN (?, ?, ...)` list).
+fn allowlist_json(allowlist: Option<&[String]>) -> Result<Option<String>, CoreError> {
+    match allowlist {
+        None => Ok(None),
+        Some(ids) => serde_json::to_string(ids)
+            .map(Some)
+            .map_err(|e| CoreError::Retrieval(format!("allowlist encode: {}", e))),
+    }
 }
 
 #[cfg(test)]
@@ -1268,6 +1500,132 @@ mod tests {
         assert!(ids.contains(&"doc_c"), "keyword-only doc still surfaces");
     }
 
+    /// Regression (allowlist scope pushdown): a scoped keyword/hybrid search
+    /// must rank *within* the scope. 50 filler documents each out-rank the 12
+    /// scoped documents on `bm25("alpha")`, so every scoped document sits
+    /// beyond the global top-`POOL` (40) — exactly the geometry under which the
+    /// old hybrid leg took the global top-40 and *then* filtered, leaving the
+    /// keyword side empty and degrading hybrid to dense-only. Keyword mode
+    /// returns all in-scope matches, and the fused scores carry the keyword
+    /// RRF term again: pre-fix every score was a dense-only term (≤ 1/61),
+    /// post-fix every scoped document also earns a keyword term (≥ 2/72).
+    #[test]
+    fn allowlisted_keyword_search_ranks_within_scope() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "test");
+
+        // Embeddings are irrelevant to what this test pins (keyword evidence);
+        // one deterministic value per document keeps the dense leg stable.
+        let embed = |texts: &[String]| -> Result<Vec<f32>, CoreError> {
+            let mut out = Vec::with_capacity(texts.len() * 16);
+            for t in texts {
+                let v = 0.1f32 + t.matches("zeta").count() as f32 * 0.02;
+                out.extend(std::iter::repeat_n(v, 16));
+            }
+            Ok(out)
+        };
+
+        // 50 fillers: 5 `alpha` occurrences in a 5-token document, i.e. the
+        // strongest bm25 match available, so they own the global top-40.
+        for i in 0..50 {
+            coll.add_document(
+                &test_document(&format!("filler{:02}", i), "alpha alpha alpha alpha alpha"),
+                &embed,
+                200,
+                0,
+            )
+            .unwrap();
+        }
+        // 12 scoped documents: one `alpha` each, 21..76 tokens long. They all
+        // rank below every filler globally, so the global top-40 holds none.
+        for i in 0..12 {
+            let content = format!("{}alpha", "zeta ".repeat(20 + 5 * i));
+            coll.add_document(
+                &test_document(&format!("scoped{:02}", i), &content),
+                &embed,
+                200,
+                0,
+            )
+            .unwrap();
+        }
+        let scoped: Vec<String> = (0..12).map(|i| format!("scoped{:02}", i)).collect();
+        let q = vec![0.1f32; 16];
+
+        // Premise: the unrestricted keyword top-40 is fillers only, so every
+        // scoped hit lies beyond the global pool.
+        let global = coll
+            .search(&q, "alpha", 40, SearchMode::Keyword, None)
+            .unwrap();
+        assert_eq!(global.len(), 40);
+        assert!(
+            global.iter().all(|r| r.document_id.starts_with("filler")),
+            "premise: scoped hits must rank beyond the global top-40"
+        );
+
+        // Scoped keyword search: every in-scope match comes back instead of
+        // being cut by the global ranking. The order among them is SQLite's
+        // bm25 arithmetic, so only the set is asserted.
+        let kw = coll
+            .search(
+                &q,
+                "alpha",
+                12,
+                SearchMode::Keyword,
+                Some(scoped.as_slice()),
+            )
+            .unwrap();
+        let kw_ids: Vec<&str> = kw.iter().map(|r| r.document_id.as_str()).collect();
+        assert_eq!(
+            kw_ids.len(),
+            12,
+            "scoped keyword search returns every in-scope match"
+        );
+        let mut got = kw_ids.clone();
+        got.sort_unstable();
+        let mut want: Vec<&str> = scoped.iter().map(String::as_str).collect();
+        want.sort_unstable();
+        assert_eq!(got, want, "exactly the in-scope documents are returned");
+        assert!(
+            !kw_ids.iter().any(|id| id.starts_with("filler")),
+            "the global top-ranked fillers must not leak into the scoped result"
+        );
+
+        // Scoped hybrid: the fused scores must carry keyword evidence again.
+        let hyb = coll
+            .search(&q, "alpha", 12, SearchMode::Hybrid, Some(scoped.as_slice()))
+            .unwrap();
+        assert_eq!(hyb.len(), 12, "the scope has exactly 12 documents");
+        let fused_scores: Vec<f64> = hyb.iter().map(|r| r.score).collect();
+        assert!(
+            hyb.iter().all(|r| r.score > 0.02),
+            "scoped keyword evidence missing from the fusion: {fused_scores:?}"
+        );
+
+        // A pathologically long allowlist must not fail: the `json_each`
+        // binding is one parameter whatever the list length (an `IN (?, ?, …)`
+        // list would hit SQLite's parameter cap and abort the query).
+        let mut huge = scoped.clone();
+        huge.extend((0..2000).map(|i| format!("missing{:04}", i)));
+        let kw_huge = coll
+            .search(&q, "alpha", 12, SearchMode::Keyword, Some(huge.as_slice()))
+            .unwrap();
+        assert_eq!(kw_huge.len(), 12, "long allowlists must still work");
+
+        // `Some(empty)` = nothing eligible, in every mode (the dense leg must
+        // never reach turbovec's panic-on-empty-allowlist path).
+        let empty: Vec<String> = Vec::new();
+        for mode in [SearchMode::Keyword, SearchMode::Hybrid, SearchMode::Dense] {
+            let results = coll
+                .search(&q, "alpha", 12, mode, Some(empty.as_slice()))
+                .unwrap();
+            assert!(
+                results.is_empty(),
+                "{mode} must return nothing for an empty allowlist"
+            );
+        }
+    }
+
     /// Ingest a document, delete it, verify it's gone.
     #[test]
     fn property_ingest_then_delete() {
@@ -1398,6 +1756,285 @@ mod tests {
             hits,
             queried
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Reindex / repair of un-normalised vectors
+    // -------------------------------------------------------------------
+
+    /// Read `collection_meta.vectors_normalized` (`None` = legacy, unstamped).
+    fn normalized_stamp(dir: &Path) -> Option<String> {
+        let conn = rusqlite::Connection::open(dir.join("metadata.db")).unwrap();
+        conn.query_row(
+            "SELECT value FROM collection_meta WHERE key = 'vectors_normalized'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Drop the stamp, i.e. make `dir` look like a collection written before
+    /// L2 normalisation landed.
+    fn clear_normalized_stamp(dir: &Path) {
+        let conn = rusqlite::Connection::open(dir.join("metadata.db")).unwrap();
+        conn.execute(
+            "DELETE FROM collection_meta WHERE key = 'vectors_normalized'",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// A normalising collection is stamped at creation and on insert, and an
+    /// unstamped one with chunks is legacy until `rebuild_index` repairs it.
+    #[test]
+    fn legacy_collection_reports_needs_reindex_until_rebuilt() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "legacy");
+        assert_eq!(
+            normalized_stamp(&dir).as_deref(),
+            Some("1"),
+            "collection_meta must be stamped at creation"
+        );
+
+        coll.add_document(
+            &test_document("doc1", "alpha bravo charlie"),
+            &test_embed_fn,
+            200,
+            0,
+        )
+        .unwrap();
+        coll.flush().unwrap();
+        assert_eq!(normalized_stamp(&dir).as_deref(), Some("1"));
+        assert!(!coll.needs_reindex());
+
+        // Strip the stamp: this is exactly what a pre-normalisation collection
+        // looks like on disk (no flag, no version, no stored raw vectors).
+        clear_normalized_stamp(&dir);
+        let mut legacy = Collection::load("legacy", &dir).unwrap();
+        assert!(
+            legacy.needs_reindex(),
+            "an unstamped collection with stored vectors is legacy"
+        );
+
+        // Repair with deliberately un-normalised magnitudes: rebuild_index
+        // normalises them itself.
+        let stored = legacy.texts_for_reindex().unwrap();
+        let ids: Vec<u64> = stored.iter().map(|(id, _)| *id).collect();
+        let vectors = vec![3.0f32; stored.len() * 16];
+        legacy.rebuild_index(&vectors, &ids).unwrap();
+        assert!(
+            !legacy.needs_reindex(),
+            "rebuild_index repairs the collection"
+        );
+        assert_eq!(normalized_stamp(&dir).as_deref(), Some("1"));
+
+        // The stamp is persisted, not just in-memory state.
+        legacy.flush().unwrap();
+        let reloaded = Collection::load("legacy", &dir).unwrap();
+        assert!(!reloaded.needs_reindex(), "the stamp survives a reload");
+
+        // An empty collection has nothing to repair even when unstamped.
+        let empty_dir = tmp.path().join("empty-legacy");
+        let _empty = test_collection(&empty_dir, "empty-legacy");
+        clear_normalized_stamp(&empty_dir);
+        let loaded = Collection::load("empty-legacy", &empty_dir).unwrap();
+        assert!(loaded.is_empty());
+        assert!(
+            !loaded.needs_reindex(),
+            "zero stored chunks means zero biased vectors"
+        );
+    }
+
+    /// `texts_for_reindex` returns every stored chunk exactly once, ascending
+    /// by int_id, matching the ingested chunk order.
+    #[test]
+    fn texts_for_reindex_returns_every_chunk_in_int_id_order() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "texts");
+
+        let corpus = [
+            ("doc1", "alpha bravo charlie delta echo foxtrot golf hotel"),
+            ("doc2", "india juliet kilo lima mike november oscar papa"),
+            (
+                "doc3",
+                "quebec romeo sierra tango uniform victor whiskey xray",
+            ),
+        ];
+        let mut expected: Vec<String> = Vec::new();
+        for (id, content) in corpus {
+            let chunks = chunk_document(&test_document(id, content), 4, 2);
+            assert!(
+                chunks.len() > 1,
+                "each document must contribute several chunks"
+            );
+            expected.extend(chunks.iter().map(|c| c.text.clone()));
+            coll.add_document(&test_document(id, content), &test_embed_fn, 4, 2)
+                .unwrap();
+        }
+
+        let stored = coll.texts_for_reindex().unwrap();
+        assert_eq!(stored.len(), coll.len(), "one row per stored chunk");
+        assert_eq!(stored.len(), expected.len());
+        assert!(
+            stored.windows(2).all(|w| w[0].0 < w[1].0),
+            "int_ids ascend and never repeat: {:?}",
+            stored.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+        let texts: Vec<String> = stored.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(texts, expected, "ascending int_id order == ingest order");
+    }
+
+    /// `rebuild_index` preserves `len()`, the int_id → vector mapping, and a
+    /// later document delete still removes exactly its own chunks.
+    #[test]
+    fn rebuild_index_preserves_ids_and_delete_mapping() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "rebuild");
+
+        // A 200-token window makes every document exactly one chunk, so the
+        // int_ids are the predictable 1, 2, 3 in ingest order.
+        for (id, text) in [
+            ("doc1", "alpha one"),
+            ("doc2", "bravo two"),
+            ("doc3", "charlie three"),
+        ] {
+            coll.add_document(&test_document(id, text), &test_embed_fn, 200, 0)
+                .unwrap();
+        }
+
+        let stored = coll.texts_for_reindex().unwrap();
+        let int_ids: Vec<u64> = stored.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            int_ids,
+            vec![1, 2, 3],
+            "ingest order allocates ascending int_ids"
+        );
+
+        // One-hot rows keyed by int_id: a query on column c can then only hit
+        // the row belonging to int_id c, making the mapping observable.
+        let mut vectors = vec![0.0f32; stored.len() * 16];
+        for (row, (int_id, _)) in stored.iter().enumerate() {
+            vectors[row * 16 + *int_id as usize] = 1.0;
+        }
+        coll.rebuild_index(&vectors, &int_ids).unwrap();
+
+        assert_eq!(coll.len(), int_ids.len(), "len() == int_ids.len()");
+        assert!(!coll.needs_reindex());
+
+        let mut q = vec![0.0f32; 16];
+        q[2] = 1.0;
+        let hits = coll.search(&q, "two", 10, SearchMode::Dense, None).unwrap();
+        assert_eq!(
+            hits[0].document_id, "doc2",
+            "int_id 2's row must still be the nearest to query column 2"
+        );
+
+        // int_ids survived the rebuild, so SQLite-side deletes still line up
+        // with the index.
+        let before = coll.len();
+        let doc2_chunks = coll
+            .list_documents()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == "doc2")
+            .unwrap()
+            .chunk_count;
+        coll.delete_document("doc2").unwrap();
+        assert_eq!(coll.len(), before - doc2_chunks as usize);
+        let hits = coll.search(&q, "two", 10, SearchMode::Dense, None).unwrap();
+        assert!(
+            hits.iter().all(|r| r.document_id != "doc2"),
+            "a deleted document's chunks must be gone from the rebuilt index"
+        );
+    }
+
+    /// A count/geometry mismatch is rejected and leaves the previous index
+    /// searchable — never a partial swap.
+    #[test]
+    fn rebuild_index_rejects_mismatch_without_touching_the_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "guard");
+
+        let embed = |texts: &[String]| -> Result<Vec<f32>, CoreError> {
+            let mut out = Vec::with_capacity(texts.len() * 16);
+            for t in texts {
+                // Distinct directions survive L2 normalisation (equal
+                // coordinates of different magnitudes would not): doc2's
+                // chunks are one-hot on column 2, doc1's on column 0.
+                let mut v = vec![0.0f32; 16];
+                if t.contains("quantum") {
+                    v[2] = 1.0;
+                } else {
+                    v[0] = 1.0;
+                }
+                out.extend(v);
+            }
+            Ok(out)
+        };
+        coll.add_document(&test_document("doc1", "alpha beta"), &embed, 5, 0)
+            .unwrap();
+        coll.add_document(&test_document("doc2", "quantum computing"), &embed, 5, 0)
+            .unwrap();
+
+        let before_len = coll.len();
+        let stored = coll.texts_for_reindex().unwrap();
+        let ids: Vec<u64> = stored.iter().map(|(id, _)| *id).collect();
+        assert!(ids.len() >= 2);
+        let mut q = vec![0.0f32; 16];
+        q[2] = 1.0;
+        let before: Vec<String> = coll
+            .search(&q, "quantum", 10, SearchMode::Dense, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.document_id)
+            .collect();
+        assert_eq!(before[0], "doc2", "premise: doc2 is the dense winner");
+
+        // Wrong float count for the given id set.
+        let err = coll
+            .rebuild_index(&vec![0.9f32; ids.len() * 16 - 1], &ids)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Retrieval(_)), "got {err:?}");
+
+        // An int_id the stored chunk set does not contain.
+        let mut extra = ids.clone();
+        extra.push(9999);
+        assert!(
+            coll.rebuild_index(&vec![0.9f32; extra.len() * 16], &extra)
+                .is_err(),
+            "an unknown int_id must be rejected"
+        );
+
+        // A stored chunk left out.
+        assert!(
+            coll.rebuild_index(&vec![0.9f32; (ids.len() - 1) * 16], &ids[..ids.len() - 1])
+                .is_err(),
+            "a missing int_id must be rejected"
+        );
+
+        // Duplicated id (same length, wrong set).
+        let mut dup = ids.clone();
+        dup[0] = dup[1];
+        assert!(
+            coll.rebuild_index(&vec![0.9f32; dup.len() * 16], &dup)
+                .is_err(),
+            "a duplicated int_id must be rejected"
+        );
+
+        // The live index is untouched: same size, same ranking, still stamped.
+        assert_eq!(coll.len(), before_len, "no partial swap");
+        assert!(!coll.needs_reindex());
+        let after: Vec<String> = coll
+            .search(&q, "quantum", 10, SearchMode::Dense, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.document_id)
+            .collect();
+        assert_eq!(after, before, "the previous index is still searchable");
     }
 
     // -------------------------------------------------------------------

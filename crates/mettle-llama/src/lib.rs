@@ -100,11 +100,20 @@ pub struct LlamaConfig {
     /// Rerank per-call packed-token cap (residency contract §1.1). Bounds
     /// the per-call rerank compute buffer; a slot may override it lower.
     pub rerank_micro_tokens: usize,
+    /// Margin held back from the device's free memory when preflighting an
+    /// inline (rerank/embed) context, from `[engine] vram_margin_bytes`
+    /// (default [`DEFAULT_VRAM_MARGIN_BYTES`]). Mirrors the planner's
+    /// default so inline and planned reservations budget alike.
+    pub vram_margin_bytes: u64,
     pub speculative: SpecConfig,
 }
 
 /// Default rerank per-call packed-token cap ([engine] rerank_micro_tokens).
 pub const DEFAULT_RERANK_MICRO_TOKENS: usize = 2048;
+
+/// Default inline-context VRAM margin ([engine] vram_margin_bytes unset):
+/// 512 MiB, matching the planner's default.
+pub const DEFAULT_VRAM_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Floor the planner will shrink a rerank slot's packed-token cap to
 /// before dropping the slot (residency contract §1.1). One sequence of a
@@ -126,6 +135,7 @@ impl Default for LlamaConfig {
             kv_cache_q8: true,
             flash_attn: true,
             rerank_micro_tokens: DEFAULT_RERANK_MICRO_TOKENS,
+            vram_margin_bytes: DEFAULT_VRAM_MARGIN_BYTES,
             speculative: SpecConfig::default(),
         }
     }
@@ -352,7 +362,7 @@ fn worker_main(
 
         // Route pending requests.
         for req in pending.drain(..) {
-            route_request(&mut runtimes, &backend, req);
+            route_request(&mut runtimes, &backend, req, &cfg);
         }
 
         // One decode iteration per runtime.
@@ -591,6 +601,7 @@ fn route_request(
     runtimes: &mut HashMap<String, ModelRuntime>,
     backend: &LlamaBackend,
     req: EngineRequest,
+    cfg: &LlamaConfig,
 ) {
     let EngineRequest {
         model: alias,
@@ -638,6 +649,7 @@ fn route_request(
                 &documents,
                 rt.rerank_micro_tokens,
                 rt.rerank_geometry,
+                cfg.vram_margin_bytes,
                 rt.op_offload,
             ) {
                 Ok(v) => {
@@ -720,20 +732,20 @@ fn embed(
 /// budgets for (residency contract §1.1).
 pub const RERANK_MICRO_BATCH: usize = 8;
 
-/// Margin held back from the device's free memory when preflighting an
-/// inline (rerank/embed) context, matching the planner's default.
-const INLINE_VRAM_MARGIN: u64 = 512 * 1024 * 1024;
-
 /// Cached accelerator probe for the inline-context preflight (residency
 /// contract §1.1). Probed once; `memory()` shells out per call.
 static DEVICE_PROBE: std::sync::LazyLock<Option<Box<dyn mettle_core::device::Device>>> =
     std::sync::LazyLock::new(mettle_core::device::detect);
 
-/// Current free VRAM minus the inline margin, or `None` when no
-/// accelerator is reachable (CPU-only host: no GPU context to preflight).
-fn inline_vram_budget() -> Option<u64> {
+/// Current free VRAM minus `margin`, or `None` when no accelerator is
+/// reachable (CPU-only host: no GPU context to preflight).
+///
+/// Reads the device each time it is called — the probe shells out, so
+/// callers read it once per request and never cache it across requests
+/// (a stale reading could admit an over-committing batch).
+fn inline_vram_budget(margin: u64) -> Option<u64> {
     let dev = DEVICE_PROBE.as_ref()?;
-    Some(dev.memory()?.free_bytes.saturating_sub(INLINE_VRAM_MARGIN))
+    Some(dev.memory()?.free_bytes.saturating_sub(margin))
 }
 
 /// Estimated cost of the context one rerank micro-batch of `chunk` needs.
@@ -779,6 +791,7 @@ fn rerank(
     documents: &[String],
     micro_tokens: usize,
     geometry: Option<RerankGeometry>,
+    vram_margin_bytes: u64,
     op_offload: bool,
 ) -> Result<Vec<f32>, mettle_core::engine::RerankError> {
     // Everything that can fail is an ordinary engine error except the §1.1
@@ -790,6 +803,13 @@ fn rerank(
     if seqs.is_empty() {
         return Ok(Vec::new());
     }
+    // §1.1 preflight budget: read the device ONCE per call, before any
+    // micro-batch is planned. The probe shells out, and this runs inline on
+    // the worker thread that also decodes every generation slot — reading
+    // it per micro-batch stalled all other slots for a process round-trip.
+    // It is still read per request (never cached across requests): a stale
+    // reading could admit an over-committing batch.
+    let vram_budget = geometry.and_then(|_| inline_vram_budget(vram_margin_bytes));
     let mut scores = Vec::with_capacity(seqs.len());
     let mut batch_seqs: &[Vec<LlamaToken>] = &seqs;
     while !batch_seqs.is_empty() {
@@ -810,12 +830,11 @@ fn rerank(
         // batch (whole sequences) until it fits; if even one sequence does
         // not, refuse with the structured reason and keep the process up.
         if let Some(geo) = geometry {
-            let budget = inline_vram_budget();
-            let (fit_n, fits) = fit_rerank_batch(&geo, &batch_seqs[..n], budget);
+            let (fit_n, fits) = fit_rerank_batch(&geo, &batch_seqs[..n], vram_budget);
             n = fit_n;
             if !fits {
                 let cost = rerank_batch_cost(&geo, &batch_seqs[..n]);
-                let budget = budget.unwrap_or(0);
+                let budget = vram_budget.unwrap_or(0);
                 return Err(RerankError::ContextVram(format!(
                     "rerank context needs ~{} MiB ({} tokens), {} MiB free after margin",
                     cost.total() / (1024 * 1024),
