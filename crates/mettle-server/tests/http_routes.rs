@@ -13,10 +13,28 @@ use mettle_server::app::build_router;
 use mettle_server::state::AppState;
 use tower::ServiceExt;
 
+mod support;
+use support::FakeEmbedder;
+
 fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {
     let mut config = RootConfig::default();
     config.retrieval.data_dir = data_dir.to_path_buf();
     Arc::new(AppState::new(config))
+}
+
+/// Built-in embedders resident in a [`FakeEmbedder`] (registry dims).
+const EMBEDDERS: &[(&str, usize)] = &[
+    ("embed-gemma:latest", 768),
+    ("qwen3-embedding-0.6b:latest", 1024),
+];
+
+/// `test_state` plus a resident fake embedder, so ingest and dense search
+/// run without a GGUF. Returns the embedder for unload simulation.
+fn test_state_with_embedder(data_dir: &std::path::Path) -> (Arc<AppState>, Arc<FakeEmbedder>) {
+    let state = test_state(data_dir);
+    let embedder = FakeEmbedder::new(EMBEDDERS);
+    state.set_engine(embedder.clone());
+    (state, embedder)
 }
 
 async fn send(
@@ -197,7 +215,8 @@ async fn create_and_push_are_structured_stubs() {
 #[tokio::test]
 async fn collection_crud_ingest_search_delete() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let router = build_router(test_state(tmp.path()));
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
 
     // Create.
     let (status, _) = send(
@@ -293,8 +312,7 @@ async fn collection_crud_ingest_search_delete() {
     assert!(hit_docs.contains("doc2"), "doc2 must match on 'quantum'");
 
     // Hybrid mode (adoption contract §1.2): keyword-matching doc still
-    // surfaces through the fused pool (no engine here — dense leg scores are
-    // the documented zero-vector degradation).
+    // surfaces through the fused pool.
     let (status, body) = send(
         &router,
         "POST",
@@ -369,7 +387,8 @@ async fn collections_persist_across_restart() {
 
     // First "process": create + ingest.
     {
-        let router = build_router(test_state(tmp.path()));
+        let (state, _embedder) = test_state_with_embedder(tmp.path());
+        let router = build_router(state);
         let (status, _) = send(
             &router,
             "POST",
@@ -410,8 +429,10 @@ async fn collections_persist_across_restart() {
 
 #[tokio::test]
 async fn rag_chat_without_model_returns_503() {
+    // The embedder is resident (retrieval succeeds); the chat model is not.
     let tmp = tempfile::TempDir::new().unwrap();
-    let router = build_router(test_state(tmp.path()));
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
 
     let (status, _) = send(
         &router,
@@ -582,7 +603,8 @@ async fn request_id_header_on_every_response() {
 #[tokio::test]
 async fn metrics_exposed_and_counting() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let router = build_router(test_state(tmp.path()));
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
 
     let (status, _) = send(
         &router,
@@ -620,13 +642,15 @@ async fn metrics_exposed_and_counting() {
     assert!(text.contains("engine_requests_total"));
     assert!(text.contains("engine_ingest_documents_total 1"));
     assert!(text.contains("engine_collection_chunks{collection=\"m\"} "));
-    assert!(text.contains("engine_model_loaded 0"));
+    // The fake embedder counts as a loaded engine.
+    assert!(text.contains("engine_model_loaded 1"));
 }
 
 #[tokio::test]
 async fn multipart_ingest() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let router = build_router(test_state(tmp.path()));
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
 
     let (status, _) = send(
         &router,
@@ -842,4 +866,140 @@ async fn collection_names_are_validated_and_never_reach_the_filesystem() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Residency contract §1.3: no zero-vector fallback on any path. An
+/// unservable embedder fails ingest with the structured 503 and writes
+/// nothing; dense/hybrid search fails the same way; keyword still works.
+#[tokio::test]
+async fn ingest_and_search_fail_loud_without_embedder() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (state, embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state.clone());
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents",
+        Some(serde_json::json!({"id": "kept", "content": "resident embedder wrote this"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    embedder.unload("embed-gemma:latest");
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents",
+        Some(serde_json::json!({"id": "lost", "content": "zebra unicorn payload"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "slot_unavailable", "{body}");
+    assert_eq!(body["error"]["reason"], "not_resident");
+    assert_eq!(body["error"]["missing"][0], "embed-gemma:latest");
+
+    // Nothing was written: no mode finds the rejected document.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/search",
+        Some(serde_json::json!({"query": "zebra unicorn", "mode": "keyword", "k": 10})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty(), "{body}");
+
+    for mode in ["dense", "hybrid"] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/collections/docs/search",
+            Some(serde_json::json!({"query": "zebra", "mode": mode})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{mode}: {body}");
+        assert_eq!(body["error"]["code"], "slot_unavailable");
+    }
+
+    // A re-POST once the embedder is back is a clean first write (no 409
+    // from a half-written earlier attempt).
+    let (state2, _e) = test_state_with_embedder(tmp.path());
+    state2.collections.lock().unwrap().load_all().unwrap();
+    let router2 = build_router(state2);
+    let (status, body) = send(
+        &router2,
+        "POST",
+        "/v1/collections/docs/documents",
+        Some(serde_json::json!({"id": "lost", "content": "zebra unicorn payload"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn no_engine_ingest_is_a_structured_503() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let router = build_router(test_state(tmp.path()));
+    send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
+    )
+    .await;
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents",
+        Some(serde_json::json!({"id": "d", "content": "text"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["reason"], "no_engine", "{body}");
+}
+
+/// The literal fallback must not come back (residency contract §1.3).
+#[test]
+fn zero_vector_fallback_is_gone_from_rag_routes() {
+    let src = include_str!("../src/routes/rag.rs");
+    assert!(!src.contains("zero-vector"));
+    assert!(!src.contains("vec![0.0"));
+}
+
+/// Document ids are free-form; percent-encoded path segments decode to the
+/// stored id (QUESTIONS from docket Q2: `acme#3` was lost as a fragment).
+#[tokio::test]
+async fn document_ids_round_trip_percent_encoded() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (state, _embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
+    send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
+    )
+    .await;
+    for (id, encoded) in [("acme#3", "acme%233"), ("a/b c", "a%2Fb%20c")] {
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/collections/docs/documents",
+            Some(serde_json::json!({"id": id, "content": format!("payload for {id}")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let uri = format!("/v1/collections/docs/documents/{encoded}");
+        let (status, body) = send(&router, "DELETE", &uri, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{id}: {body}");
+    }
 }

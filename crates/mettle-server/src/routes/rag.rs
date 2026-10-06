@@ -35,29 +35,30 @@ fn core_error_status(e: &mettle_core::error::CoreError) -> StatusCode {
 
 /// Embed `texts` with the collection's embedding model.
 ///
-/// Failure semantics (adoption-contract grilling Q13a, 2026-09-10):
-/// - Zero-vector fallback ONLY when no engine is loaded at all — the
-///   documented fresh-install degradation (keyword/ingest keep working).
-/// - Engine present but embedding via the collection's embedder failed
-///   (not resident, JIT refused, load error): hard 503 naming the alias and
-///   reason — `degrade_on_engine_error` keeps the zero fallback for INGEST
-///   only, so a fresh install can still ingest while keyword search works.
-/// - Dim mismatch between the model and the collection: always a hard 409
-///   (the collection needs re-ingest under its own embedder; serving zeros
-///   would return garbage with 200).
-async fn embed_or_fallback(
+/// Fail loud, never degrade (residency contract §1.3): no path substitutes
+/// all-zero vectors for a failed embedding, because those are silent
+/// corruption — the request succeeds and dense/hybrid search quietly rots.
+/// - Embedder not servable (no engine, not resident, dropped, loading):
+///   the structured 503 `slot_unavailable` with the slot's real reason.
+/// - Embedder resident but the forward pass failed: 503 naming the error.
+/// - Dim mismatch between the model and the collection: 409 (the
+///   collection needs re-ingest under its own embedder).
+///
+/// Callers embed BEFORE writing anything, so an error here writes nothing.
+async fn embed_for_collection(
     state: &AppState,
     embedding_model: &str,
     collection: &str,
     dim: usize,
     texts: &[String],
-    degrade_on_engine_error: bool,
-) -> Result<Vec<f32>, (StatusCode, String)> {
+) -> Result<Vec<f32>, axum::response::Response> {
     let alias = if embedding_model.is_empty() || embedding_model == "default" {
         state
             .registry
             .read()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?
+            .map_err(|_| {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
+            })?
             .default_embedding()
             .alias
             .clone()
@@ -65,54 +66,36 @@ async fn embed_or_fallback(
         embedding_model.to_string()
     };
 
-    let Some(engine) = state.engine() else {
-        tracing::warn!(
-            "no engine loaded; using zero-vector embeddings (dense scores are meaningless)"
-        );
-        return Ok(vec![0.0f32; texts.len() * dim]);
-    };
+    let (_, engine) = state.v1_engine_for(&alias)?;
+    let vectors = mettle_core::engine::embed_texts(engine.as_ref(), &alias, texts)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("embedding via collection embedder '{alias}' failed: {e}"),
+            )
+            .into_response()
+        })?;
 
-    match mettle_core::engine::embed_texts(engine.as_ref(), &alias, texts).await {
-        Ok(vectors) => {
-            let mut flat = Vec::with_capacity(texts.len() * dim);
-            for v in vectors {
-                if v.len() != dim {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!(
-                            "embedding model '{}' produces {}-d vectors but collection \
-                             '{}' expects {}; re-ingest the collection under its own \
-                             embedding model",
-                            alias,
-                            v.len(),
-                            collection,
-                            dim
-                        ),
-                    ));
-                }
-                flat.extend_from_slice(&v);
-            }
-            Ok(flat)
+    let mut flat = Vec::with_capacity(texts.len() * dim);
+    for v in vectors {
+        if v.len() != dim {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!(
+                    "embedding model '{}' produces {}-d vectors but collection '{}' \
+                     expects {}; re-ingest the collection under its own embedding model",
+                    alias,
+                    v.len(),
+                    collection,
+                    dim
+                ),
+            )
+            .into_response());
         }
-        Err(e) if degrade_on_engine_error => {
-            // Ingest degradation: keep accepting documents on a fresh
-            // install where the embedder is not resident yet.
-            tracing::warn!(
-                "embedding via '{}' failed ({}); using zero-vector fallback",
-                alias,
-                e
-            );
-            Ok(vec![0.0f32; texts.len() * dim])
-        }
-        Err(e) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "embedding via collection embedder '{}' failed: {e} (it may not be \
-                 resident; activate a profile or load the model)",
-                alias
-            ),
-        )),
+        flat.extend_from_slice(&v);
     }
+    Ok(flat)
 }
 
 // ---------------------------------------------------------------------------
@@ -380,19 +363,13 @@ pub async fn ingest_document(
     );
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
 
-    let embeddings = match embed_or_fallback(
-        &state,
-        &embedding_model,
-        &collection_name,
-        dim,
-        &chunk_texts,
-        true,
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
+    let embeddings =
+        match embed_for_collection(&state, &embedding_model, &collection_name, dim, &chunk_texts)
+            .await
+        {
+            Ok(e) => e,
+            Err(resp) => return resp,
+        };
 
     let mut coll = match coll_handle.lock() {
         Ok(c) => c,
@@ -477,18 +454,17 @@ pub async fn search_collection(
     let query_embedding = if req.mode == SearchMode::Keyword {
         Vec::new()
     } else {
-        match embed_or_fallback(
+        match embed_for_collection(
             &state,
             &embedding_model,
             &collection_name,
             dim,
             std::slice::from_ref(&req.query),
-            false,
         )
         .await
         {
             Ok(e) => e,
-            Err((status, msg)) => return api_error(status, msg).into_response(),
+            Err(resp) => return resp,
         }
     };
 
@@ -532,7 +508,7 @@ pub async fn rag_chat_handler(
     // 1. Search every requested collection (hybrid mode, server-side).
     let mut hits = match search_collections(&state, &req).await {
         Ok(h) => h,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
+        Err(resp) => return resp,
     };
 
     // 2. Run on_retrieval hooks.
@@ -657,7 +633,8 @@ fn rag_response(model: String, citations: Vec<Citation>, acc: Accumulated) -> Ra
 async fn search_collections(
     state: &AppState,
     req: &RagChatRequest,
-) -> Result<Vec<Hit>, (StatusCode, String)> {
+) -> Result<Vec<Hit>, axum::response::Response> {
+    let fail = |status: StatusCode, msg: String| api_error(status, msg).into_response();
     let query = req
         .messages
         .last()
@@ -666,41 +643,34 @@ async fn search_collections(
 
     let mut all_hits = Vec::new();
     for name in &req.collections {
-        let handle = collection_handle(state, name)?;
+        let handle = collection_handle(state, name).map_err(|(s, m)| fail(s, m))?;
 
         let (dim, embedding_model) = {
-            let coll = handle.lock().map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "lock poisoned".to_string(),
-                )
-            })?;
+            let coll = handle
+                .lock()
+                .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
             (coll.dim, coll.embedding_model.clone())
         };
 
         // RAG chat always searches dense/hybrid (server-side default mode),
-        // so the query embedding is required and embedder failures are hard.
-        let query_embedding = embed_or_fallback(
+        // so the query embedding is required.
+        let query_embedding = embed_for_collection(
             state,
             &embedding_model,
             name,
             dim,
             std::slice::from_ref(&query),
-            false,
         )
         .await?;
 
-        let coll = handle.lock().map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "lock poisoned".to_string(),
-            )
-        })?;
+        let coll = handle
+            .lock()
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
 
         let started = std::time::Instant::now();
         let results = coll
             .search(&query_embedding, &query, req.k, Default::default(), None)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         state.metrics.observe_search(started.elapsed());
         drop(coll);
 

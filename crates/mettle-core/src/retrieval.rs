@@ -521,18 +521,17 @@ impl Collection {
             l2_normalize(row);
         }
 
-        // Allocate integer IDs for the turbovec index.
+        // Atomic per document: stage every SQLite row in one transaction,
+        // insert the vectors, then commit. Any failure before the commit
+        // rolls the rows back (the transaction drops), and a failed commit
+        // removes the vectors again — no half-written document survives.
         let base_id = self.next_int_id;
         let int_ids: Vec<u64> = (base_id..base_id + chunks.len() as u64).collect();
-        self.next_int_id += chunks.len() as u64;
 
-        // Insert into turbovec.
-        self.index
-            .add_with_ids(&normalized, &int_ids)
-            .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
-
-        // Insert into SQLite.
-        conn.execute(
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Retrieval(format!("sqlite begin: {}", e)))?;
+        tx.execute(
             "INSERT INTO documents (id, metadata_json) VALUES (?1, ?2)",
             rusqlite::params![
                 doc.id,
@@ -544,7 +543,7 @@ impl Collection {
         let mut chunk_ids = Vec::with_capacity(chunks.len());
         for (i, chunk) in chunks.iter().enumerate() {
             let chunk_id = format!("{}/chunk/{}", doc.id, i);
-            conn.execute(
+            tx.execute(
                 "INSERT INTO chunks (id, int_id, document_id, text, char_offset) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     chunk_id,
@@ -556,7 +555,7 @@ impl Collection {
             )
             .map_err(|e| CoreError::Retrieval(format!("sqlite insert chunk: {}", e)))?;
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO chunks_fts (chunk_id, text) VALUES (?1, ?2)",
                 rusqlite::params![chunk_id, chunk.text],
             )
@@ -564,6 +563,18 @@ impl Collection {
 
             chunk_ids.push(chunk_id);
         }
+
+        self.index
+            .add_with_ids(&normalized, &int_ids)
+            .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
+
+        if let Err(e) = tx.commit() {
+            for id in &int_ids {
+                self.index.remove(*id);
+            }
+            return Err(CoreError::Retrieval(format!("sqlite commit: {}", e)));
+        }
+        self.next_int_id += chunks.len() as u64;
 
         Ok(chunk_ids)
     }
@@ -1251,11 +1262,9 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let mut store = CollectionStore::new(dir, 4);
 
+        // Unknown names must never be turned into a path (traversal guard).
         let result = store.delete("nonexistent");
-        assert!(
-            result.is_ok(),
-            "deleting non-existent collection is a no-op"
-        );
+        assert!(matches!(result, Err(CoreError::CollectionNotFound(_))));
     }
 
     /// turbovec recall smoke (spec §13): inserting random vectors and querying
