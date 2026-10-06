@@ -35,7 +35,7 @@ impl Default for RootConfig {
             server: ServerConfig::default(),
             engine: EngineOptions::default(),
             model: default_models(),
-            profile: Vec::new(),
+            profile: vec![default_profile()],
             retrieval: RetrievalConfig::default(),
         }
     }
@@ -178,6 +178,12 @@ pub struct ProfileSlot {
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub name: String,
+    /// Shipped-default marker: activated on first boot when no active
+    /// profile was ever persisted (adoption-contract grilling Q11,
+    /// 2026-09-10 — the one deliberate amendment to profiles-contract's
+    /// "no implicit default profile").
+    #[serde(default)]
+    pub default: bool,
     #[serde(default)]
     pub slots: Vec<ProfileSlot>,
 }
@@ -229,17 +235,57 @@ pub struct ModelEntry {
 }
 
 fn default_models() -> Vec<ModelEntry> {
-    vec![ModelEntry {
-        id: "gemma4:e2b".into(),
-        default: true,
-        path: None,
-        n_gpu_layers: None,
-        mmproj_path: None,
-        role: None,
-        min_ctx: None,
-        draft: None,
-    }]
+    // Adoption contract §1.4 (2026-09-10): the shipped default catalog is
+    // the bench-proven qwen3 retrieval set plus the gemma4 chat model (chat
+    // stays JIT — the profile pins only retrieval models). `path: None`
+    // entries clone the registry builtins (HF repos + quant filenames), so
+    // fresh installs resolve via the HF cache and this repo's `models/`
+    // checkouts resolve via config paths when a user pins them.
+    fn entry(id: &str, default: bool) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            default,
+            path: None,
+            n_gpu_layers: None,
+            mmproj_path: None,
+            role: None,
+            min_ctx: None,
+            draft: None,
+        }
+    }
+    vec![
+        entry("gemma4:e2b", true),
+        entry("qwen3-embedding-0.6b:latest", false),
+        entry("qwen3-reranker-0.6b:latest", false),
+        entry("embed-gemma:latest", false),
+        entry("bge-m3:latest", false),
+        entry("bge-reranker-v2-m3:latest", false),
+    ]
 }
+
+/// The shipped-default profile: the bench-retrieval shape (n_ctx 8192,
+/// KV fp8, `n_gpu_layers 999`, all retrieval models GPU-resident; chat
+/// models JIT). Priorities order the degradation ladder: the qwen3 defaults
+/// are kept longest, the secondary embedders/reranker evict first.
+fn default_profile() -> ProfileConfig {
+    let slot = |id: &str, priority: u32| ProfileSlot {
+        id: id.into(),
+        priority: Some(priority),
+        placement: None,
+    };
+    ProfileConfig {
+        name: "bench-retrieval".into(),
+        default: true,
+        slots: vec![
+            slot("qwen3-embedding-0.6b:latest", 10),
+            slot("qwen3-reranker-0.6b:latest", 20),
+            slot("embed-gemma:latest", 30),
+            slot("bge-m3:latest", 40),
+            slot("bge-reranker-v2-m3:latest", 50),
+        ],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -459,10 +505,22 @@ mod tests {
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert!(cfg.engine.prefix_cache);
         assert!(matches!(cfg.engine.kv_cache, KVCacheSetting::Fp8));
-        assert_eq!(cfg.model.len(), 1);
+        // gemma4 chat + the qwen3 retrieval set (adoption contract §1.4).
+        assert_eq!(cfg.model.len(), 6);
         assert_eq!(cfg.model[0].id, "gemma4:e2b");
         assert!(cfg.model[0].default);
         assert!(cfg.model[0].path.is_none());
+        assert!(cfg
+            .model
+            .iter()
+            .any(|m| m.id == "qwen3-embedding-0.6b:latest"));
+        // The shipped default profile: bench-retrieval, activation-default,
+        // qwen3 slots kept longest (lowest priority number wins role alias).
+        let profile = &cfg.profile[0];
+        assert_eq!(profile.name, "bench-retrieval");
+        assert!(profile.default);
+        assert_eq!(profile.slots[0].id, "qwen3-embedding-0.6b:latest");
+        assert_eq!(profile.slots[1].id, "qwen3-reranker-0.6b:latest");
     }
 
     #[test]

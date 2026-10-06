@@ -55,7 +55,10 @@ pub async fn request_hook_middleware(
             req.extensions_mut().insert(ctx);
             next.run(req).await
         }
-        HookOutcome::Abort { status_code, message } => {
+        HookOutcome::Abort {
+            status_code,
+            message,
+        } => {
             let status = axum::http::StatusCode::from_u16(status_code)
                 .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
             (status, axum::Json(serde_json::json!({"error": message}))).into_response()
@@ -115,9 +118,7 @@ mod tests {
 
     #[test]
     fn extract_bearer_missing() {
-        let req = Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
+        let req = Request::builder().body(axum::body::Body::empty()).unwrap();
         assert_eq!(extract_bearer(&req), None);
     }
 }

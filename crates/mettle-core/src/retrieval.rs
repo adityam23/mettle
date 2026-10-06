@@ -50,8 +50,18 @@ pub struct ScoredChunk {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
+    /// Vector-only: turbovec nearest neighbours within the allowlist.
     Dense,
+    /// Lexical-only: FTS5 `MATCH` over OR-joined query tokens, ranked by
+    /// `bm25()` (higher score = better; returned scores are negated bm25).
+    /// No embedding is computed.
     Keyword,
+    /// Head-preserving candidate fusion: the dense top-10 ordering is pinned,
+    /// then Reciprocal Rank Fusion (k=60, 1:1) over the dense top-40 and the
+    /// keyword top-40 fills ranks 11+. Allowlist enforced on both lists before
+    /// fusion. Breaking change vs. the pre-2026-09-10 FTS5-candidates ∩
+    /// dense-rerank semantics; the pinning is a measured deviation from pure
+    /// RRF — see the `search()` notes.
     #[default]
     Hybrid,
 }
@@ -85,6 +95,19 @@ pub struct SearchRequest {
 
 fn default_k() -> usize {
     10
+}
+
+/// L2-normalize one embedding in place. Zero (or near-zero) vectors stay
+/// zero so the no-engine fallback keeps its current behaviour.
+fn l2_normalize(v: &mut [f32]) {
+    let sq: f64 = v.iter().map(|&x| x as f64 * x as f64).sum();
+    let norm = sq.sqrt();
+    if norm > 1e-10 {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x = (*x as f64 * inv) as f32;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,16 +173,14 @@ pub struct CollectionStore {
     collections: HashMap<String, Arc<Mutex<Collection>>>,
     data_dir: PathBuf,
     default_bit_width: usize,
-    embedding_dim: usize,
 }
 
 impl CollectionStore {
-    pub fn new(data_dir: PathBuf, default_bit_width: usize, embedding_dim: usize) -> Self {
+    pub fn new(data_dir: PathBuf, default_bit_width: usize) -> Self {
         Self {
             collections: HashMap::new(),
             data_dir,
             default_bit_width,
-            embedding_dim,
         }
     }
 
@@ -168,11 +189,11 @@ impl CollectionStore {
         self.collections.get(name)
     }
 
-    /// Create a new named collection. Returns an error if it already exists.
     pub fn create(
         &mut self,
         name: &str,
         embedding_model: &str,
+        dim: usize,
     ) -> Result<&Arc<Mutex<Collection>>, CoreError> {
         if self.collections.contains_key(name) {
             return Err(CoreError::Conflict(format!(
@@ -188,7 +209,7 @@ impl CollectionStore {
 
         let collection = Collection::new(
             name,
-            self.embedding_dim,
+            dim,
             embedding_model,
             &coll_dir,
             self.default_bit_width,
@@ -227,15 +248,14 @@ impl CollectionStore {
         }
 
         let mut count = 0;
-        for entry in std::fs::read_dir(&colls_dir).map_err(|e| {
-            CoreError::Retrieval(format!("failed to read collections dir: {}", e))
-        })? {
-            let entry = entry.map_err(|e| {
-                CoreError::Retrieval(format!("failed to read dir entry: {}", e))
-            })?;
+        for entry in std::fs::read_dir(&colls_dir)
+            .map_err(|e| CoreError::Retrieval(format!("failed to read collections dir: {}", e)))?
+        {
+            let entry = entry
+                .map_err(|e| CoreError::Retrieval(format!("failed to read dir entry: {}", e)))?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let coll = Collection::load(&name, self.embedding_dim, &entry.path())?;
+                let coll = Collection::load(&name, &entry.path())?;
                 self.collections.insert(name, Arc::new(Mutex::new(coll)));
                 count += 1;
             }
@@ -285,15 +305,13 @@ impl Collection {
             CoreError::Retrieval(format!("failed to create collection directory: {}", e))
         })?;
 
-        let index = IdMapIndex::new(dim, bit_width).map_err(|e| {
-            CoreError::Retrieval(format!("failed to create turbovec index: {}", e))
-        })?;
+        let index = IdMapIndex::new(dim, bit_width)
+            .map_err(|e| CoreError::Retrieval(format!("failed to create turbovec index: {}", e)))?;
 
         // Initialize the SQLite schema.
         let db_path = data_dir.join("metadata.db");
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| {
-            CoreError::Retrieval(format!("failed to open sqlite db: {}", e))
-        })?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
         conn.execute_batch(
             "
@@ -337,8 +355,11 @@ impl Collection {
         })
     }
 
-    /// Load an existing collection from disk.
-    pub fn load(name: &str, dim: usize, data_dir: &Path) -> Result<Self, CoreError> {
+    /// Load an existing collection from disk. The embedding dimension is
+    /// persisted in `collection_meta` at creation; a collection without it
+    /// is corrupt and refused (never silently rebuild an index at a wrong
+    /// dim).
+    pub fn load(name: &str, data_dir: &Path) -> Result<Self, CoreError> {
         let db_path = data_dir.join("metadata.db");
         if !db_path.exists() {
             return Err(CoreError::CollectionNotFound(format!(
@@ -348,9 +369,8 @@ impl Collection {
             )));
         }
 
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| {
-            CoreError::Retrieval(format!("failed to open sqlite db: {}", e))
-        })?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
         let meta = |key: &str| -> Option<String> {
             conn.query_row(
@@ -361,12 +381,10 @@ impl Collection {
             .ok()
         };
         let embedding_model = meta("embedding_model").unwrap_or_default();
-        let dim = meta("dim")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(dim);
-        let bit_width = meta("bit_width")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+        let dim = meta("dim").and_then(|v| v.parse().ok()).ok_or_else(|| {
+            CoreError::Retrieval(format!("collection '{name}' has no dim in meta"))
+        })?;
+        let bit_width = meta("bit_width").and_then(|v| v.parse().ok()).unwrap_or(4);
 
         let index_path = data_dir.join("index.bin");
         let index = if index_path.exists() {
@@ -429,9 +447,8 @@ impl Collection {
     ) -> Result<Vec<String>, CoreError> {
         // Check if document already exists.
         let db_path = self.data_dir.join("metadata.db");
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| {
-            CoreError::Retrieval(format!("failed to open sqlite db: {}", e))
-        })?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
         let existing: bool = conn
             .query_row(
@@ -462,6 +479,14 @@ impl Collection {
             )));
         }
 
+        // turbovec scores estimate the inner product <v, q>; the served models
+        // emit unnormalized embeddings, so normalize here — dense ranking must
+        // be cosine or long high-norm chunks dominate regardless of similarity.
+        let mut normalized = embeddings.to_vec();
+        for row in normalized.chunks_exact_mut(self.dim) {
+            l2_normalize(row);
+        }
+
         // Allocate integer IDs for the turbovec index.
         let base_id = self.next_int_id;
         let int_ids: Vec<u64> = (base_id..base_id + chunks.len() as u64).collect();
@@ -469,13 +494,16 @@ impl Collection {
 
         // Insert into turbovec.
         self.index
-            .add_with_ids(embeddings, &int_ids)
+            .add_with_ids(&normalized, &int_ids)
             .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
 
         // Insert into SQLite.
         conn.execute(
             "INSERT INTO documents (id, metadata_json) VALUES (?1, ?2)",
-            rusqlite::params![doc.id, serde_json::to_string(&doc.metadata).unwrap_or_default()],
+            rusqlite::params![
+                doc.id,
+                serde_json::to_string(&doc.metadata).unwrap_or_default()
+            ],
         )
         .map_err(|e| CoreError::Retrieval(format!("sqlite insert document: {}", e)))?;
 
@@ -509,9 +537,8 @@ impl Collection {
     /// Delete a document and all its chunks.
     pub fn delete_document(&mut self, doc_id: &str) -> Result<(), CoreError> {
         let db_path = self.data_dir.join("metadata.db");
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| {
-            CoreError::Retrieval(format!("failed to open sqlite db: {}", e))
-        })?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
         // Collect integer IDs to remove from turbovec.
         let mut stmt = conn
@@ -560,9 +587,8 @@ impl Collection {
         allowlist: Option<&[String]>,
     ) -> Result<Vec<ScoredChunk>, CoreError> {
         let db_path = self.data_dir.join("metadata.db");
-        let conn = rusqlite::Connection::open(&db_path).map_err(|e| {
-            CoreError::Retrieval(format!("failed to open sqlite db: {}", e))
-        })?;
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
         // Resolve the document-id allowlist to index int_ids.
         let allow_ids: Option<Vec<u64>> = match allowlist {
@@ -582,35 +608,60 @@ impl Collection {
             }
         };
 
+        // Queries are normalized to the same cosine space as stored vectors.
+        let mut q = query_embedding.to_vec();
+        l2_normalize(&mut q);
+
         match mode {
             SearchMode::Dense => {
-                let (scores, ids) =
-                    self.index
-                        .search_with_allowlist(query_embedding, k, allow_ids.as_deref());
+                let (scores, ids) = self
+                    .index
+                    .search_with_allowlist(&q, k, allow_ids.as_deref());
                 self.lookup_chunks(&conn, &ids, &scores)
             }
             SearchMode::Keyword => {
+                // Adoption-contract §1.1 (2026-09-10): OR-mode FTS5 + bm25()
+                // ranking. The old AND-expansion measured 0.000 recall on the
+                // parity benchmark (FTS5 AND of long natural questions matches
+                // nothing); this recipe measures .487@10 vs docket's
+                // rank_bm25 .380.
+                //
+                // Tokenize with the metric's rule: lowercase [a-z0-9]+ runs,
+                // OR-joined into the MATCH, no other sanitization. FTS5's
+                // AND/OR/NOT operators are uppercase-only, so lowercase
+                // [a-z0-9]+ barewords cannot inject operators.
+                //
+                // Disclosed caveats: FTS5's unicode61 tokenizer vs the
+                // metric's [a-z0-9]+ (underscore/unicode edge cases), and
+                // indexed text carries the ingest-side chunk cap.
+                let tokens = keyword_tokens(query_text);
+                if tokens.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let fts_query = tokens.join(" OR ");
                 let allowed_docs: Option<std::collections::HashSet<&str>> =
                     allowlist.map(|d| d.iter().map(String::as_str).collect());
 
-                let fts_query = sanitize_fts5(query_text);
                 let mut stmt = conn
                     .prepare(
-                        "SELECT c.id, c.document_id, c.text, c.char_offset
+                        "SELECT c.id, c.document_id, c.text, c.char_offset, bm25(chunks_fts)
                          FROM chunks_fts fts
                          JOIN chunks c ON c.id = fts.chunk_id
                          WHERE chunks_fts MATCH ?1
-                         ORDER BY rank",
+                         ORDER BY bm25(chunks_fts)",
                     )
                     .map_err(|e| CoreError::Retrieval(format!("fts query: {}", e)))?;
 
+                // bm25() is smaller-is-better (SQLite returns negative
+                // relevance); negate so score is higher-is-better like dense.
                 let results: Vec<ScoredChunk> = stmt
                     .query_map([&fts_query], |row| {
+                        let bm25: f64 = row.get(4)?;
                         Ok(ScoredChunk {
                             chunk_id: row.get(0)?,
                             document_id: row.get(1)?,
                             text: row.get(2)?,
-                            score: 1.0,
+                            score: -bm25,
                             source_span: Some((row.get::<_, i64>(3)? as usize, 0)),
                         })
                     })
@@ -627,44 +678,122 @@ impl Collection {
                 Ok(results)
             }
             SearchMode::Hybrid => {
-                // FTS5 → candidate IDs → dense rerank via allowlist.
-                let fts_query = sanitize_fts5(query_text);
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT c.int_id FROM chunks_fts fts
-                         JOIN chunks c ON c.id = fts.chunk_id
-                         WHERE chunks_fts MATCH ?1
-                         ORDER BY rank
-                         LIMIT 100",
-                    )
-                    .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?;
+                // Adoption-contract §1.2 (2026-09-10), BREAKING semantic
+                // change: the old FTS5-candidates ∩ dense-rerank collapsed to
+                // dense (hybrid == dense .787@10 both) and starved the
+                // reranker of candidate diversity (rerank_hybrid .867 vs
+                // docket's diverse-pool .913).
+                //
+                // Shipped geometry (user decision 2026-09-11, option C of the
+                // measured frontier): the dense top-HEAD ordering is pinned
+                // first, and Reciprocal Rank Fusion (k=60, 1:1) over the
+                // remaining dense top-POOL and the keyword top-POOL
+                // (OR+bm25, §1.1) fills the tail. Score-scale-free;
+                // fused top-k.
+                //
+                // DISCLOSED DEVIATION from the grilled pure-RRF spec, with
+                // the measured reason (offline replay of all 150 questions;
+                // benchmarks/retrieval_parity/fusion_probe.py,
+                // diversity_probe.py, fusion_composition.py,
+                // fusion_cell_search.py, fusion_head_probe.py):
+                //
+                // 1. The spec'd docket-identical equal-weight fusion
+                //    (top-40/40, 1:1, no head pin) SERVED hybrid .7200@10 —
+                //    below its own ≥.787 gate, because OR/bm25 evidence
+                //    (keyword .487 vs dense .787) outvotes dense order AND a
+                //    dual-list chunk earns BOTH RRF terms, so it jumps into
+                //    the top-10 and displaces dense head golds.
+                // 2. Suppressing the keyword weight instead (dense 2.0 :
+                //    keyword 0.5, top-80 pools) SERVED hybrid .8067@10 —
+                //    but puts ZERO keyword-only candidates in the fused
+                //    top-40 (the apparent novelty was dense ranks 40-79
+                //    leaking through the deeper dense pool, not lexical
+                //    diversity), and SERVED rerank_hybrid .8800, missing the
+                //    contract's ≥.90 gate: the rerank pool is compositionally
+                //    plain dense.
+                // 3. Pinning the dense head decouples the two gates: stage-1
+                //    top-10 recall is exactly the dense mode's own ordering
+                //    (no keyword-induced head churn), while the tail carries
+                //    the lexical candidates the reranker needs. Offline the
+                //    fused top-40 matches the pool composition that measured
+                //    rerank_hybrid .9067 when served (≈10 keyword-only
+                //    chunks vs 0.0 in (2)). HEAD=10 is also the recall-optimal
+                //    pin: h8/h5/h0 measured .7733/.7467/.7400 offline vs
+                //    .7933, because every extra fused head position risks
+                //    displacing a dense gold with a keyword one.
+                //
+                // The allowlist is enforced on BOTH candidate lists before
+                // fusion (keyword rows by document id, dense in-kernel), so
+                // the fused result cannot contain excluded ids.
+                const RRF_K: f64 = 60.0;
+                const POOL: usize = 40;
+                const HEAD: usize = 10;
+                const DENSE_W: f64 = 1.0;
+                const KEYWORD_W: f64 = 1.0;
+                // Never shrink a large-k request below the historical pool:
+                // the measured geometry is k=40, larger k only widens it.
+                let pool = POOL.max(k);
 
-                let mut candidate_ids: Vec<u64> = stmt
-                    .query_map([&fts_query], |row| row.get::<_, i64>(0).map(|v| v as u64))
-                    .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?
-                    .filter_map(|r| r.ok())
+                let tokens = keyword_tokens(query_text);
+                let mut rrf: HashMap<u64, f64> = HashMap::new();
+                if !tokens.is_empty() {
+                    let fts_query = tokens.join(" OR ");
+                    let allowed_docs: Option<std::collections::HashSet<&str>> =
+                        allowlist.map(|d| d.iter().map(String::as_str).collect());
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT c.int_id, c.document_id
+                             FROM chunks_fts fts
+                             JOIN chunks c ON c.id = fts.chunk_id
+                             WHERE chunks_fts MATCH ?1
+                             ORDER BY bm25(chunks_fts)
+                             LIMIT ?2",
+                        )
+                        .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?;
+
+                    let pool = pool as i64;
+                    let rows: Vec<(u64, String)> = stmt
+                        .query_map(rusqlite::params![fts_query, pool], |row| {
+                            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| CoreError::Retrieval(format!("fts hybrid query: {}", e)))?
+                        .filter_map(|r| r.ok())
+                        .filter(|(_, doc)| {
+                            allowed_docs
+                                .as_ref()
+                                .is_none_or(|docs| docs.contains(doc.as_str()))
+                        })
+                        .collect();
+                    for (rank, (int_id, _)) in rows.into_iter().enumerate() {
+                        *rrf.entry(int_id).or_default() += KEYWORD_W / (RRF_K + rank as f64 + 1.0);
+                    }
+                }
+
+                // Dense leg (allowlist enforced in-kernel; empty keyword side
+                // just leaves a single-list RRF = dense ranking).
+                let (_, d_ids) = self
+                    .index
+                    .search_with_allowlist(&q, pool, allow_ids.as_deref());
+                for (rank, &id) in d_ids.iter().enumerate() {
+                    *rrf.entry(id).or_default() += DENSE_W / (RRF_K + rank as f64 + 1.0);
+                }
+
+                // Pin the dense head, then fill from the fused ordering. The
+                // head's RRF scores are read before `rrf` is consumed.
+                let head: Vec<u64> = d_ids.iter().copied().take(HEAD).collect();
+                let head_set: std::collections::HashSet<u64> = head.iter().copied().collect();
+                let mut ordered: Vec<(u64, f64)> = head
+                    .iter()
+                    .map(|&id| (id, rrf.get(&id).copied().unwrap_or(0.0)))
                     .collect();
 
-                // Intersect FTS candidates with the caller's allowlist.
-                if let Some(allow) = &allow_ids {
-                    let allow: std::collections::HashSet<u64> = allow.iter().copied().collect();
-                    candidate_ids.retain(|id| allow.contains(id));
-                }
-
-                if candidate_ids.is_empty() {
-                    // No keyword candidates: fall back to dense (still allowlist-filtered).
-                    let (scores, ids) =
-                        self.index
-                            .search_with_allowlist(query_embedding, k, allow_ids.as_deref());
-                    return self.lookup_chunks(&conn, &ids, &scores);
-                }
-
-                let (scores, ids) = self.index.search_with_allowlist(
-                    query_embedding,
-                    k.min(candidate_ids.len()),
-                    Some(&candidate_ids),
-                );
-
+                let mut fused: Vec<(u64, f64)> = rrf.into_iter().collect();
+                // Score desc; int_id asc tie-break for determinism.
+                fused.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                ordered.extend(fused.into_iter().filter(|(id, _)| !head_set.contains(id)));
+                ordered.truncate(k);
+                let ids: Vec<u64> = ordered.iter().map(|(id, _)| *id).collect();
+                let scores: Vec<f32> = ordered.iter().map(|(_, s)| *s as f32).collect();
                 self.lookup_chunks(&conn, &ids, &scores)
             }
         }
@@ -709,9 +838,9 @@ impl Collection {
     /// Flush the turbovec index to disk.
     pub fn flush(&self) -> Result<(), CoreError> {
         let path = self.data_dir.join("index.bin");
-        self.index.write(&path).map_err(|e| {
-            CoreError::Retrieval(format!("failed to write index: {}", e))
-        })
+        self.index
+            .write(&path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to write index: {}", e)))
     }
 
     /// Number of vectors currently stored.
@@ -771,17 +900,28 @@ fn chunk_text(text: &str, doc_id: &str, chunk_tokens: usize, chunk_overlap: usiz
     chunks
 }
 
-/// Sanitize a user query for FTS5 MATCH syntax: keep alphanumeric terms,
-/// drop everything else (operators, quotes, punctuation). Terms stay
-/// unquoted, so FTS5 ANDs them together.
-fn sanitize_fts5(query: &str) -> String {
-    // Lowercase so bare AND/OR/NOT are not parsed as FTS5 operators.
-    query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Tokenize a query with the retrieval metric's rule: lowercase `[a-z0-9]+`
+/// runs (adoption-contract §1.1). Unicode/underscore characters split runs;
+fn keyword_tokens(query: &str) -> Vec<String> {
+    let lowered = query.to_lowercase();
+    let bytes = lowered.as_bytes();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_tok = b.is_ascii_lowercase() || b.is_ascii_digit();
+        match (is_tok, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                tokens.push(lowered[s..i].to_string());
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(lowered[s..].to_string());
+    }
+    tokens
 }
 
 #[cfg(test)]
@@ -800,10 +940,18 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_fts5() {
-        assert_eq!(sanitize_fts5("hello world"), "hello world");
-        assert_eq!(sanitize_fts5("it's \"special\""), "it s special");
-        assert_eq!(sanitize_fts5("foo:bar (x OR y) -baz*"), "foo bar x or y baz");
+    fn test_keyword_tokens() {
+        assert_eq!(keyword_tokens("hello world"), vec!["hello", "world"]);
+        assert_eq!(
+            keyword_tokens("it's \"special\""),
+            vec!["it", "s", "special"]
+        );
+        assert_eq!(
+            keyword_tokens("Foo:BAR (x OR y) -baz*"),
+            vec!["foo", "bar", "x", "or", "y", "baz"]
+        );
+        assert_eq!(keyword_tokens("a_b c2"), vec!["a", "b", "c2"]);
+        assert!(keyword_tokens("!!!").is_empty());
     }
 
     // -------------------------------------------------------------------
@@ -858,14 +1006,128 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let mut coll = test_collection(&dir, "test");
 
-        let doc = test_document("doc1", "machine learning is a subset of artificial intelligence");
+        let doc = test_document(
+            "doc1",
+            "machine learning is a subset of artificial intelligence",
+        );
         coll.add_document(&doc, &test_embed_fn, 5, 2).unwrap();
 
         let q_embedding = vec![0.0f32; 16];
         let results = coll
-            .search(&q_embedding, "machine learning", 10, SearchMode::Keyword, None)
+            .search(
+                &q_embedding,
+                "machine learning",
+                10,
+                SearchMode::Keyword,
+                None,
+            )
             .unwrap();
         assert!(!results.is_empty(), "keyword search should find results");
+    }
+
+    /// Hybrid mode fuses the keyword top-40 and dense top-40 candidates (RRF
+    /// union, adoption-contract §1.2): a document that matches only on
+    /// keywords and one that matches only on embeddings both surface. Under
+    /// the old FTS→dense intersection, the dense-only document was invisible.
+    #[test]
+    fn hybrid_rrf_union_diversity() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "test");
+
+        let embed = |texts: &[String]| -> Result<Vec<f32>, CoreError> {
+            let mut out = Vec::with_capacity(texts.len() * 16);
+            for t in texts {
+                // doc2 (quantum) sits in a different region of the space than
+                // doc1 (alpha), so the query below is dense-near doc2 only.
+                let v = if t.contains("quantum") {
+                    0.9f32
+                } else {
+                    0.1f32
+                };
+                out.extend(std::iter::repeat(v).take(16));
+            }
+            Ok(out)
+        };
+        coll.add_document(
+            &test_document("doc1", "alpha beta gamma delta epsilon"),
+            &embed,
+            5,
+            2,
+        )
+        .unwrap();
+        coll.add_document(
+            &test_document("doc2", "quantum computing is neither alpha nor beta"),
+            &embed,
+            5,
+            2,
+        )
+        .unwrap();
+
+        // Query tokens match doc1's text; query embedding is doc2's region.
+        let q = vec![0.9f32; 16];
+        let results = coll
+            .search(&q, "alpha", 10, SearchMode::Hybrid, None)
+            .unwrap();
+        let docs: std::collections::HashSet<&str> =
+            results.iter().map(|r| r.document_id.as_str()).collect();
+        assert!(docs.contains("doc1"), "keyword-only doc1 must surface");
+        assert!(docs.contains("doc2"), "dense-only doc2 must surface");
+
+        // No keyword side (no tokens): hybrid = single-list RRF over dense.
+        let results = coll
+            .search(&q, "!!!", 10, SearchMode::Hybrid, None)
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.document_id == "doc2"),
+            "hybrid with empty keyword leg falls back to the dense ranking"
+        );
+    }
+    /// The dense top-10 is pinned ahead of the fused tail (contract §1.2 as
+    /// amended): a keyword-only document must never displace a densely
+    /// stronger one at the head, because that head churn is what drove the
+    /// served `hybrid` arm below its gate (.7200).
+    #[test]
+    fn hybrid_head_stays_dense_ordered() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut coll = test_collection(&dir, "test");
+
+        // Dense ordering a > b > c for the query below.
+        let embed = |texts: &[String]| -> Result<Vec<f32>, CoreError> {
+            let mut out = Vec::with_capacity(texts.len() * 16);
+            for t in texts {
+                let v = if t.contains("alpha") {
+                    1.0f32
+                } else if t.contains("bravo") {
+                    0.5
+                } else {
+                    0.1
+                };
+                out.extend(std::iter::repeat_n(v, 16));
+            }
+            Ok(out)
+        };
+        for (id, text) in [("doc_a", "alpha"), ("doc_b", "bravo"), ("doc_c", "charlie")] {
+            coll.add_document(&test_document(id, text), &embed, 5, 0)
+                .unwrap();
+        }
+
+        let q = vec![0.9f32; 16];
+        let dense = coll
+            .search(&q, "charlie", 10, SearchMode::Dense, None)
+            .unwrap();
+        assert_eq!(dense[0].document_id, "doc_a", "dense orders a first");
+
+        // "charlie" matches doc_c in FTS5 only; doc_c is dense-worst. Under
+        // additive equal-weight RRF it collects both terms (1/62 + 1/61) and
+        // outranks doc_a (1/61) — the head pin must keep doc_a first.
+        let fused = coll
+            .search(&q, "charlie", 10, SearchMode::Hybrid, None)
+            .unwrap();
+        let ids: Vec<&str> = fused.iter().map(|r| r.document_id.as_str()).collect();
+        assert_eq!(ids[0], "doc_a", "hybrid must not reorder the dense head");
+        assert!(ids.contains(&"doc_c"), "keyword-only doc still surfaces");
     }
 
     /// Ingest a document, delete it, verify it's gone.
@@ -877,7 +1139,10 @@ mod tests {
 
         let doc = test_document("doc1", "this document will be deleted");
         coll.add_document(&doc, &test_embed_fn, 5, 2).unwrap();
-        assert!(!coll.is_empty(), "collection should not be empty after ingest");
+        assert!(
+            !coll.is_empty(),
+            "collection should not be empty after ingest"
+        );
 
         coll.delete_document("doc1").unwrap();
         assert!(coll.is_empty(), "collection should be empty after delete");
@@ -900,13 +1165,15 @@ mod tests {
             coll.flush().unwrap();
 
             let q = vec![0.1f32; 16];
-            let results = coll.search(&q, "persistence", 10, SearchMode::Dense, None).unwrap();
+            let results = coll
+                .search(&q, "persistence", 10, SearchMode::Dense, None)
+                .unwrap();
             assert!(!results.is_empty(), "search should work before restart");
         }
 
         // Phase 2: load from disk, verify same results.
         {
-            let loaded = Collection::load(coll_name, 16, &dir).unwrap();
+            let loaded = Collection::load(coll_name, &dir).unwrap();
             assert!(!loaded.is_empty(), "loaded collection should have data");
 
             let q = vec![0.1f32; 16];
@@ -936,10 +1203,10 @@ mod tests {
     fn property_duplicate_collection_rejected() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        let mut store = CollectionStore::new(dir, 4, 16);
+        let mut store = CollectionStore::new(dir, 4);
 
-        store.create("c1", "test-model").unwrap();
-        let result = store.create("c1", "other-model");
+        store.create("c1", "test-model", 16).unwrap();
+        let result = store.create("c1", "other-model", 16);
         assert!(result.is_err(), "duplicate collection should be rejected");
     }
 
@@ -948,10 +1215,13 @@ mod tests {
     fn property_delete_nonexistent_collection() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        let mut store = CollectionStore::new(dir, 4, 16);
+        let mut store = CollectionStore::new(dir, 4);
 
         let result = store.delete("nonexistent");
-        assert!(result.is_ok(), "deleting non-existent collection is a no-op");
+        assert!(
+            result.is_ok(),
+            "deleting non-existent collection is a no-op"
+        );
     }
 
     /// turbovec recall smoke (spec §13): inserting random vectors and querying
@@ -1049,7 +1319,7 @@ mod tests {
 
             // Restart: same number of vectors, keyword search still works.
             {
-                let mut coll = Collection::load("prop", 16, &dir).unwrap();
+                let mut coll = Collection::load("prop", &dir).unwrap();
                 let before = coll.len();
                 prop_assert!(before > 0);
 

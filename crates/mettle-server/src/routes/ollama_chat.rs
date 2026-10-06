@@ -1,12 +1,6 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-    Extension,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use mettle_core::engine::{EngineRequest, EngineResponse, RequestKind};
 use mettle_core::hooks::RequestCtx;
 use mettle_core::ollama_types::{
@@ -124,4 +118,3 @@ fn chat_response(model: String, acc: Accumulated) -> ChatResponse {
         timing: usage_to_timing(&acc.usage),
     }
 }
-

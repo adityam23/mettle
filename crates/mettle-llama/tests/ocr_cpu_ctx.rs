@@ -14,7 +14,9 @@ use llama_cpp_2::model::LlamaModel;
 fn models_root() -> std::path::PathBuf {
     std::env::var_os("METTLE_MODELS")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"))
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models")
+        })
 }
 
 fn gguf(rel: &str) -> std::path::PathBuf {
@@ -32,15 +34,16 @@ fn cpu_model_context_reserves_cuda() {
         &LlamaModelParams::default().with_n_gpu_layers(999),
     )
     .expect("load gemma");
-        
-        
+
     let gemma_params = LlamaContextParams::default()
         .with_n_ctx(Some(NonZeroU32::new(8192).unwrap()))
         .with_n_batch(512)
         .with_n_seq_max(1)
         .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO)
         .with_n_threads(16);
-    let _gemma_ctx = gemma.new_context(&backend, gemma_params).expect("gemma ctx");
+    let _gemma_ctx = gemma
+        .new_context(&backend, gemma_params)
+        .expect("gemma ctx");
 
     // Then the CPU model + context (op_offload=false like the engine).
     let model = LlamaModel::load_from_file(

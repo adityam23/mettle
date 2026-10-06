@@ -77,7 +77,7 @@ impl AppState {
             engine,
             registry,
             hooks: Arc::new(HookRegistry::new()),
-            collections: Arc::new(Mutex::new(CollectionStore::new(data_dir, bit_width, 768))),
+            collections: Arc::new(Mutex::new(CollectionStore::new(data_dir, bit_width))),
             config,
             startup_time: Instant::now(),
             metrics: Metrics::default(),

@@ -26,3 +26,6 @@ agent-docs/
 CLAUDE.md
 .claude/
 .omp/
+
+# Benchmark runtime state (served collections; rebuildable)
+benchmarks/**/.state/

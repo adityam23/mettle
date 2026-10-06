@@ -69,9 +69,8 @@ where
                 }
                 Err(e) => {
                     tracing::error!("stream error: {}", e);
-                    let mut json =
-                        serde_json::to_vec(&serde_json::json!({"error": e.to_string()}))
-                            .unwrap_or_default();
+                    let mut json = serde_json::to_vec(&serde_json::json!({"error": e.to_string()}))
+                        .unwrap_or_default();
                     json.push(b'\n');
                     axum::body::Bytes::from(json)
                 }

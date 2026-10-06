@@ -1,0 +1,29 @@
+{
+ "generated": "2026-09-10T17:47:18+02:00",
+ "p50_s": 10.83,
+ "baseline_p50_s": 11.566,
+ "mean_rho": 0.998983904413943,
+ "per_call_rho": {
+  "financebench_id_03069": 0.999249530956848,
+  "financebench_id_00464": 0.99906191369606,
+  "financebench_id_08135": 0.999624765478424,
+  "financebench_id_00720": 0.99906191369606,
+  "financebench_id_01487": 0.9994371482176361,
+  "financebench_id_00651": 1.0,
+  "financebench_id_00215": 0.9994371482176361,
+  "financebench_id_00494": 0.999624765478424,
+  "financebench_id_01226": 0.9969924812030075,
+  "financebench_id_00799": 0.998874296435272,
+  "financebench_id_01981": 0.9945054945054945,
+  "financebench_id_00070": 0.999624765478424,
+  "financebench_id_01198": 1.0,
+  "financebench_id_03031": 0.9977485928705441,
+  "financebench_id_00521": 0.999249530956848,
+  "financebench_id_02416": 1.0,
+  "financebench_id_04481": 0.9986866791744841,
+  "financebench_id_06741": 0.999624765478424,
+  "financebench_id_00563": 0.998874296435272,
+  "financebench_id_10130": 1.0
+ },
+ "gate_pass": true
+}

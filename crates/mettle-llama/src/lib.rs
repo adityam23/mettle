@@ -647,7 +647,10 @@ fn embed(
         limit
     );
 
-    let mut ctx = model.new_context(backend, embed_ctx_params(pooling, tokens.len(), 1))?;
+    let mut ctx = model.new_context(
+        backend,
+        embed_ctx_params(pooling, tokens.len(), tokens.len(), 1),
+    )?;
     let mut batch = LlamaBatch::new(tokens.len().max(8), 1);
     for (i, tok) in tokens.iter().enumerate() {
         batch.add(*tok, i as i32, &[0], false)?;
@@ -734,28 +737,84 @@ fn rerank(
     if seqs.is_empty() {
         return Ok(Vec::new());
     }
-    // Decode each pair in its own context/decode: multi-sequence batching
-    // perturbs decoder-arch rerankers (Qwen3) at the sub-0.1% score level —
-    // enough to swap near-zero-scored documents vs the HF reference. Pair
-    // counts are small, so the throughput cost is negligible next to exact,
-    // request-shape-independent scores.
+    // Micro-batched multi-sequence decode (adoption-contract §1.3, 2026-09-10):
+    // pairs are grouped into ONE context with n_seq sequences and decoded in a
+    // single pass — the same geometry upstream llama-server's rerank endpoint
+    // uses. The per-pair-loop this replaces measured p50 12.5 s per 40-doc
+    // call; batching must land p50 <= 4 s (gate) while preserving score
+    // ORDER: multi-seq batching perturbs decoder-arch rerankers (Qwen3) at
+    // the sub-0.1% score level, so order survives (rho >= 0.99 gate on the
+    // probe baseline) — bit-exact logits are NOT preserved, by contract.
+    //
+    // Micro-batch bounds: at most RERANK_MICRO_BATCH sequences AND
+    // RERANK_MICRO_TOKENS total tokens per context. KV is split per
+    // sequence in this llama.cpp build (kv_unified=false, no context-params
+    // knob), so n_ctx MUST be max_len * n_seqs (each seq needs max_len
+    // cells); the compute buffer scales with the ubatch (= whole pass) and a
+    // 3751-token pass reserved 2.2 GiB — enough to fail next to the resident
+    // models on the 6 GB card, hence the 2048-token cap. n_ubatch must cover
+    // the whole pass: encoder contexts cannot split a sequence across
+    // ubatches.
+    const RERANK_MICRO_BATCH: usize = 8;
+    const RERANK_MICRO_TOKENS: usize = 2048;
+
     let mut scores = Vec::with_capacity(seqs.len());
-    for seq in &seqs {
-        let params = embed_ctx_params(Pooling::Rank, seq.len(), 1);
-        let mut ctx = model.new_context(backend, params)?;
-        let mut batch = LlamaBatch::new(seq.len().max(8), 1);
-        for (pos, tok) in seq.iter().enumerate() {
-            batch.add(*tok, pos as i32, &[0], false)?;
+    let mut batch_seqs: &[Vec<LlamaToken>] = &seqs;
+    while !batch_seqs.is_empty() {
+        // Greedy fill: take whole sequences while both caps hold (at least
+        // one sequence per context, even when it alone exceeds the budget).
+        let mut n = 0usize;
+        let mut tokens = 0usize;
+        for seq in batch_seqs {
+            let len = seq.len();
+            if n > 0 && (n >= RERANK_MICRO_BATCH || tokens + len > RERANK_MICRO_TOKENS) {
+                break;
+            }
+            n += 1;
+            tokens += len;
         }
+        let (chunk, rest) = batch_seqs.split_at(n);
+        batch_seqs = rest;
+
+        // Split-KV layout: per-seq capacity is kv_cells / n_seqs, so size
+        // kv_cells = max_len * n_seqs (256-granular per sequence, which also
+        // keeps n_ctx divisible by n_seq_max — llama.cpp silently rounds
+        // n_ctx DOWN). Compute (pp) stays at the actually-packed token
+        // total: reserving it for the KV-shaped worst case OOMs the 6 GB
+        // card (a 4608-cell shape wanted a 2.5 GiB compute buffer).
+        let total: usize = chunk.iter().map(|s| s.len()).sum();
+        let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(1);
+        let kv_cells = max_len.div_ceil(256) * 256 * chunk.len();
+        let params = embed_ctx_params(Pooling::Rank, kv_cells, total, chunk.len());
+        let t0 = std::time::Instant::now();
+        let mut ctx = model.new_context(backend, params)?;
+        let create_ms = t0.elapsed().as_millis();
+        let mut batch = LlamaBatch::new(total.max(8), chunk.len() as i32);
+        for (seq_i, seq) in chunk.iter().enumerate() {
+            for (pos, tok) in seq.iter().enumerate() {
+                batch.add(*tok, pos as i32, &[seq_i as i32], false)?;
+            }
+        }
+        let t1 = std::time::Instant::now();
         ctx.decode(&mut batch)?;
-        let emb = ctx
-            .embeddings_seq_ith(0)
-            .map_err(|e| anyhow::anyhow!("rerank scores: {e}"))?;
-        anyhow::ensure!(
-            !emb.is_empty(),
-            "model produced no rerank score (missing classifier head?)"
+        let decode_ms = t1.elapsed().as_millis();
+        tracing::debug!(
+            rerank_batch = %format!(
+                "n_seq={} tokens={total} ctx_create={create_ms}ms decode={decode_ms}ms",
+                chunk.len()
+            ),
+            "rerank micro-batch"
         );
-        scores.push(emb[0]);
+        for seq_i in 0..chunk.len() {
+            let emb = ctx
+                .embeddings_seq_ith(seq_i as i32)
+                .map_err(|e| anyhow::anyhow!("rerank scores: {e}"))?;
+            anyhow::ensure!(
+                !emb.is_empty(),
+                "model produced no rerank score (missing classifier head?)"
+            );
+            scores.push(emb[0]);
+        }
     }
     Ok(scores)
 }
@@ -919,19 +978,36 @@ pub(crate) fn logprobs_for(
 // Context params
 // ---------------------------------------------------------------------------
 
-fn embed_ctx_params(pooling: Pooling, n_tokens: usize, n_seqs: usize) -> LlamaContextParams {
-    // Size to the tokens actually in flight: KV/compute buffers scale with
-    // n_ctx, so a reranker/embedder request must not reserve the model's full
-    // training context. Positions beyond the training length are
-    // out-of-distribution — callers truncate first. Encoder contexts cannot
-    // split a sequence across ubatches (llama.cpp asserts `n_ubatch >=
-    // n_tokens`), so n_batch/n_ubatch cover the whole pass.
-    let n_ctx = (n_tokens.max(1)) as u32;
+fn embed_ctx_params(
+    pooling: Pooling,
+    kv_cells: usize,
+    pp_tokens: usize,
+    n_seqs: usize,
+) -> LlamaContextParams {
+    // `pp_tokens` sizes the prefill compute buffer (n_batch / n_ubatch must
+    // cover the whole pass — encoder contexts cannot split a sequence across
+    // ubatches, llama.cpp asserts `n_ubatch >= n_tokens`); `kv_cells` sizes
+    // the KV cache (with kv_unified=false, kv_cells/n_seq_max cells are
+    // reserved PER sequence, so multi-seq callers pass
+    // kv_cells = max_len * n_seqs). Measured on the bench GPU (2026-09-10,
+    // adoption contract §1.3): per-token decode cost is FLAT in sequence
+    // count (~0.55 ms/token for the 0.6B reranker) under either buffer
+    // layout, and SPLIT KV preserves score ordering better than unified
+    // (probe mean rho .99898 / min .9945 vs unified .9941 / .90) — so the
+    // micro-batch keeps kv_unified=false and batches to cut context churn,
+    // not for compute amortization. Reserving either buffer for a
+    // shape-skewed worst case OOMs the 6 GB card (a 4608-cell KV shape
+    // wanted a 2.5 GiB compute buffer).
+    // Positions beyond the training length are out-of-distribution —
+    // callers truncate first.
+    let n_ctx = (kv_cells.max(1)) as u32;
+    let n_pp = (pp_tokens.max(1)) as u32;
     LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_seq_max(n_seqs.max(1) as u32)
-        .with_n_batch(n_ctx)
-        .with_n_ubatch(n_ctx)
+        .with_kv_unified(false)
+        .with_n_batch(n_pp)
+        .with_n_ubatch(n_pp)
         .with_n_threads(
             std::thread::available_parallelism()
                 .map(|n| n.get() as i32)
@@ -956,5 +1032,21 @@ fn embed_ctx_params(pooling: Pooling, n_tokens: usize, n_seqs: usize) -> LlamaCo
 pub fn gguf_layer_count(path: &std::path::Path) -> Option<u32> {
     let ctx = llama_cpp_2::gguf::GgufContext::from_file(path)?;
     let idx = ctx.find_key("llama.block_count");
+    (idx >= 0).then(|| ctx.val_u32(idx))
+}
+/// Read an embedding model's embedding dimension from a GGUF file header
+/// (`{arch}.embedding_length`). Used to size a turbovec collection to the
+/// actual model — no hardcoded 768. `None` when the file is unreadable or
+/// lacks the key. The arch prefix is resolved from `general.architecture`
+/// exactly as [`vram::estimate_vram`] does.
+pub fn gguf_embedding_dim(path: &std::path::Path) -> Option<u32> {
+    let ctx = llama_cpp_2::gguf::GgufContext::from_file(path)?;
+    let arch_idx = ctx.find_key("general.architecture");
+    let arch = (arch_idx >= 0)
+        .then(|| ctx.val_str(arch_idx))
+        .flatten()
+        .unwrap_or("llama")
+        .to_owned();
+    let idx = ctx.find_key(&format!("{arch}.embedding_length"));
     (idx >= 0).then(|| ctx.val_u32(idx))
 }

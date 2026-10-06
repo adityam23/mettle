@@ -11,15 +11,16 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use mettle_core::config::{ModelEntry, ProfileConfig, ProfileSlot, RootConfig};
 use mettle_server::app::build_router;
 use mettle_server::state::AppState;
-use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn profile(name: &str, slots: &[&str]) -> ProfileConfig {
     ProfileConfig {
         name: name.to_string(),
+        default: false,
         slots: slots
             .iter()
             .map(|id| ProfileSlot {

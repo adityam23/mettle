@@ -509,7 +509,11 @@ impl ProfileManager {
 
     /// Boot-time re-activation: load `state.json`; if it names a profile
     /// that still exists, activate it (degradation applies — VRAM may have
-    /// changed across restarts). Otherwise the engine idles.
+    /// changed across restarts). Otherwise — amendment, adoption-contract
+    /// grilling Q11 (2026-09-10): activate the config's `default = true`
+    /// profile (the shipped `bench-retrieval` shape) instead of idling, so
+    /// "shipped default" means what it says. Only when NOTHING was ever
+    /// persisted (fresh install); an explicit profile switch always wins.
     pub async fn boot_activate(self: Arc<Self>) {
         match self.load_persisted_active() {
             Some(name) => {
@@ -518,9 +522,22 @@ impl ProfileManager {
                     tracing::warn!("boot activation failed: {e}");
                 }
             }
-            None => {
-                tracing::info!("no active profile persisted; engine idles until one is activated");
-            }
+            None => match self.config.profile.iter().find(|p| p.default) {
+                Some(profile) => {
+                    tracing::info!(
+                        "no active profile persisted; activating shipped default profile '{}'",
+                        profile.name
+                    );
+                    if let Err(e) = Arc::clone(&self).activate(profile.name.clone()).await {
+                        tracing::warn!("default profile activation failed: {e}");
+                    }
+                }
+                None => {
+                    tracing::info!(
+                        "no active profile persisted; engine idles until one is activated"
+                    );
+                }
+            },
         }
     }
 
@@ -1672,6 +1689,7 @@ mod tests {
                 .iter()
                 .map(|(name, slots)| ProfileConfig {
                     name: (*name).to_string(),
+                    default: false,
                     slots: slots
                         .iter()
                         .map(|id| ProfileSlot {
@@ -1787,6 +1805,63 @@ mod tests {
 
         assert_eq!(active_name(&fresh), Some("p".into()));
         assert!(fx.engine.op_log().len() > ops_before, "engine reloaded");
+    }
+
+    #[tokio::test]
+    async fn boot_activates_shipped_default_profile() {
+        // Grilling Q11 amendment (adoption contract §1.4): with NOTHING ever
+        // persisted, a `default = true` profile in the config activates on
+        // first boot instead of idling the engine.
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m1"])], 8 * GIB, |cfg| {
+            cfg.profile[0].default = true;
+        });
+
+        let fresh = Arc::new(ProfileManager::new(
+            ProfileDeps {
+                engine: Arc::new(std::sync::RwLock::new(Some(
+                    fx.engine.clone() as SharedEngine
+                ))),
+                registry: Arc::new(std::sync::RwLock::new({
+                    let mut r = ModelRegistry::new();
+                    r.apply_user_models(&fx.manager.config.model);
+                    r
+                })),
+                loaded_models: Arc::new(Mutex::new(Vec::new())),
+            },
+            fx.manager.config.clone(),
+            fx.events.clone(),
+            fx.dir.path().join("state.json"),
+        ));
+        fresh.clone().boot_activate().await;
+
+        assert_eq!(active_name(&fresh), Some("p".into()));
+    }
+
+    #[tokio::test]
+    async fn boot_without_default_marker_still_idles() {
+        // No persisted state and no default-marked profile -> the engine
+        // idles (profiles-contract behavior preserved for non-default
+        // configs).
+        let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
+        let fresh = Arc::new(ProfileManager::new(
+            ProfileDeps {
+                engine: Arc::new(std::sync::RwLock::new(Some(
+                    fx.engine.clone() as SharedEngine
+                ))),
+                registry: Arc::new(std::sync::RwLock::new({
+                    let mut r = ModelRegistry::new();
+                    r.apply_user_models(&fx.manager.config.model);
+                    r
+                })),
+                loaded_models: Arc::new(Mutex::new(Vec::new())),
+            },
+            fx.manager.config.clone(),
+            fx.events.clone(),
+            fx.dir.path().join("state.json"),
+        ));
+        fresh.clone().boot_activate().await;
+
+        assert_eq!(active_name(&fresh), None);
     }
 
     #[tokio::test]

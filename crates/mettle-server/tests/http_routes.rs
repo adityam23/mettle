@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use mettle_core::config::RootConfig;
 use mettle_server::app::build_router;
 use mettle_server::state::AppState;
-use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn test_state(data_dir: &std::path::Path) -> Arc<AppState> {
@@ -204,7 +204,7 @@ async fn collection_crud_ingest_search_delete() {
         &router,
         "POST",
         "/v1/collections",
-        Some(serde_json::json!({"name": "docs", "embedding_model": "test-embed"})),
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -214,7 +214,7 @@ async fn collection_crud_ingest_search_delete() {
         &router,
         "POST",
         "/v1/collections",
-        Some(serde_json::json!({"name": "docs", "embedding_model": "test-embed"})),
+        Some(serde_json::json!({"name": "docs", "embedding_model": "embed-gemma:latest"})),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -260,6 +260,54 @@ async fn collection_crud_ingest_search_delete() {
     let hits = body.as_array().unwrap();
     assert!(!hits.is_empty(), "keyword search should match");
     assert_eq!(hits[0]["document_id"], "doc1");
+
+    // Second doc with token-disjoint content (for OR-mode + hybrid pins).
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents",
+        Some(serde_json::json!({
+            "id": "doc2",
+            "content": "quantum computing breakthroughs accelerate everything"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // OR-mode keyword (adoption contract §1.1): one matching term per doc
+    // surfaces both. The old AND-expansion returned nothing here.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/search",
+        Some(serde_json::json!({"query": "machine quantum", "mode": "keyword", "k": 5})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = body.as_array().unwrap();
+    let hit_docs: std::collections::HashSet<&str> = hits
+        .iter()
+        .map(|h| h["document_id"].as_str().unwrap())
+        .collect();
+    assert!(hit_docs.contains("doc1"), "doc1 must match on 'machine'");
+    assert!(hit_docs.contains("doc2"), "doc2 must match on 'quantum'");
+
+    // Hybrid mode (adoption contract §1.2): keyword-matching doc still
+    // surfaces through the fused pool (no engine here — dense leg scores are
+    // the documented zero-vector degradation).
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/search",
+        Some(serde_json::json!({"query": "machine", "mode": "hybrid", "k": 5})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = body.as_array().unwrap();
+    assert!(
+        hits.iter().any(|h| h["document_id"] == "doc1"),
+        "hybrid must surface the keyword match"
+    );
 
     // Allowlist excluding the document filters it out.
     let (status, body) = send(
@@ -326,7 +374,7 @@ async fn collections_persist_across_restart() {
             &router,
             "POST",
             "/v1/collections",
-            Some(serde_json::json!({"name": "persist", "embedding_model": "test-embed"})),
+            Some(serde_json::json!({"name": "persist", "embedding_model": "embed-gemma:latest"})),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -369,7 +417,7 @@ async fn rag_chat_without_model_returns_503() {
         &router,
         "POST",
         "/v1/collections",
-        Some(serde_json::json!({"name": "kb", "embedding_model": "test-embed"})),
+        Some(serde_json::json!({"name": "kb", "embedding_model": "embed-gemma:latest"})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);

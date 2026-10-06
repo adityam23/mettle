@@ -466,7 +466,20 @@ pub async fn rerank_handler(
     // Resolve + kind gate BEFORE the availability checks: a model that
     // cannot serve this endpoint is a resolution error (404) even when no
     // engine is loaded.
-    let model_id = state.profiles.resolve_alias(&req.model);
+    // Adoption contract §1.4: empty or "default" model resolves to the
+    // registry's default rerank alias (qwen3-reranker-0.6b:latest); explicit
+    // ids and "role:rerank" keep their existing paths.
+    let model_id = if req.model.is_empty() || req.model == "default" {
+        match state.registry.read() {
+            Ok(r) => r.default_rerank().alias.clone(),
+            Err(_) => {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
+                    .into_response()
+            }
+        }
+    } else {
+        state.profiles.resolve_alias(&req.model)
+    };
     let entry = match state.resolve_model(&model_id) {
         Ok(v) => v,
         Err(e) => {

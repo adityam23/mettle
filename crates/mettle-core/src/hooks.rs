@@ -173,14 +173,12 @@ mod tests {
     struct LoggingHook;
     impl EngineHook for LoggingHook {
         fn on_request(&self, ctx: &mut RequestCtx) -> HookOutcome {
-            ctx.metadata
-                .insert("seen_by_hook".into(), "true".into());
+            ctx.metadata.insert("seen_by_hook".into(), "true".into());
             HookOutcome::Continue
         }
 
         fn on_response(&self, _ctx: &RequestCtx, resp: &mut ResponseCtx) -> HookOutcome {
-            resp.metadata
-                .insert("annotated".into(), "1".into());
+            resp.metadata.insert("annotated".into(), "1".into());
             HookOutcome::Continue
         }
     }

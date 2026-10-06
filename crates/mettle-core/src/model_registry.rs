@@ -74,6 +74,13 @@ pub struct RegistryEntry {
     /// Local mmproj path from `[[model]] mmproj_path`; takes precedence
     /// over the HF-cache resolution for vision models.
     pub mmproj_path: Option<std::path::PathBuf>,
+    /// Embedding dimension for `Embedding`-kinds — the real vector length
+    /// this model produces. `None` for non-embedding models or unknown
+    /// (read the GGUF header's `{arch}.embedding_length` at collection
+    /// creation instead). Kept per-model so a collection can be sized to
+    /// its embedder (bge-m3=1024, qwen3-embedding=1024, embed-gemma=768),
+    /// not a hardcoded global.
+    pub embedding_dim: Option<usize>,
 }
 
 /// The model registry holds built-in aliases (Gemma 4 family) and
@@ -84,6 +91,7 @@ pub struct ModelRegistry {
     entries: HashMap<String, RegistryEntry>,
     default_id: String,
     default_embedding_id: String,
+    default_rerank_id: String,
 }
 
 impl Default for ModelRegistry {
@@ -128,6 +136,7 @@ fn builtin(
         local_path: None,
         n_gpu_layers: None,
         mmproj_path: None,
+        embedding_dim: None,
     }
 }
 
@@ -299,12 +308,36 @@ impl ModelRegistry {
             ),
         ];
 
+        let mut entries: HashMap<String, RegistryEntry> = builtins.into_iter().collect();
+        // Stamp the embedding dims so a resolved entry carries its vector
+        // length (collection sizing falls back to this when the GGUF is not
+        // yet cached). Only Embedding-kind entries are touched.
+        for (alias, dim) in Self::EMBED_DIMS {
+            if let Some(e) = entries.get_mut(*alias) {
+                e.embedding_dim = Some(*dim);
+            }
+        }
+
         Self {
             default_id: "gemma4:e2b".into(),
-            default_embedding_id: "embed-gemma:latest".into(),
-            entries: builtins.into_iter().collect(),
+            // Adoption contract §1.4 (2026-09-10): the bench-winning qwen3
+            // config becomes the shipped default. embed-gemma and bge-m3
+            // stay registered as comparison/secondary models.
+            default_embedding_id: "qwen3-embedding-0.6b:latest".into(),
+            default_rerank_id: "qwen3-reranker-0.6b:latest".into(),
+            entries,
         }
     }
+
+    /// The built-in embedding models' vector lengths. `None` when the
+    /// GGUF is the authoritative source (read `{arch}.embedding_length`
+    /// at collection creation), these are the deterministic fallback so a
+    /// collection can be sized before the model is pulled/cached.
+    const EMBED_DIMS: &'static [(&'static str, usize)] = &[
+        ("embed-gemma:latest", 768),
+        ("bge-m3:latest", 1024),
+        ("qwen3-embedding-0.6b:latest", 1024),
+    ];
 
     /// Resolve an Ollama-style name to a registry entry.
     ///
@@ -349,6 +382,13 @@ impl ModelRegistry {
             .expect("default model must be in registry")
     }
 
+    /// Return the default rerank model entry (adoption contract §1.4:
+    /// qwen3-reranker-0.6b is the shipped default rerank alias).
+    pub fn default_rerank(&self) -> &RegistryEntry {
+        self.entries
+            .get(&self.default_rerank_id)
+            .expect("default rerank model must be in registry")
+    }
     /// Return the default embedding model entry (spec resolved decision #3).
     pub fn default_embedding(&self) -> &RegistryEntry {
         self.entries
@@ -415,6 +455,7 @@ impl ModelRegistry {
                     local_path: None,
                     n_gpu_layers: None,
                     mmproj_path: None,
+                    embedding_dim: None,
                 });
 
             entry.user_defined = true;
@@ -457,6 +498,17 @@ impl ModelRegistry {
             .values()
             .find(|e| matches!(e.loader_kind, LoaderKind::GgufVision { .. }))
             .map(|e| e.alias.clone())
+    }
+    /// The embedding dimension for an embedding-model alias, used to size a
+    /// collection's turbovec index to the real model. Falls back to the
+    /// declared dim (built-in embedders) when the entry is `Embedding`-kind
+    /// but has no declared dim. `None` for unknown aliases / non-embeddings.
+    pub fn embedding_dim_for(&self, alias: &str) -> Option<usize> {
+        let entry = self.entries.get(alias)?;
+        match entry.loader_kind {
+            LoaderKind::Embedding { .. } => entry.embedding_dim,
+            _ => None,
+        }
     }
 }
 
@@ -505,19 +557,23 @@ mod tests {
     }
 
     #[test]
-    fn default_embedding_is_gemma() {
+    fn default_embedding_is_qwen3() {
         let reg = ModelRegistry::new();
         let e = reg.default_embedding();
-        assert_eq!(e.hf_repo_id, "ggml-org/embeddinggemma-300M-GGUF");
+        assert_eq!(e.hf_repo_id, "Qwen/Qwen3-Embedding-0.6B-GGUF");
         assert!(matches!(
             e.loader_kind,
             LoaderKind::Embedding {
-                pooling: Pooling::Mean,
+                pooling: Pooling::Last,
                 ..
             }
         ));
         // Resolvable by bare name via :latest fallback.
+        assert!(reg.resolve("qwen3-embedding-0.6b").is_ok());
+        // embed-gemma stays registered as the comparison/secondary embedder.
         assert!(reg.resolve("embed-gemma").is_ok());
+        // qwen3-reranker-0.6b is the default rerank alias (§1.4).
+        assert_eq!(reg.default_rerank().alias, "qwen3-reranker-0.6b:latest");
     }
 
     #[test]

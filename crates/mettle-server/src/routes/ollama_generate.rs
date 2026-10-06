@@ -1,17 +1,9 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-    Extension,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use mettle_core::engine::{EngineRequest, EngineResponse, RequestKind};
 use mettle_core::hooks::RequestCtx;
-use mettle_core::ollama_types::{
-    GenerateRequest, GenerateResponse, GenerateStreamChunk,
-};
+use mettle_core::ollama_types::{GenerateRequest, GenerateResponse, GenerateStreamChunk};
 use mettle_core::stream::{engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt};
 use mettle_core::timing::timestamp_iso8601;
 use tokio::sync::mpsc;

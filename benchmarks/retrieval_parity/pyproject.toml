@@ -1,0 +1,6 @@
+[project]
+name = "retrieval-parity"
+version = "0.1.0"
+description = "Mettle-vs-docket retrieval parity benchmark (mettle side). Real FinanceBench data, shared metric with docket/benchmarks/financebench/sweep_recall.py."
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27"]

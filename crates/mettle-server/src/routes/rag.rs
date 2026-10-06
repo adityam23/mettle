@@ -4,17 +4,15 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json, Extension,
+    Extension, Json,
 };
+use mettle_core::engine::{EngineRequest, EngineResponse, GenConstraint, RequestKind};
 use mettle_core::hooks::{Hit, RequestCtx};
 use mettle_core::retrieval::{
     chunk_document, Citation, Document, RagChatRequest, RagChatResponse, RagChatStreamChunk,
-    SearchRequest,
+    SearchMode, SearchRequest,
 };
-use mettle_core::engine::{EngineRequest, EngineResponse, GenConstraint, RequestKind};
-use mettle_core::stream::{
-    engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt,
-};
+use mettle_core::stream::{engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt};
 use mettle_core::timing::timestamp_iso8601;
 
 use super::error::{api_error, api_error_code};
@@ -35,14 +33,25 @@ fn core_error_status(e: &mettle_core::error::CoreError) -> StatusCode {
     }
 }
 
-/// Embed `texts` with the collection's embedding model, falling back to
-/// zero vectors when no engine (or no embedding model) is loaded so that
-/// keyword search and ingest keep working on a fresh install.
+/// Embed `texts` with the collection's embedding model.
+///
+/// Failure semantics (adoption-contract grilling Q13a, 2026-09-10):
+/// - Zero-vector fallback ONLY when no engine is loaded at all — the
+///   documented fresh-install degradation (keyword/ingest keep working).
+/// - Engine present but embedding via the collection's embedder failed
+///   (not resident, JIT refused, load error): hard 503 naming the alias and
+///   reason — `degrade_on_engine_error` keeps the zero fallback for INGEST
+///   only, so a fresh install can still ingest while keyword search works.
+/// - Dim mismatch between the model and the collection: always a hard 409
+///   (the collection needs re-ingest under its own embedder; serving zeros
+///   would return garbage with 200).
 async fn embed_or_fallback(
     state: &AppState,
     embedding_model: &str,
+    collection: &str,
     dim: usize,
     texts: &[String],
+    degrade_on_engine_error: bool,
 ) -> Result<Vec<f32>, (StatusCode, String)> {
     let alias = if embedding_model.is_empty() || embedding_model == "default" {
         state
@@ -69,11 +78,14 @@ async fn embed_or_fallback(
             for v in vectors {
                 if v.len() != dim {
                     return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        StatusCode::CONFLICT,
                         format!(
-                            "embedding model '{}' returned dim {}, collection expects {}",
+                            "embedding model '{}' produces {}-d vectors but collection \
+                             '{}' expects {}; re-ingest the collection under its own \
+                             embedding model",
                             alias,
                             v.len(),
+                            collection,
                             dim
                         ),
                     ));
@@ -82,9 +94,9 @@ async fn embed_or_fallback(
             }
             Ok(flat)
         }
-        Err(e) => {
-            // The embedding model may simply not be resident; degrade rather
-            // than fail ingest/search outright.
+        Err(e) if degrade_on_engine_error => {
+            // Ingest degradation: keep accepting documents on a fresh
+            // install where the embedder is not resident yet.
             tracing::warn!(
                 "embedding via '{}' failed ({}); using zero-vector fallback",
                 alias,
@@ -92,6 +104,14 @@ async fn embed_or_fallback(
             );
             Ok(vec![0.0f32; texts.len() * dim])
         }
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "embedding via collection embedder '{}' failed: {e} (it may not be \
+                 resident; activate a profile or load the model)",
+                alias
+            ),
+        )),
     }
 }
 
@@ -125,8 +145,17 @@ pub async fn create_collection(
         req.embedding_model.clone()
     };
 
+    // The collection's turbovec index is built at the embedding model's real
+    // dimension. Resolve it from the GGUF header when the model is on disk,
+    // else fall back to the registry's declared dim. Never hardcode 768 —
+    // bge-m3/qwen3-embedding are 1024.
+    let dim = match resolve_embedding_dim(&state, &embedding_model) {
+        Ok(d) => d,
+        Err((status, msg)) => return api_error(status, &msg).into_response(),
+    };
+
     match state.collections.lock() {
-        Ok(mut store) => match store.create(&req.name, &embedding_model) {
+        Ok(mut store) => match store.create(&req.name, &embedding_model, dim) {
             Ok(_) => StatusCode::CREATED.into_response(),
             Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
         },
@@ -134,10 +163,52 @@ pub async fn create_collection(
     }
 }
 
+/// Resolve an embedding model's vector dimension for collection sizing.
+/// Prefers the GGUF header's `{arch}.embedding_length` (authoritative, works
+/// for any model), then falls back to the registry's declared dim for the
+/// built-in embedders. Errors when the model is unknown / not an embedder.
+fn resolve_embedding_dim(
+    state: &AppState,
+    embedding_model: &str,
+) -> Result<usize, (StatusCode, String)> {
+    let entry = state
+        .resolve_model(embedding_model)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    // Is it an embedding model at all?
+    if !matches!(
+        entry.loader_kind,
+        mettle_core::model_registry::LoaderKind::Embedding { .. }
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("model '{}' is not an embedding model", embedding_model),
+        ));
+    }
+
+    // GGUF header first (the model's real dim), if the file is resolvable.
+    if let Ok(path) = crate::llama_bridge::resolve_gguf_path(&entry) {
+        if let Some(d) = mettle_llama::gguf_embedding_dim(&path) {
+            return Ok(d as usize);
+        }
+    }
+
+    // Registry-declared fallback (built-in embedders: 768 / 1024 / 1024).
+    if let Some(d) = entry.embedding_dim {
+        return Ok(d);
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "cannot determine embedding dimension for '{}' (GGUF not cached and no declared dim)",
+            embedding_model
+        ),
+    ))
+}
+
 /// GET /v1/collections — list all collections.
-pub async fn list_collections(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::Response {
+pub async fn list_collections(State(state): State<Arc<AppState>>) -> axum::response::Response {
     match state.collections.lock() {
         Ok(store) => Json(store.list()).into_response(),
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
@@ -169,24 +240,25 @@ fn collection_handle(
     state: &AppState,
     name: &str,
 ) -> Result<CollectionHandle, (StatusCode, String)> {
-    let store = state
-        .collections
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".to_string()))?;
-    store
-        .get(name)
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("collection '{}' not found", name),
-            )
-        })
+    let store = state.collections.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "lock poisoned".to_string(),
+        )
+    })?;
+    store.get(name).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("collection '{}' not found", name),
+        )
+    })
 }
 
 /// Parse the ingest request body: JSON `Document`, or multipart with a file
 /// field (text/Markdown) and optional `id` field (spec §6).
-async fn parse_ingest_request(req: axum::extract::Request) -> Result<Document, (StatusCode, String)> {
+async fn parse_ingest_request(
+    req: axum::extract::Request,
+) -> Result<Document, (StatusCode, String)> {
     let content_type = req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -308,7 +380,16 @@ pub async fn ingest_document(
     );
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
 
-    let embeddings = match embed_or_fallback(&state, &embedding_model, dim, &chunk_texts).await {
+    let embeddings = match embed_or_fallback(
+        &state,
+        &embedding_model,
+        &collection_name,
+        dim,
+        &chunk_texts,
+        true,
+    )
+    .await
+    {
         Ok(e) => e,
         Err((status, msg)) => return api_error(status, msg).into_response(),
     };
@@ -391,16 +472,24 @@ pub async fn search_collection(
         }
     };
 
-    let query_embedding = match embed_or_fallback(
-        &state,
-        &embedding_model,
-        dim,
-        std::slice::from_ref(&req.query),
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
+    // Keyword mode never uses the query embedding (pure FTS5/bm25) — skip
+    // the forward pass and any embedder failure entirely (Q13a).
+    let query_embedding = if req.mode == SearchMode::Keyword {
+        Vec::new()
+    } else {
+        match embed_or_fallback(
+            &state,
+            &embedding_model,
+            &collection_name,
+            dim,
+            std::slice::from_ref(&req.query),
+            false,
+        )
+        .await
+        {
+            Ok(e) => e,
+            Err((status, msg)) => return api_error(status, msg).into_response(),
+        }
     };
 
     let coll = match coll_handle.lock() {
@@ -580,18 +669,33 @@ async fn search_collections(
         let handle = collection_handle(state, name)?;
 
         let (dim, embedding_model) = {
-            let coll = handle
-                .lock()
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".to_string()))?;
+            let coll = handle.lock().map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "lock poisoned".to_string(),
+                )
+            })?;
             (coll.dim, coll.embedding_model.clone())
         };
 
-        let query_embedding =
-            embed_or_fallback(state, &embedding_model, dim, std::slice::from_ref(&query)).await?;
+        // RAG chat always searches dense/hybrid (server-side default mode),
+        // so the query embedding is required and embedder failures are hard.
+        let query_embedding = embed_or_fallback(
+            state,
+            &embedding_model,
+            name,
+            dim,
+            std::slice::from_ref(&query),
+            false,
+        )
+        .await?;
 
-        let coll = handle
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".to_string()))?;
+        let coll = handle.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lock poisoned".to_string(),
+            )
+        })?;
 
         let started = std::time::Instant::now();
         let results = coll

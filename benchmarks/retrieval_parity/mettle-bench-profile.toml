@@ -1,0 +1,97 @@
+# Benchmark profile: retrieval parity run (mettle side), RTX 3060 Laptop 6 GB.
+#
+# Serves ALL retrieval models GPU-resident at once (chat/OCR/generator models
+# deliberately absent — their KV reserve is what pushes this card over). This
+# mirrors the profile docket's Phase-A recall sweep used (see docket
+# benchmarks/financebench/README.md "6 GB VRAM note": all embedders + rerankers
+# are sub-1.2 GB and coexist once the chat model is out).
+#
+# Models live in THIS repo's models/ dir (the old /personal-projects/infengine
+# paths in ~/.engine/config.toml.benchmark-profile.bak are stale — repo renamed).
+#
+# Launch:  METTLE_CONFIG=$(pwd)/benchmarks/retrieval_parity/mettle-bench-profile.toml \
+#            target/release/mettled
+# State (collections) is kept under benchmarks/retrieval_parity/.state so the
+# run is self-contained and index bytes are measurable.
+
+[server]
+host = "127.0.0.1"
+port = 11434
+
+[engine]
+max_concurrent_seqs = 4
+kv_cache = "fp8"
+prefix_cache = true
+speculative = "off"
+# Retrieval-only benchmark: chunks cap at 2000 chars (~600 tokens), queries are
+# short. 8192 ctx keeps the per-slot VRAM estimate honest so all five models
+# coexist; 131072 inflated estimates to 6.8-9.3 GB/slot and the profile manager
+# dropped 4 of 5. Models load JIT on first request (the pattern docket's Phase-A
+# sweep used with this exact model set).
+n_ctx = 8192
+n_batch = 512
+n_gpu_layers = 999
+vram_margin_bytes = 536870912
+
+[retrieval]
+data_dir = "/personal-projects/mettle/benchmarks/retrieval_parity/.state"
+default_bit_width = 4
+chunk_tokens = 512
+chunk_overlap = 64
+
+# --- Embedders ---------------------------------------------------------------
+[[model]]
+id = "embed-gemma:latest"
+default = true
+path = "/personal-projects/mettle/models/embeddinggemma-300m/embeddinggemma-300M-Q8_0.gguf"
+role = "embed"
+n_gpu_layers = 999
+
+[[model]]
+id = "bge-m3:latest"
+path = "/personal-projects/mettle/models/bge-m3/bge-m3-Q8_0.gguf"
+role = "embed"
+n_gpu_layers = 999
+
+[[model]]
+id = "qwen3-embedding-0.6b:latest"
+path = "/personal-projects/mettle/models/qwen3-embedding-0.6b/Qwen3-Embedding-0.6B-Q8_0.gguf"
+role = "embed"
+n_gpu_layers = 999
+
+# --- Rerankers ---------------------------------------------------------------
+[[model]]
+id = "bge-reranker-v2-m3:latest"
+path = "/personal-projects/mettle/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf"
+role = "rerank"
+n_gpu_layers = 999
+
+[[model]]
+id = "qwen3-reranker-0.6b:latest"
+path = "/personal-projects/mettle/models/qwen3-reranker-0.6b/Qwen3-Reranker-0.6B-F16.gguf"
+role = "rerank"
+n_gpu_layers = 999
+
+
+[[profile]]
+name = "bench-retrieval"
+
+[[profile.slots]]
+id = "embed-gemma:latest"
+priority = 10
+
+[[profile.slots]]
+id = "bge-m3:latest"
+priority = 20
+
+[[profile.slots]]
+id = "qwen3-embedding-0.6b:latest"
+priority = 30
+
+[[profile.slots]]
+id = "bge-reranker-v2-m3:latest"
+priority = 40
+
+[[profile.slots]]
+id = "qwen3-reranker-0.6b:latest"
+priority = 50

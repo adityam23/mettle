@@ -5,16 +5,18 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{State, Extension},
+    extract::{Extension, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use mettle_core::anthropic_types::{
     AnthropicMessage, AnthropicUsage, ContentBlock, MessageDeltaBlock, MessageStartBlock,
-    MessagesRequest, MessagesResponse, MessageStreamEvent, TextDelta,
+    MessageStreamEvent, MessagesRequest, MessagesResponse, TextDelta,
 };
-use mettle_core::engine::{EngineRequest, EngineResponse, GenConstraint, RequestKind, SamplingParams};
+use mettle_core::engine::{
+    EngineRequest, EngineResponse, GenConstraint, RequestKind, SamplingParams,
+};
 use mettle_core::hooks::RequestCtx;
 use mettle_core::ollama_types::ChatMessage;
 use mettle_core::stream::{engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt};
@@ -47,12 +49,16 @@ pub async fn messages_handler(
             });
         }
     }
-    messages.extend(req.messages.into_iter().map(|m: AnthropicMessage| ChatMessage {
-        role: m.role,
-        content: m.content,
-        images: None,
-        tool_calls: None,
-    }));
+    messages.extend(
+        req.messages
+            .into_iter()
+            .map(|m: AnthropicMessage| ChatMessage {
+                role: m.role,
+                content: m.content,
+                images: None,
+                tool_calls: None,
+            }),
+    );
     let params = SamplingParams {
         temperature: req.temperature,
         top_p: req.top_p,
@@ -143,23 +149,29 @@ pub async fn messages_handler(
         );
         SseStream::new(stream, true).into_response()
     } else {
-        match engine_accumulate(rx, hooks, ctx, model_name.clone(), move |acc: Accumulated| {
-            Ok(MessagesResponse {
-                id: id.clone(),
-                type_: "message",
-                role: "assistant",
-                content: vec![ContentBlock {
-                    type_: "text",
-                    text: acc.content,
-                }],
-                model: model_name.clone(),
-                stop_reason: acc.finish_reason,
-                usage: AnthropicUsage {
-                    input_tokens: acc.usage.prompt_tokens,
-                    output_tokens: acc.usage.completion_tokens,
-                },
-            })
-        })
+        match engine_accumulate(
+            rx,
+            hooks,
+            ctx,
+            model_name.clone(),
+            move |acc: Accumulated| {
+                Ok(MessagesResponse {
+                    id: id.clone(),
+                    type_: "message",
+                    role: "assistant",
+                    content: vec![ContentBlock {
+                        type_: "text",
+                        text: acc.content,
+                    }],
+                    model: model_name.clone(),
+                    stop_reason: acc.finish_reason,
+                    usage: AnthropicUsage {
+                        input_tokens: acc.usage.prompt_tokens,
+                        output_tokens: acc.usage.completion_tokens,
+                    },
+                })
+            },
+        )
         .await
         {
             Ok(resp) => Json(resp).into_response(),

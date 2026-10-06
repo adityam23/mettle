@@ -8,12 +8,7 @@ pub struct ApiError {
 
 /// Build an `(StatusCode, Json<ApiError>)` tuple that implements `IntoResponse`.
 pub fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiError>) {
-    (
-        status,
-        Json(ApiError {
-            error: msg.into(),
-        }),
-    )
+    (status, Json(ApiError { error: msg.into() }))
 }
 
 /// Convert a raw status code (from `mettle_core::stream`'s `(u16, String)`

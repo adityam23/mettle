@@ -1,0 +1,592 @@
+{
+ "generated": "2026-09-10T14:31:52+02:00",
+ "n_questions": 150,
+ "n_filings": 84,
+ "embedder": "qwen3-embedding-0.6b:latest",
+ "arms": {
+  "exact": {
+   "@3_t0.5": 0.6267,
+   "@3_t0.8": 0.4467,
+   "@5_t0.5": 0.7,
+   "@5_t0.8": 0.5,
+   "@6_t0.5": 0.7267,
+   "@6_t0.8": 0.5267,
+   "@10_t0.5": 0.7933,
+   "@10_t0.8": 0.6267,
+   "@20_t0.5": 0.9067,
+   "@20_t0.8": 0.76,
+   "mean_best_overlap": 0.9106,
+   "n": 150
+  },
+  "dense": {
+   "@3_t0.5": 0.62,
+   "@3_t0.8": 0.4533,
+   "@5_t0.5": 0.7,
+   "@5_t0.8": 0.5,
+   "@6_t0.5": 0.7467,
+   "@6_t0.8": 0.5467,
+   "@10_t0.5": 0.7867,
+   "@10_t0.8": 0.62,
+   "@20_t0.5": 0.9133,
+   "@20_t0.8": 0.7733,
+   "mean_best_overlap": 0.9109,
+   "n": 150
+  },
+  "hybrid": {
+   "@3_t0.5": 0.62,
+   "@3_t0.8": 0.4533,
+   "@5_t0.5": 0.7,
+   "@5_t0.8": 0.5,
+   "@6_t0.5": 0.7467,
+   "@6_t0.8": 0.5467,
+   "@10_t0.5": 0.7867,
+   "@10_t0.8": 0.62,
+   "@20_t0.5": 0.9133,
+   "@20_t0.8": 0.7733,
+   "mean_best_overlap": 0.9109,
+   "n": 150
+  },
+  "keyword_or": {
+   "@3_t0.5": 0.32,
+   "@3_t0.8": 0.22,
+   "@5_t0.5": 0.4067,
+   "@5_t0.8": 0.28,
+   "@6_t0.5": 0.4333,
+   "@6_t0.8": 0.3067,
+   "@10_t0.5": 0.4867,
+   "@10_t0.8": 0.3467,
+   "@20_t0.5": 0.6267,
+   "@20_t0.8": 0.5,
+   "mean_best_overlap": 0.7523,
+   "n": 150
+  },
+  "rerank_exact(qwen3-reranker-0.6b:latest)": {
+   "@3_t0.5": 0.76,
+   "@3_t0.8": 0.5867,
+   "@5_t0.5": 0.8333,
+   "@5_t0.8": 0.66,
+   "@6_t0.5": 0.84,
+   "@6_t0.8": 0.6667,
+   "@10_t0.5": 0.88,
+   "@10_t0.8": 0.7467,
+   "@20_t0.5": 0.94,
+   "@20_t0.8": 0.8133,
+   "mean_best_overlap": 0.9106,
+   "n": 150
+  },
+  "rerank_hybrid(qwen3-reranker-0.6b:latest)": {
+   "@3_t0.5": 0.7467,
+   "@3_t0.8": 0.5867,
+   "@5_t0.5": 0.82,
+   "@5_t0.8": 0.66,
+   "@6_t0.5": 0.8267,
+   "@6_t0.8": 0.6667,
+   "@10_t0.5": 0.8667,
+   "@10_t0.8": 0.7467,
+   "@20_t0.5": 0.9333,
+   "@20_t0.8": 0.8133,
+   "mean_best_overlap": 0.9109,
+   "n": 150
+  }
+ },
+ "latency": {
+  "exact": {
+   "n": 150,
+   "mean_ms": 38.28,
+   "p50_ms": 36.34,
+   "p95_ms": 96.67
+  },
+  "dense": {
+   "n": 150,
+   "mean_ms": 47.78,
+   "p50_ms": 43.8,
+   "p95_ms": 80.8
+  },
+  "hybrid": {
+   "n": 150,
+   "mean_ms": 47.49,
+   "p50_ms": 44.5,
+   "p95_ms": 74.3
+  },
+  "keyword_or": {
+   "n": 150,
+   "mean_ms": 4.21,
+   "p50_ms": 3.23,
+   "p95_ms": 11.93
+  },
+  "embed_query": {
+   "n": 150,
+   "mean_ms": 44.2,
+   "p50_ms": 40.6,
+   "p95_ms": 72.3
+  },
+  "rerank_call(qwen3-reranker-0.6b:latest)": {
+   "n": 150,
+   "mean_ms": 12452.47,
+   "p50_ms": 12500.0,
+   "p95_ms": 15560.0
+  }
+ },
+ "keyword_verdict": {
+  "docket_bm25@10": 0.38,
+  "mettle_fts5_or@10": 0.4867,
+  "delta": -0.1067,
+  "salvageable": true,
+  "rule": "recall@10 within 0.02 of docket bm25 (0.380) => salvageable"
+ },
+ "sanity": {
+  "3M_2018_10K": true,
+  "3M_2022_10K": true,
+  "3M_2023Q2_10Q": true,
+  "ACTIVISIONBLIZZARD_2019_10K": true,
+  "ADOBE_2015_10K": true,
+  "ADOBE_2016_10K": true,
+  "ADOBE_2017_10K": true,
+  "ADOBE_2022_10K": true,
+  "AES_2022_10K": true,
+  "AMAZON_2017_10K": true,
+  "AMAZON_2019_10K": true,
+  "AMCOR_2020_10K": true,
+  "AMCOR_2022_8K_dated-2022-07-01": true,
+  "AMCOR_2023Q2_10Q": true,
+  "AMCOR_2023Q4_EARNINGS": true,
+  "AMCOR_2023_10K": true,
+  "AMD_2015_10K": true,
+  "AMD_2022_10K": true,
+  "AMERICANEXPRESS_2022_10K": true,
+  "AMERICANWATERWORKS_2020_10K": true,
+  "AMERICANWATERWORKS_2021_10K": true,
+  "AMERICANWATERWORKS_2022_10K": true,
+  "BESTBUY_2017_10K": true,
+  "BESTBUY_2019_10K": true,
+  "BESTBUY_2023_10K": true,
+  "BESTBUY_2024Q2_10Q": true,
+  "BLOCK_2016_10K": true,
+  "BLOCK_2020_10K": true,
+  "BOEING_2018_10K": true,
+  "BOEING_2022_10K": true,
+  "COCACOLA_2017_10K": true,
+  "COCACOLA_2021_10K": true,
+  "COCACOLA_2022_10K": true,
+  "CORNING_2020_10K": true,
+  "CORNING_2021_10K": true,
+  "CORNING_2022_10K": true,
+  "COSTCO_2021_10K": true,
+  "CVSHEALTH_2018_10K": true,
+  "CVSHEALTH_2022_10K": true,
+  "FOOTLOCKER_2022_8K_dated-2022-05-20": true,
+  "FOOTLOCKER_2022_8K_dated_2022-08-19": true,
+  "GENERALMILLS_2019_10K": true,
+  "GENERALMILLS_2020_10K": true,
+  "GENERALMILLS_2022_10K": true,
+  "JOHNSON_JOHNSON_2022Q4_EARNINGS": true,
+  "JOHNSON_JOHNSON_2022_10K": true,
+  "JOHNSON_JOHNSON_2023Q2_EARNINGS": true,
+  "JOHNSON_JOHNSON_2023_8K_dated-2023-08-30": true,
+  "JPMORGAN_2021Q1_10Q": true,
+  "JPMORGAN_2022Q2_10Q": true,
+  "JPMORGAN_2022_10K": true,
+  "JPMORGAN_2023Q2_10Q": true,
+  "KRAFTHEINZ_2019_10K": true,
+  "LOCKHEEDMARTIN_2020_10K": true,
+  "LOCKHEEDMARTIN_2021_10K": true,
+  "LOCKHEEDMARTIN_2022_10K": true,
+  "MGMRESORTS_2018_10K": true,
+  "MGMRESORTS_2020_10K": true,
+  "MGMRESORTS_2022Q4_EARNINGS": true,
+  "MGMRESORTS_2022_10K": true,
+  "MGMRESORTS_2023Q2_10Q": true,
+  "MICROSOFT_2016_10K": true,
+  "MICROSOFT_2023_10K": true,
+  "NETFLIX_2015_10K": true,
+  "NETFLIX_2017_10K": true,
+  "NIKE_2018_10K": true,
+  "NIKE_2019_10K": true,
+  "NIKE_2021_10K": true,
+  "NIKE_2023_10K": true,
+  "PAYPAL_2022_10K": true,
+  "PEPSICO_2021_10K": true,
+  "PEPSICO_2022_10K": true,
+  "PEPSICO_2023Q1_EARNINGS": true,
+  "PEPSICO_2023_8K_dated-2023-05-05": true,
+  "PEPSICO_2023_8K_dated-2023-05-30": true,
+  "PFIZER_2021_10K": true,
+  "Pfizer_2023Q2_10Q": true,
+  "ULTABEAUTY_2023Q4_EARNINGS": true,
+  "ULTABEAUTY_2023_10K": true,
+  "VERIZON_2021_10K": true,
+  "VERIZON_2022_10K": true,
+  "WALMART_2018_10K": true,
+  "WALMART_2019_10K": true,
+  "WALMART_2020_10K": true,
+  "passed": true,
+  "note": "dense = strict top-1; hybrid/keyword_or = chunk-0 present in top-10 (top-1 not guaranteed for rerank/OR paths)"
+ },
+ "collections": {
+  "fbpar-qwen3-embedding-0-6b-latest-3m-2018-10k": {
+   "status": "verified",
+   "chunks": 541
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-3m-2022-10k": {
+   "status": "verified",
+   "chunks": 873
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-3m-2023q2-10q": {
+   "status": "verified",
+   "chunks": 315
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-activisionblizzard-2019-10k": {
+   "status": "verified",
+   "chunks": 575
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-adobe-2015-10k": {
+   "status": "verified",
+   "chunks": 386
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-adobe-2016-10k": {
+   "status": "verified",
+   "chunks": 375
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-adobe-2017-10k": {
+   "status": "verified",
+   "chunks": 360
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-adobe-2022-10k": {
+   "status": "verified",
+   "chunks": 332
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-aes-2022-10k": {
+   "status": "verified",
+   "chunks": 857
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amazon-2017-10k": {
+   "status": "verified",
+   "chunks": 256
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amazon-2019-10k": {
+   "status": "verified",
+   "chunks": 237
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amcor-2020-10k": {
+   "status": "verified",
+   "chunks": 530
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amcor-2022-8k-dated-2022-07-01": {
+   "status": "verified",
+   "chunks": 24
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amcor-2023q2-10q": {
+   "status": "verified",
+   "chunks": 121
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amcor-2023q4-earnings": {
+   "status": "verified",
+   "chunks": 40
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amcor-2023-10k": {
+   "status": "verified",
+   "chunks": 464
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amd-2015-10k": {
+   "status": "verified",
+   "chunks": 705
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-amd-2022-10k": {
+   "status": "verified",
+   "chunks": 379
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-americanexpress-2022-10k": {
+   "status": "verified",
+   "chunks": 780
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-americanwaterworks-2020-10k": {
+   "status": "verified",
+   "chunks": 521
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-americanwaterworks-2021-10k": {
+   "status": "verified",
+   "chunks": 590
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-americanwaterworks-2022-10k": {
+   "status": "verified",
+   "chunks": 950
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-bestbuy-2017-10k": {
+   "status": "verified",
+   "chunks": 308
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-bestbuy-2019-10k": {
+   "status": "verified",
+   "chunks": 319
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-bestbuy-2023-10k": {
+   "status": "verified",
+   "chunks": 269
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-bestbuy-2024q2-10q": {
+   "status": "verified",
+   "chunks": 91
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-block-2016-10k": {
+   "status": "verified",
+   "chunks": 337
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-block-2020-10k": {
+   "status": "verified",
+   "chunks": 476
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-boeing-2018-10k": {
+   "status": "verified",
+   "chunks": 336
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-boeing-2022-10k": {
+   "status": "verified",
+   "chunks": 483
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-cocacola-2017-10k": {
+   "status": "verified",
+   "chunks": 690
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-cocacola-2021-10k": {
+   "status": "verified",
+   "chunks": 624
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-cocacola-2022-10k": {
+   "status": "verified",
+   "chunks": 603
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-corning-2020-10k": {
+   "status": "verified",
+   "chunks": 384
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-corning-2021-10k": {
+   "status": "verified",
+   "chunks": 363
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-corning-2022-10k": {
+   "status": "verified",
+   "chunks": 440
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-costco-2021-10k": {
+   "status": "verified",
+   "chunks": 200
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-cvshealth-2018-10k": {
+   "status": "verified",
+   "chunks": 1253
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-cvshealth-2022-10k": {
+   "status": "verified",
+   "chunks": 772
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-footlocker-2022-8k-dated-2022-05-20": {
+   "status": "verified",
+   "chunks": 7
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-footlocker-2022-8k-dated-2022-08-19": {
+   "status": "verified",
+   "chunks": 87
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-generalmills-2019-10k": {
+   "status": "verified",
+   "chunks": 394
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-generalmills-2020-10k": {
+   "status": "verified",
+   "chunks": 409
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-generalmills-2022-10k": {
+   "status": "verified",
+   "chunks": 349
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-johnson-johnson-2022q4-earnings": {
+   "status": "verified",
+   "chunks": 48
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-johnson-johnson-2022-10k": {
+   "status": "verified",
+   "chunks": 472
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-johnson-johnson-2023q2-earnings": {
+   "status": "verified",
+   "chunks": 50
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-johnson-johnson-2023-8k-dated-2023-08-30": {
+   "status": "verified",
+   "chunks": 52
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-jpmorgan-2021q1-10q": {
+   "status": "verified",
+   "chunks": 574
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-jpmorgan-2022q2-10q": {
+   "status": "verified",
+   "chunks": 621
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-jpmorgan-2022-10k": {
+   "status": "verified",
+   "chunks": 1466
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-jpmorgan-2023q2-10q": {
+   "status": "verified",
+   "chunks": 717
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-kraftheinz-2019-10k": {
+   "status": "verified",
+   "chunks": 505
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-lockheedmartin-2020-10k": {
+   "status": "verified",
+   "chunks": 483
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-lockheedmartin-2021-10k": {
+   "status": "verified",
+   "chunks": 464
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-lockheedmartin-2022-10k": {
+   "status": "verified",
+   "chunks": 474
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-mgmresorts-2018-10k": {
+   "status": "verified",
+   "chunks": 600
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-mgmresorts-2020-10k": {
+   "status": "verified",
+   "chunks": 515
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-mgmresorts-2022q4-earnings": {
+   "status": "verified",
+   "chunks": 43
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-mgmresorts-2022-10k": {
+   "status": "verified",
+   "chunks": 649
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-mgmresorts-2023q2-10q": {
+   "status": "verified",
+   "chunks": 164
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-microsoft-2016-10k": {
+   "status": "verified",
+   "chunks": 356
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-microsoft-2023-10k": {
+   "status": "verified",
+   "chunks": 330
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-netflix-2015-10k": {
+   "status": "verified",
+   "chunks": 207
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-netflix-2017-10k": {
+   "status": "verified",
+   "chunks": 207
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-nike-2018-10k": {
+   "status": "verified",
+   "chunks": 347
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-nike-2019-10k": {
+   "status": "verified",
+   "chunks": 318
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-nike-2021-10k": {
+   "status": "verified",
+   "chunks": 351
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-nike-2023-10k": {
+   "status": "verified",
+   "chunks": 349
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-paypal-2022-10k": {
+   "status": "verified",
+   "chunks": 435
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pepsico-2021-10k": {
+   "status": "verified",
+   "chunks": 1171
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pepsico-2022-10k": {
+   "status": "verified",
+   "chunks": 1172
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pepsico-2023q1-earnings": {
+   "status": "verified",
+   "chunks": 35
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pepsico-2023-8k-dated-2023-05-05": {
+   "status": "verified",
+   "chunks": 7
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pepsico-2023-8k-dated-2023-05-30": {
+   "status": "verified",
+   "chunks": 537
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pfizer-2021-10k": {
+   "status": "verified",
+   "chunks": 577
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-pfizer-2023q2-10q": {
+   "status": "verified",
+   "chunks": 249
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-ultabeauty-2023q4-earnings": {
+   "status": "verified",
+   "chunks": 18
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-ultabeauty-2023-10k": {
+   "status": "verified",
+   "chunks": 283
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-verizon-2021-10k": {
+   "status": "verified",
+   "chunks": 433
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-verizon-2022-10k": {
+   "status": "verified",
+   "chunks": 437
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-walmart-2018-10k": {
+   "status": "verified",
+   "chunks": 861
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-walmart-2019-10k": {
+   "status": "verified",
+   "chunks": 406
+  },
+  "fbpar-qwen3-embedding-0-6b-latest-walmart-2020-10k": {
+   "status": "verified",
+   "chunks": 532
+  }
+ },
+ "deviations": [],
+ "provenance": {
+  "mettle_git_head": "1d37ec344213e0ca86069d329eb4528e1f1823ae",
+  "mettle_git_dirty": true,
+  "mettled_mtime": "2026-09-03T23:29:58.321799",
+  "gguf_files": {
+   "/personal-projects/mettle/models/gemma-4-e2b/gemma-4-E2B-it-Q4_0.gguf": 2841481184,
+   "/personal-projects/mettle/models/gemma-4-e2b/mtp-gemma-4-E2B-it-Q4_0.gguf": 59235872,
+   "/personal-projects/mettle/models/embeddinggemma-300m/embeddinggemma-300M-Q8_0.gguf": 333590944,
+   "/personal-projects/mettle/models/unlimited-ocr/Unlimited-OCR-Q4_K_M.gguf": 1950326784,
+   "/personal-projects/mettle/models/unlimited-ocr/mmproj-Unlimited-OCR-F16.gguf": 811876448,
+   "/personal-projects/mettle/models/bge-reranker-v2-m3/bge-reranker-v2-m3-Q8_0.gguf": 635676416,
+   "/personal-projects/mettle/models/bge-m3/bge-m3-Q8_0.gguf": 634553760,
+   "/personal-projects/mettle/models/qwen3-embedding-0.6b/Qwen3-Embedding-0.6B-Q8_0.gguf": 639150592,
+   "/personal-projects/mettle/models/qwen3-reranker-0.6b/Qwen3-Reranker-0.6B-F16.gguf": 1197629984
+  },
+  "host": "RTX 3060 Laptop 6GB / Ryzen 9 5900HX",
+  "questions_file": "/personal-projects/docket/benchmarks/financebench/data/financebench_merged.jsonl",
+  "chunk_source": "/personal-projects/docket/benchmarks/financebench/.sweep_cache (frozen docket chunks, 36,920)",
+  "config": "/personal-projects/mettle/benchmarks/retrieval_parity/mettle-bench-profile.toml",
+  "metric": "gold-evidence token-overlap recall@k (verbatim docket sweep_recall.py)",
+  "state_file": "/personal-projects/mettle/benchmarks/retrieval_parity/results/mettle_best_config_state.json",
+  "contract": "BEST_CONFIG_CONTRACT.md (2026-09-10)",
+  "embedder": "qwen3-embedding-0.6b:latest",
+  "reranker": "qwen3-reranker-0.6b:latest",
+  "python_packages": {
+   "turbovec": "not installed in this venv (collection index.bin built by mettle-core turbovec 0.8.1)"
+  }
+ }
+}
