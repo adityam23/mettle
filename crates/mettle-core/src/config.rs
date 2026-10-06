@@ -147,14 +147,18 @@ pub enum ModelRole {
     Ocr,
 }
 
-/// Where a slot's weights live. `Gpu` is the default policy
-/// (GPU-or-refuse); `Cpu` is explicit config intent only — degradation
-/// never falls back to CPU on its own.
+/// Where a slot's weights live.
+/// - `Gpu` (default): GPU-or-refuse — the VRAM ladder, then drop.
+/// - `Cpu`: forced system-RAM residency, never budgeted against VRAM.
+/// - `Auto`: GPU preferred; when no GPU rung fits (or a runtime OOM picks
+///   this slot as the victim) it is demoted to CPU instead of dropped.
+///   Opt-in per slot for models whose CPU latency the consumer accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Placement {
     Gpu,
     Cpu,
+    Auto,
 }
 
 /// One model inside a `[[profile]]`. `priority` orders degradation and
@@ -264,9 +268,10 @@ fn default_models() -> Vec<ModelEntry> {
 }
 
 /// The shipped-default profile: the bench-retrieval shape (n_ctx 8192,
-/// KV fp8, `n_gpu_layers 999`, all retrieval models GPU-resident; chat
-/// models JIT). Priorities order the degradation ladder: the qwen3 defaults
-/// are kept longest, the secondary embedders/reranker evict first.
+/// KV fp8, `n_gpu_layers 999`; chat models JIT). It pins only the measured
+/// winners — qwen3 embedder + qwen3 reranker — so a fresh install downloads
+/// and loads just those two. The comparison models (embed-gemma, bge-m3,
+/// bge-reranker-v2-m3) stay in the catalog, loadable through the slot API.
 fn default_profile() -> ProfileConfig {
     let slot = |id: &str, priority: u32| ProfileSlot {
         id: id.into(),
@@ -279,9 +284,6 @@ fn default_profile() -> ProfileConfig {
         slots: vec![
             slot("qwen3-embedding-0.6b:latest", 10),
             slot("qwen3-reranker-0.6b:latest", 20),
-            slot("embed-gemma:latest", 30),
-            slot("bge-m3:latest", 40),
-            slot("bge-reranker-v2-m3:latest", 50),
         ],
     }
 }
@@ -642,6 +644,7 @@ placement = "cpu"
 name = "retrieval-bench"
 [[profile.slots]]
 id = "bge-reranker-v2-m3"
+placement = "auto"
 "#;
         let cfg: RootConfig = toml::from_str(toml).unwrap();
         cfg.validate().unwrap();
@@ -656,6 +659,7 @@ id = "bge-reranker-v2-m3"
         assert_eq!(cfg.profile[0].slots[0].placement, None);
         assert_eq!(cfg.profile[0].slots[1].placement, Some(Placement::Cpu));
         assert_eq!(cfg.profile[1].slots[0].priority, None);
+        assert_eq!(cfg.profile[1].slots[0].placement, Some(Placement::Auto));
     }
 
     #[test]

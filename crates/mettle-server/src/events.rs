@@ -38,6 +38,8 @@ pub enum EngineEvent {
         name: String,
         dropped: Vec<String>,
         shrunk: Vec<String>,
+        /// `auto` slots moved to CPU instead of being dropped.
+        demoted: Vec<String>,
         reason: String,
     },
     #[serde(rename = "slot.loaded")]
@@ -127,6 +129,7 @@ mod tests {
             name: "finance".into(),
             dropped: vec!["big-model".into()],
             shrunk: vec!["qwen35".into()],
+            demoted: Vec::new(),
             reason: "vram".into(),
         };
         let json = serde_json::to_value(&degraded).unwrap();

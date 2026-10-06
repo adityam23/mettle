@@ -106,23 +106,27 @@ pub struct ProfileDeps {
 pub enum SlotState {
     Unloaded,
     Loading,
-    Loaded {
-        ctx: u32,
-        /// Planner estimate for THIS load's context (None for CPU slots,
-        /// which are not budgeted against VRAM).
-        estimated_bytes: Option<u64>,
-        /// Post-load device-memory delta, when a device was reachable.
-        measured_bytes: Option<u64>,
-        shrunk: bool,
-        /// Effective per-call packed-token cap for a rerank slot (the rung
-        /// the ladder admitted, which may be below the configured cap);
-        /// `None` for every other kind (residency contract §1.1).
-        micro_tokens: Option<usize>,
-    },
-    Failed {
-        cause: FailCause,
-        reason: String,
-    },
+    Loaded(Residency),
+    Failed { cause: FailCause, reason: String },
+}
+
+/// Where and how a loaded slot lives.
+#[derive(Debug, Clone, Default)]
+pub struct Residency {
+    pub ctx: u32,
+    /// Planner estimate for THIS load's context (None for CPU slots,
+    /// which are not budgeted against VRAM).
+    pub estimated_bytes: Option<u64>,
+    /// Post-load device-memory delta, when a device was reachable.
+    pub measured_bytes: Option<u64>,
+    pub shrunk: bool,
+    /// Effective per-call packed-token cap for a rerank slot (the rung
+    /// the ladder admitted, which may be below the configured cap);
+    /// `None` for every other kind (residency contract §1.1).
+    pub micro_tokens: Option<usize>,
+    /// Effective placement: true when the weights live in system RAM —
+    /// forced by `placement = "cpu"` or reached by demoting an `auto` slot.
+    pub on_cpu: bool,
 }
 
 /// Why a slot ended up [`SlotState::Failed`]: the planner refused it for
@@ -258,6 +262,8 @@ struct Inner {
     slots: HashMap<String, SlotState>,
     dropped: Vec<String>,
     shrunk: Vec<String>,
+    /// `auto` slots running on CPU because the GPU could not hold them.
+    demoted: Vec<String>,
 }
 
 pub struct ProfileManager {
@@ -302,6 +308,7 @@ impl ProfileManager {
                 slots: HashMap::new(),
                 dropped: Vec::new(),
                 shrunk: Vec::new(),
+                demoted: Vec::new(),
             }),
             measured: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
@@ -596,8 +603,10 @@ impl ProfileManager {
     ) -> Result<SlotLoadSpec, String> {
         let mut model = llama_bridge::load_spec_for_route(reg_entry)?;
         // Placement is the only offload knob (profiles-contract.md).
+        // `Auto` here means "the GPU attempt"; its CPU fallback calls this
+        // with `Placement::Cpu`.
         model.n_gpu_layers = Some(match placement {
-            Placement::Gpu => 999,
+            Placement::Gpu | Placement::Auto => 999,
             Placement::Cpu => 0,
         });
         let wiring = self.draft_wiring(reg_entry);
@@ -932,7 +941,7 @@ impl ProfileManager {
             }
             match inner.slots.get(&slot.id) {
                 Some(SlotState::Loading) => return false,
-                Some(SlotState::Loaded { .. }) => {
+                Some(SlotState::Loaded(_)) => {
                     if !loaded_roles.contains(&role) {
                         loaded_roles.push(role);
                     }
@@ -995,7 +1004,7 @@ impl ProfileManager {
             Ok(inner) => inner
                 .slots
                 .iter()
-                .filter(|(_, st)| matches!(st, SlotState::Loaded { .. } | SlotState::Loading))
+                .filter(|(_, st)| matches!(st, SlotState::Loaded(_) | SlotState::Loading))
                 .map(|(id, _)| id.clone())
                 .collect(),
             Err(_) => return Err("slot state poisoned".into()),
@@ -1021,6 +1030,7 @@ impl ProfileManager {
         let mut loaded_any = false;
         let mut dropped: Vec<String> = Vec::new();
         let mut shrunk: Vec<String> = Vec::new();
+        let mut demoted: Vec<String> = Vec::new();
         let mut refusal: Option<String> = None;
 
         for (idx, (_, slot)) in targets.iter().enumerate() {
@@ -1032,7 +1042,7 @@ impl ProfileManager {
                     .lock()
                     .ok()
                     .and_then(|i| i.slots.get(&slot.id).cloned()),
-                Some(SlotState::Loaded { .. })
+                Some(SlotState::Loaded(_))
             ) {
                 loaded_any = true; // overlap: already resident
                 continue;
@@ -1041,13 +1051,19 @@ impl ProfileManager {
                 .load_through_ladder(&slot.id, slot.placement, my_gen)
                 .await
             {
-                LadderOutcome::Loaded { shrunk: was_shrunk } => {
+                LadderOutcome::Loaded {
+                    shrunk: was_shrunk,
+                    demoted: was_demoted,
+                } => {
                     loaded_any = true;
                     if was_shrunk {
                         shrunk.push(slot.id.clone());
                     }
+                    if was_demoted {
+                        demoted.push(slot.id.clone());
+                    }
                 }
-                LadderOutcome::Dropped(reason) => {
+                LadderOutcome::Dropped(_, reason) => {
                     dropped.push(slot.id.clone());
                     // First slot refused ⇒ refuse the whole activation
                     // (profiles-contract.md); current state stands.
@@ -1075,7 +1091,7 @@ impl ProfileManager {
                         .lock()
                         .ok()
                         .and_then(|i| i.slots.get(&slot.id).cloned()),
-                    Some(SlotState::Loaded { .. })
+                    Some(SlotState::Loaded(_))
                 );
                 if !resident {
                     self.fail_slot(
@@ -1088,11 +1104,13 @@ impl ProfileManager {
             if let Ok(mut inner) = self.inner.lock() {
                 inner.dropped = profile.slots.iter().map(|s| s.id.clone()).collect();
                 inner.shrunk.clear();
+                inner.demoted.clear();
             }
             self.events.emit(EngineEvent::ProfileDegraded {
                 name: name.to_string(),
                 dropped: profile.slots.iter().map(|s| s.id.clone()).collect(),
                 shrunk: Vec::new(),
+                demoted: Vec::new(),
                 reason: reason.clone(),
             });
             return Err(format!("activation of '{name}' refused: {reason}"));
@@ -1106,14 +1124,16 @@ impl ProfileManager {
             inner.active = Some(name.to_string());
             inner.dropped = dropped.clone();
             inner.shrunk = shrunk.clone();
+            inner.demoted = demoted.clone();
         }
         self.persist_state();
 
-        if !dropped.is_empty() || !shrunk.is_empty() {
+        if !dropped.is_empty() || !shrunk.is_empty() || !demoted.is_empty() {
             self.events.emit(EngineEvent::ProfileDegraded {
                 name: name.to_string(),
-                dropped: dropped.clone(),
-                shrunk: shrunk.clone(),
+                dropped,
+                shrunk,
+                demoted,
                 reason: "vram".into(),
             });
         }
@@ -1123,68 +1143,108 @@ impl ProfileManager {
         Ok(())
     }
 
-    /// The per-slot degradation ladder: full ctx → halved ctx down to
-    /// `min_ctx` → drop. CPU slots bypass the VRAM ladder entirely (config
-    /// intent, loaded unconditionally from RAM).
+    /// The per-slot degradation ladder. `gpu`: full ctx → halved ctx down
+    /// to `min_ctx` (and, for rerankers, a shrinking per-call cap) → drop.
+    /// `cpu`: loaded from RAM unconditionally, never budgeted. `auto`: the
+    /// GPU ladder first, then CPU instead of a drop (docket M1). The slot
+    /// is failed in exactly one place, so an `auto` slot that lands on CPU
+    /// never emits a `slot.failed` for its abandoned GPU attempt.
     async fn load_through_ladder(
         &self,
         id: &str,
         placement: Option<Placement>,
         my_gen: u64,
     ) -> LadderOutcome {
-        let placement = placement.unwrap_or(Placement::Gpu);
         self.set_slot(id, SlotState::Loading);
-
-        let Some(catalog) = self.catalog_entry(id) else {
-            let reason = format!("model '{id}' is not in the catalog");
-            self.fail_slot(id, FailCause::Load, &reason);
-            return LadderOutcome::Dropped(reason);
+        let outcome = match self.catalog_and_registry(id) {
+            Err(reason) => LadderOutcome::Dropped(FailCause::Load, reason),
+            Ok((catalog, reg_entry)) => match placement.unwrap_or(Placement::Gpu) {
+                Placement::Cpu => self.load_on_cpu(id, &reg_entry).await,
+                Placement::Gpu => self.load_on_gpu(id, &catalog, &reg_entry, my_gen).await,
+                Placement::Auto => match self.load_on_gpu(id, &catalog, &reg_entry, my_gen).await {
+                    LadderOutcome::Dropped(_, gpu_reason) if !self.stale(my_gen) => {
+                        tracing::info!("demoting '{id}' to CPU: {gpu_reason}");
+                        match self.load_on_cpu(id, &reg_entry).await {
+                            LadderOutcome::Loaded { shrunk, .. } => LadderOutcome::Loaded {
+                                shrunk,
+                                demoted: true,
+                            },
+                            LadderOutcome::Dropped(cause, cpu_reason) => LadderOutcome::Dropped(
+                                cause,
+                                format!("{gpu_reason}; CPU fallback failed: {cpu_reason}"),
+                            ),
+                            aborted => aborted,
+                        }
+                    }
+                    other => other,
+                },
+            },
         };
-        let reg_entry = match self.deps.registry.read() {
-            Ok(reg) => reg.resolve(id).cloned().map_err(|e| e.to_string()),
-            Err(_) => Err("registry lock poisoned".into()),
-        };
-        let reg_entry = match reg_entry {
-            Ok(e) => e,
-            Err(reason) => {
-                self.fail_slot(id, FailCause::Load, &reason);
-                return LadderOutcome::Dropped(reason);
-            }
-        };
-
-        if placement == Placement::Cpu {
-            // CPU residency is config intent, never a recovery move: no
-            // budget check, no shrink ladder.
-            let spec = match self.slot_spec(&reg_entry, Placement::Cpu, None, None) {
-                Ok(s) => s,
-                Err(reason) => {
-                    self.fail_slot(id, FailCause::Load, &reason);
-                    return LadderOutcome::Dropped(reason);
-                }
-            };
-            match self.load_via_engine(spec).await {
-                Ok(()) => {
-                    self.record_load_success(id, self.full_ctx(), None, None, false, None);
-                    return LadderOutcome::Loaded { shrunk: false };
-                }
-                Err(reason) => {
-                    self.fail_slot(id, FailCause::Load, &reason);
-                    return LadderOutcome::Dropped(reason);
-                }
-            }
+        if let LadderOutcome::Dropped(cause, reason) = &outcome {
+            self.fail_slot(id, *cause, reason);
         }
+        outcome
+    }
 
+    /// Catalog + registry entry for a profile slot, or why it can't load.
+    fn catalog_and_registry(&self, id: &str) -> Result<(ModelEntry, RegistryEntry), String> {
+        let catalog = self
+            .catalog_entry(id)
+            .ok_or_else(|| format!("model '{id}' is not in the catalog"))?;
+        let reg_entry = self
+            .deps
+            .registry
+            .read()
+            .map_err(|_| "registry lock poisoned".to_string())?
+            .resolve(id)
+            .cloned()
+            .map_err(|e| e.to_string())?;
+        Ok((catalog, reg_entry))
+    }
+
+    /// System-RAM residency: no budget check, no shrink ladder.
+    async fn load_on_cpu(&self, id: &str, reg_entry: &RegistryEntry) -> LadderOutcome {
+        let spec = match self.slot_spec(reg_entry, Placement::Cpu, None, None) {
+            Ok(s) => s,
+            Err(reason) => return LadderOutcome::Dropped(FailCause::Load, reason),
+        };
+        match self.load_via_engine(spec).await {
+            Ok(()) => {
+                self.record_load_success(
+                    id,
+                    Residency {
+                        ctx: self.full_ctx(),
+                        on_cpu: true,
+                        ..Default::default()
+                    },
+                );
+                LadderOutcome::Loaded {
+                    shrunk: false,
+                    demoted: false,
+                }
+            }
+            Err(reason) => LadderOutcome::Dropped(FailCause::Load, reason),
+        }
+    }
+
+    /// The VRAM ladder. Returns the outcome without failing the slot; the
+    /// caller decides whether a drop is final or falls back to CPU.
+    async fn load_on_gpu(
+        &self,
+        id: &str,
+        catalog: &ModelEntry,
+        reg_entry: &RegistryEntry,
+        my_gen: u64,
+    ) -> LadderOutcome {
         // GPU path: budget = free − margin (fresh snapshot per slot).
         let Some(device) = self.device.as_ref() else {
             let reason = "no accelerator detected (GPU-or-refuse)".to_string();
-            self.fail_slot(id, FailCause::Load, &reason);
-            return LadderOutcome::Dropped(reason);
+            return LadderOutcome::Dropped(FailCause::Load, reason);
         };
         device.clear_cache();
         let Some(mem_before) = device.memory() else {
             let reason = "accelerator unreachable".to_string();
-            self.fail_slot(id, FailCause::Load, &reason);
-            return LadderOutcome::Dropped(reason);
+            return LadderOutcome::Dropped(FailCause::Load, reason);
         };
         let budget = mem_before.free_bytes.saturating_sub(self.margin_bytes());
 
@@ -1192,7 +1252,7 @@ impl ProfileManager {
         // rerank slot (§1.1 — its per-call context, not its resident ctx,
         // is what the cap moves; the ctx slope is zero for that kind, so
         // the ctx rungs collapse to one).
-        let rerank_cap = self.rerank_cap(&reg_entry);
+        let rerank_cap = self.rerank_cap(reg_entry);
         let cap_rungs: Vec<Option<usize>> = match rerank_cap {
             Some(cap) => Self::rerank_cap_rungs(cap).into_iter().map(Some).collect(),
             None => vec![None],
@@ -1211,17 +1271,16 @@ impl ProfileManager {
         // slot without a doomed cudaMalloc round-trip.
         let mut costs = Vec::with_capacity(rungs.len());
         for (cap, _ctx) in &rungs {
-            match self.slot_cost(&reg_entry, *cap) {
+            match self.slot_cost(reg_entry, *cap) {
                 Some(cost) => costs.push(cost),
                 None => {
                     let reason =
                         format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
-                    self.fail_slot(id, FailCause::Load, &reason);
-                    return LadderOutcome::Dropped(reason);
+                    return LadderOutcome::Dropped(FailCause::Load, reason);
                 }
             }
         }
-        let gguf_for_measure = llama_bridge::resolve_gguf_path(&reg_entry).ok();
+        let gguf_for_measure = llama_bridge::resolve_gguf_path(reg_entry).ok();
         if rungs
             .iter()
             .zip(&costs)
@@ -1233,8 +1292,7 @@ impl ProfileManager {
                 costs[0].at(self.full_ctx()),
                 budget
             );
-            self.fail_slot(id, FailCause::Vram, &reason);
-            return LadderOutcome::Dropped(reason);
+            return LadderOutcome::Dropped(FailCause::Vram, reason);
         }
         for (rung_idx, ((cap, ctx), cost)) in rungs.iter().zip(&costs).enumerate() {
             let ctx = *ctx;
@@ -1246,11 +1304,17 @@ impl ProfileManager {
                 continue; // planner filter: this rung cannot fit
             }
             let shrunk = rung_idx > 0 || ctx != self.full_ctx();
-            let spec = match self.slot_spec(&reg_entry, Placement::Gpu, Some(ctx), *cap) {
+            let mut residency = Residency {
+                ctx,
+                estimated_bytes: Some(projected),
+                shrunk,
+                micro_tokens: *cap,
+                ..Default::default()
+            };
+            let spec = match self.slot_spec(reg_entry, Placement::Gpu, Some(ctx), *cap) {
                 Ok(s) => s,
                 Err(reason) => {
-                    self.fail_slot(id, FailCause::Load, &reason);
-                    return LadderOutcome::Dropped(reason);
+                    return LadderOutcome::Dropped(FailCause::Load, reason);
                 }
             };
             match self.load_via_engine(spec).await {
@@ -1261,7 +1325,7 @@ impl ProfileManager {
                         // slot the newer profile never wanted becomes a
                         // visible non-pinned resident (the TTL sweeper /
                         // next activation diff cleans it up).
-                        self.record_load_success(id, ctx, Some(projected), None, shrunk, *cap);
+                        self.record_load_success(id, residency);
                         return LadderOutcome::Aborted;
                     }
                     let measured = device.memory().and_then(|after| {
@@ -1292,8 +1356,12 @@ impl ProfileManager {
                             });
                         }
                     }
-                    self.record_load_success(id, ctx, Some(projected), measured, shrunk, *cap);
-                    return LadderOutcome::Loaded { shrunk };
+                    residency.measured_bytes = measured;
+                    self.record_load_success(id, residency);
+                    return LadderOutcome::Loaded {
+                        shrunk,
+                        demoted: false,
+                    };
                 }
                 // Load-time OOM (cudaMalloc) lands here: slide down the
                 // ladder rather than giving up on the slot.
@@ -1309,29 +1377,11 @@ impl ProfileManager {
             costs[0].at(self.full_ctx()),
             budget
         );
-        self.fail_slot(id, FailCause::Vram, &reason);
-        LadderOutcome::Dropped(reason)
+        LadderOutcome::Dropped(FailCause::Vram, reason)
     }
 
-    fn record_load_success(
-        &self,
-        id: &str,
-        ctx: u32,
-        estimated_bytes: Option<u64>,
-        measured_bytes: Option<u64>,
-        shrunk: bool,
-        micro_tokens: Option<usize>,
-    ) {
-        self.set_slot(
-            id,
-            SlotState::Loaded {
-                ctx,
-                estimated_bytes,
-                measured_bytes,
-                shrunk,
-                micro_tokens,
-            },
-        );
+    fn record_load_success(&self, id: &str, residency: Residency) {
+        self.set_slot(id, SlotState::Loaded(residency));
         self.remember_loaded(id);
         self.touch(id);
         self.events
@@ -1369,7 +1419,7 @@ impl ProfileManager {
                 .lock()
                 .ok()
                 .and_then(|i| i.slots.get(id).cloned()),
-            Some(SlotState::Loaded { .. }) | Some(SlotState::Loading)
+            Some(SlotState::Loaded(_)) | Some(SlotState::Loading)
         ) {
             return Err(SlotOpError::AlreadyResident);
         }
@@ -1418,7 +1468,17 @@ impl ProfileManager {
             .map_err(SlotOpError::LoadFailed)?;
         match self.load_via_engine(spec).await {
             Ok(()) => {
-                self.record_load_success(id, full, Some(needed), None, false, rerank_cap);
+                self.record_load_success(
+                    id,
+                    Residency {
+                        ctx: full,
+                        estimated_bytes: Some(needed),
+                        measured_bytes: None,
+                        shrunk: false,
+                        micro_tokens: rerank_cap,
+                        on_cpu: false,
+                    },
+                );
                 Ok(())
             }
             Err(reason) => {
@@ -1450,7 +1510,7 @@ impl ProfileManager {
                 .lock()
                 .ok()
                 .and_then(|i| i.slots.get(id).cloned()),
-            Some(SlotState::Loaded { .. }) | Some(SlotState::Loading)
+            Some(SlotState::Loaded(_)) | Some(SlotState::Loading)
         );
         if !resident {
             return Err(SlotOpError::NotResident);
@@ -1570,11 +1630,7 @@ impl ProfileManager {
     pub fn vram_bytes(&self, id: &str) -> Option<u64> {
         if let Ok(inner) = self.inner.lock() {
             match inner.slots.get(id) {
-                Some(SlotState::Loaded {
-                    estimated_bytes,
-                    measured_bytes,
-                    ..
-                }) => return measured_bytes.or(*estimated_bytes),
+                Some(SlotState::Loaded(r)) => return r.measured_bytes.or(r.estimated_bytes),
                 Some(SlotState::Loading) | Some(SlotState::Failed { .. }) => return None,
                 _ => {}
             }
@@ -1631,7 +1687,7 @@ impl ProfileManager {
                 .slots
                 .iter()
                 .filter(|(id, st)| {
-                    matches!(st, SlotState::Loaded { .. })
+                    matches!(st, SlotState::Loaded(_))
                         && !pinned.contains(*id)
                         && lu.get(*id).is_none_or(|t| *t < deadline)
                 })
@@ -1695,14 +1751,22 @@ impl ProfileManager {
                 });
                 return Ok(());
             };
+            let member_of_active = self.is_pinned(&victim);
             self.unload_via_engine(&victim).await?;
             self.set_slot(&victim, SlotState::Unloaded);
             self.remember_unloaded(&victim);
             self.events
                 .emit(EngineEvent::SlotUnloaded { id: victim.clone() });
+            // An `auto` member moves to CPU instead of disappearing
+            // (docket M1: reach a steady state rather than drop).
+            if member_of_active
+                && self.slot_placement(&victim) == Placement::Auto
+                && self.demote_to_cpu(&victim).await
+            {
+                return Ok(());
+            }
             // Losing a profile member is degradation; announce it so the
             // consumer can surface "OCR unavailable" rather than guess.
-            let member_of_active = self.is_pinned(&victim);
             if member_of_active {
                 if let Ok(mut inner) = self.inner.lock() {
                     if !inner.dropped.contains(&victim) {
@@ -1714,6 +1778,7 @@ impl ProfileManager {
                         name,
                         dropped: vec![victim],
                         shrunk: Vec::new(),
+                        demoted: Vec::new(),
                         reason: "vram".into(),
                     });
                 }
@@ -1725,6 +1790,62 @@ impl ProfileManager {
             tracing::warn!("runtime OOM recovery failed: {e}");
         }
         self.recovering.store(false, Ordering::SeqCst);
+    }
+
+    /// Reload an already-unloaded `auto` member on CPU after an OOM
+    /// eviction. `false` (slot failed with the reason) when even the CPU
+    /// load is impossible; the caller then records it as dropped.
+    async fn demote_to_cpu(&self, id: &str) -> bool {
+        let outcome = match self.catalog_and_registry(id) {
+            Ok((_, reg_entry)) => self.load_on_cpu(id, &reg_entry).await,
+            Err(reason) => LadderOutcome::Dropped(FailCause::Load, reason),
+        };
+        match outcome {
+            LadderOutcome::Loaded { .. } => {
+                tracing::warn!("demoted '{id}' to CPU after a CUDA out-of-memory error");
+                if let Ok(mut inner) = self.inner.lock() {
+                    if !inner.demoted.iter().any(|d| d == id) {
+                        inner.demoted.push(id.to_string());
+                    }
+                }
+                if let Some(name) = self.inner.lock().ok().and_then(|i| i.active.clone()) {
+                    self.events.emit(EngineEvent::ProfileDegraded {
+                        name,
+                        dropped: Vec::new(),
+                        shrunk: Vec::new(),
+                        demoted: vec![id.to_string()],
+                        reason: "vram".into(),
+                    });
+                }
+                true
+            }
+            LadderOutcome::Dropped(cause, reason) => {
+                self.fail_slot(
+                    id,
+                    cause,
+                    &format!("CPU demotion after OOM failed: {reason}"),
+                );
+                false
+            }
+            LadderOutcome::Aborted => false,
+        }
+    }
+
+    /// Configured placement of `id`: the active profile's slot wins, then
+    /// any profile declaring it; `Gpu` when unspecified (JIT slots).
+    fn slot_placement(&self, id: &str) -> Placement {
+        let active = self.inner.lock().ok().and_then(|i| i.active.clone());
+        let from = |p: &ProfileConfig| {
+            p.slots
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.placement)
+        };
+        active
+            .and_then(|name| self.profile(&name))
+            .and_then(|p| from(&p))
+            .or_else(|| self.config.profile.iter().find_map(from))
+            .unwrap_or(Placement::Gpu)
     }
 
     /// Eviction choice: oldest-touched JIT resident wins; otherwise the
@@ -1749,7 +1870,9 @@ impl ProfileManager {
         let mut jits: Vec<(String, Instant)> = Vec::new();
         let mut pinned_members: Vec<(String, u32, usize)> = Vec::new();
         for (id, st) in inner.slots.iter() {
-            if id == failing || !matches!(st, SlotState::Loaded { .. }) {
+            // Only GPU residents free VRAM when evicted.
+            let on_gpu = matches!(st, SlotState::Loaded(r) if !r.on_cpu);
+            if id == failing || !on_gpu {
                 continue;
             }
             match members.get(id) {
@@ -1832,20 +1955,14 @@ impl ProfileManager {
             .map(|id| {
                 let st = inner.slots.get(id);
                 let (label, ctx, estimated, measured, shrunk, reason, micro_tokens) = match st {
-                    Some(SlotState::Loaded {
-                        ctx,
-                        estimated_bytes,
-                        measured_bytes,
-                        shrunk,
-                        micro_tokens,
-                    }) => (
+                    Some(SlotState::Loaded(r)) => (
                         "loaded",
-                        Some(*ctx),
-                        *estimated_bytes,
-                        *measured_bytes,
-                        *shrunk,
+                        Some(r.ctx),
+                        r.estimated_bytes,
+                        r.measured_bytes,
+                        r.shrunk,
                         None,
-                        *micro_tokens,
+                        r.micro_tokens,
                     ),
                     Some(SlotState::Failed { reason, .. }) => (
                         "failed",
@@ -1859,14 +1976,14 @@ impl ProfileManager {
                     Some(SlotState::Loading) => ("loading", None, None, None, false, None, None),
                     _ => ("unloaded", None, None, None, false, None, None),
                 };
-                let placement = self
-                    .config
-                    .profile
-                    .iter()
-                    .flat_map(|p| p.slots.iter())
-                    .find(|s| s.id == *id)
-                    .and_then(|s| s.placement)
-                    .unwrap_or(Placement::Gpu);
+                // Where the weights actually live once loaded (§1.2: the
+                // reported placement must describe real residency).
+                let configured = self.slot_placement(id);
+                let placement = match st {
+                    Some(SlotState::Loaded(r)) if r.on_cpu => Placement::Cpu,
+                    Some(SlotState::Loaded(_)) => Placement::Gpu,
+                    _ => configured,
+                };
                 let priority = self
                     .config
                     .profile
@@ -1879,6 +1996,8 @@ impl ProfileManager {
                     "role": self.effective_role(id),
                     "priority": priority,
                     "placement": placement,
+                    "configured_placement": configured,
+                    "demoted": inner.demoted.contains(id),
                     "state": label,
                     "ctx": ctx,
                     "estimated_bytes": estimated,
@@ -1895,7 +2014,11 @@ impl ProfileManager {
         serde_json::json!({
             "active": inner.active,
             "switching": self.switching(),
-            "degraded": { "dropped": inner.dropped, "shrunk": inner.shrunk },
+            "degraded": {
+                "dropped": inner.dropped,
+                "shrunk": inner.shrunk,
+                "demoted": inner.demoted,
+            },
             "slots": slots,
             "ready": ready,
             "phase": readiness["phase"],
@@ -1972,8 +2095,12 @@ impl ProfileManager {
 // helpers ----------------------------------------------------------------
 
 enum LadderOutcome {
-    Loaded { shrunk: bool },
-    Dropped(String),
+    /// `demoted`: an `auto` slot that fell back to CPU.
+    Loaded {
+        shrunk: bool,
+        demoted: bool,
+    },
+    Dropped(FailCause, String),
     Aborted,
 }
 
@@ -2804,6 +2931,93 @@ mod tests {
             .unwrap()
             .dropped
             .contains(&"m1".to_string()));
+    }
+
+    // -- placement = "auto" (docket M1) ----------------------------------------
+
+    #[tokio::test]
+    async fn auto_slot_demotes_to_cpu_instead_of_dropping() {
+        // 1 MiB free: no GPU rung fits, so the auto slot lands on CPU.
+        let fx = Fixture::build_fiddled(&["m1"], &[("p", &["m1"])], MIB, |cfg| {
+            cfg.profile[0].slots[0].placement = Some(Placement::Auto);
+        });
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        let ops = fx.engine.op_log();
+        assert!(
+            ops.iter()
+                .any(|o| o.starts_with("load:m1@") && o.contains("ngl=Some(0)")),
+            "{ops:?}"
+        );
+        assert!(
+            fx.manager.readiness(true).0,
+            "a demoted profile still serves"
+        );
+        assert!(
+            !fx.replay_contains("\"slot.failed\""),
+            "the abandoned GPU attempt must not surface as a failure"
+        );
+        assert!(fx.replay_contains("\"demoted\":[\"m1\"]"));
+
+        let status = fx.manager.status(true);
+        let slot = &status["slots"][0];
+        assert_eq!(slot["placement"], "cpu", "{status}");
+        assert_eq!(slot["configured_placement"], "auto");
+        assert_eq!(slot["demoted"], true);
+        assert_eq!(status["degraded"]["demoted"][0], "m1");
+    }
+
+    #[tokio::test]
+    async fn gpu_slot_still_drops_when_nothing_fits() {
+        let fx = Fixture::build(&[("p", &["m1"])], MIB);
+        assert!(fx.manager.clone().activate("p".into()).await.is_err());
+        let ops = fx.engine.op_log();
+        assert!(!ops.iter().any(|o| o.contains("ngl=Some(0)")), "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn oom_recovery_demotes_an_auto_victim_to_cpu() {
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m1", "m2"])], 8 * GIB, |cfg| {
+            cfg.profile[0].slots[0].priority = Some(10); // lowest priority
+            cfg.profile[0].slots[0].placement = Some(Placement::Auto);
+            cfg.profile[0].slots[1].priority = Some(1);
+        });
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        fx.manager.clone().on_runtime_oom("m2".into()).await;
+
+        let ops = fx.engine.op_log();
+        let unload = ops
+            .iter()
+            .position(|o| o == "unload:m1")
+            .expect("evicted from GPU");
+        assert!(
+            ops[unload..]
+                .iter()
+                .any(|o| o.starts_with("load:m1@") && o.contains("ngl=Some(0)")),
+            "{ops:?}"
+        );
+        let inner = fx.manager.inner.lock().unwrap().clone();
+        assert!(inner.demoted.contains(&"m1".to_string()));
+        assert!(!inner.dropped.contains(&"m1".to_string()));
+        assert!(matches!(inner.slots.get("m1"), Some(SlotState::Loaded(r)) if r.on_cpu));
+    }
+
+    #[tokio::test]
+    async fn oom_recovery_never_evicts_a_cpu_resident() {
+        // Evicting a CPU slot frees no VRAM; with only the failing GPU slot
+        // and a CPU slot resident there is nothing worth evicting.
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m1", "m2"])], 8 * GIB, |cfg| {
+            cfg.profile[0].slots[0].priority = Some(10);
+            cfg.profile[0].slots[0].placement = Some(Placement::Cpu);
+            cfg.profile[0].slots[1].priority = Some(1);
+        });
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        fx.manager.clone().on_runtime_oom("m2".into()).await;
+
+        let ops = fx.engine.op_log();
+        assert!(!ops.iter().any(|o| o.starts_with("unload:")), "{ops:?}");
     }
 
     #[tokio::test]
