@@ -6,7 +6,7 @@
 use std::convert::Infallible;
 
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -68,8 +68,35 @@ pub async fn activate_handler(
 // GET /engine/status — per-slot residency
 // ---------------------------------------------------------------------------
 
+/// `GET /engine/status` — liveness + per-slot residency. Always 200 while
+/// the process is up; `ready` and `phase` carry the readiness view so a
+/// consumer that only polls this endpoint can still render the phase
+/// (residency contract §1.4, amendment).
 pub async fn status_handler(State(state): State<std::sync::Arc<AppState>>) -> Response {
-    Json(state.profiles.status()).into_response()
+    let engine_loaded = state.engine().is_some();
+    Json(state.profiles.status(engine_loaded)).into_response()
+}
+
+/// `GET /engine/ready` — the single readiness gate. 200 when the engine
+/// can serve the active profile, 503 with the same `{ready, phase}` body
+/// otherwise. A 404 means the engine predates this endpoint.
+pub async fn ready_handler(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    let engine_loaded = state.engine().is_some();
+    let (ready, body) = state.profiles.readiness(engine_loaded);
+    let loading = body["phase"]["phase"] == "loading";
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let mut resp = (status, Json(body)).into_response();
+    // Only an in-flight `loading` is worth an automatic retry; a `failed`
+    // phase needs an operator action first (§1.5 semantics).
+    if !ready && loading {
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+    }
+    resp
 }
 
 // ---------------------------------------------------------------------------

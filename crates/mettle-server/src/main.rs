@@ -8,6 +8,11 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // Never dump a ggml/abort backtrace (residency contract §1.6): a
+    // supervised daemon's failures are structured (exit code + logs), and a
+    // backtrace turns a clean exit into a crash the supervisor must parse.
+    std::env::set_var("GGML_NO_BACKTRACE", "1");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -80,6 +85,24 @@ async fn main() {
         addr
     );
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, router).await.unwrap();
+    // Exit 98 (EADDRINUSE) is the contract's "another engine holds the
+    // port" signal (residency contract §1.6): docket maps it to `offline`
+    // and does not respawn, rather than treating it as a crash.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::error!("port {} is already in use: {e}", addr.port());
+            eprintln!("mettled: port {} is already in use", addr.port());
+            std::process::exit(98);
+        }
+        Err(e) => {
+            tracing::error!("failed to bind {addr}: {e}");
+            eprintln!("mettled: failed to bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = axum::serve(listener, router).await {
+        tracing::error!("server error: {e}");
+        std::process::exit(1);
+    }
 }

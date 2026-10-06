@@ -93,6 +93,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             axum::routing::put(crate::routes::engine::activate_handler),
         )
         .route("/engine/status", get(crate::routes::engine::status_handler))
+        .route("/engine/ready", get(crate::routes::engine::ready_handler))
         .route("/engine/device", get(crate::routes::engine::device_handler))
         .route(
             "/engine/slots/{id}/load",

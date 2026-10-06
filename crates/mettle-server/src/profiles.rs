@@ -143,6 +143,44 @@ impl SlotState {
     }
 }
 
+/// Readiness phase rendered by `/engine/status` and `/engine/ready`
+/// (residency contract §1.4, merged with the first-run surface contract).
+/// `phase` is a closed set; the rest carry whatever that phase knows.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Phase {
+    /// `downloading` | `loading` | `failed` | `ready`.
+    pub phase: &'static str,
+    /// Model the phase is about (the boot target, or the download in flight).
+    pub model: Option<String>,
+    pub bytes_done: Option<u64>,
+    pub bytes_total: Option<u64>,
+    /// Error text for `failed`.
+    pub error: Option<String>,
+    /// Closed reason for `failed` (`dropped_vram` / `load_failed` / …).
+    pub reason: Option<String>,
+    /// Human-readable cause paired with `reason`.
+    pub detail: Option<String>,
+}
+
+impl Default for Phase {
+    fn default() -> Self {
+        Self {
+            phase: "loading",
+            model: None,
+            bytes_done: None,
+            bytes_total: None,
+            error: None,
+            reason: None,
+            detail: None,
+        }
+    }
+}
+
+/// Default bounded boot-retry window (seconds) before `/engine/ready`
+/// reports `failed` (residency contract §1.4). Overridable via
+/// `[engine] ready_timeout_secs`.
+const DEFAULT_READY_TIMEOUT_SECS: u64 = 60;
+
 /// One persisted post-load measurement (`state.json`, XDG data dir). Stale
 /// entries (different engine version or GGUF mtime) are discarded on use.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -249,6 +287,10 @@ pub struct ProfileManager {
     /// reports collapse into the first attempt.
     recovering: AtomicBool,
     state_path: PathBuf,
+    /// Boot readiness phase (§1.4). Live slot state wins for `ready`;
+    /// this carries what only boot knows (`loading` retries, `failed`,
+    /// and later `downloading`).
+    phase: Mutex<Phase>,
 }
 
 impl ProfileManager {
@@ -276,6 +318,7 @@ impl ProfileManager {
             switching: AtomicBool::new(false),
             recovering: AtomicBool::new(false),
             state_path,
+            phase: Mutex::new(Phase::default()),
         }
     }
 
@@ -527,30 +570,86 @@ impl ProfileManager {
     /// "shipped default" means what it says. Only when NOTHING was ever
     /// persisted (fresh install); an explicit profile switch always wins.
     pub async fn boot_activate(self: Arc<Self>) {
-        match self.load_persisted_active() {
-            Some(name) => {
-                tracing::info!("re-activating persisted profile '{name}'");
-                if let Err(e) = Arc::clone(&self).activate(name).await {
-                    tracing::warn!("boot activation failed: {e}");
-                }
+        // Pick the boot target: the persisted profile, else the shipped
+        // `default = true` one (adoption-contract grilling Q11).
+        let target = match self.load_persisted_active() {
+            Some(name) => Some(name),
+            None => self
+                .config
+                .profile
+                .iter()
+                .find(|p| p.default)
+                .map(|p| p.name.clone()),
+        };
+        let Some(name) = target else {
+            tracing::info!("no active profile persisted; engine idles until one is activated");
+            self.set_phase(Phase {
+                phase: "failed",
+                reason: Some(UnavailableReason::NotResident.as_str().to_string()),
+                detail: Some("no profile configured to activate".into()),
+                error: Some("no profile configured to activate".into()),
+                ..Default::default()
+            });
+            return;
+        };
+
+        // Bounded retry with backoff (§1.4): another process holding VRAM
+        // at boot is transient, so keep the phase `loading` for the window
+        // and only report `failed` once it runs out.
+        let window = self.ready_timeout();
+        let started = Instant::now();
+        let mut delay = Duration::from_secs(1);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            self.set_phase(Phase {
+                phase: "loading",
+                model: Some(name.clone()),
+                detail: (attempt > 1).then(|| format!("retry {attempt}")),
+                ..Default::default()
+            });
+            tracing::info!("boot: activating profile '{name}' (attempt {attempt})");
+            if let Err(e) = Arc::clone(&self).activate_inner(name.clone(), true).await {
+                tracing::warn!("boot activation attempt {attempt} failed: {e}");
             }
-            None => match self.config.profile.iter().find(|p| p.default) {
-                Some(profile) => {
-                    tracing::info!(
-                        "no active profile persisted; activating shipped default profile '{}'",
-                        profile.name
-                    );
-                    if let Err(e) = Arc::clone(&self).activate(profile.name.clone()).await {
-                        tracing::warn!("default profile activation failed: {e}");
-                    }
-                }
-                None => {
-                    tracing::info!(
-                        "no active profile persisted; engine idles until one is activated"
-                    );
-                }
-            },
+            if self.is_serving() {
+                self.set_phase(Phase {
+                    phase: "ready",
+                    ..Default::default()
+                });
+                tracing::info!("boot: profile '{name}' ready after {attempt} attempt(s)");
+                return;
+            }
+            if started.elapsed() + delay >= window {
+                break;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(15));
         }
+        let (reason, detail) = self.failure_reason();
+        tracing::warn!(
+            "boot: profile '{name}' not ready within {}s ({}: {})",
+            window.as_secs(),
+            reason.as_deref().unwrap_or("unknown"),
+            detail.as_deref().unwrap_or("no detail")
+        );
+        self.set_phase(Phase {
+            phase: "failed",
+            model: Some(name),
+            error: detail.clone(),
+            reason,
+            detail,
+            ..Default::default()
+        });
+    }
+
+    fn ready_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.config
+                .engine
+                .ready_timeout_secs
+                .unwrap_or(DEFAULT_READY_TIMEOUT_SECS),
+        )
     }
 
     fn load_persisted_active(&self) -> Option<String> {
@@ -601,18 +700,118 @@ impl ProfileManager {
     /// events (`profile.active` / `profile.degraded`); the returned Result
     /// is for the caller's logs.
     pub async fn activate(self: Arc<Self>, name: String) -> Result<(), String> {
+        self.activate_inner(name, false).await
+    }
+
+    /// `boot` suppresses the terminal `failed` transition so the boot retry
+    /// loop can keep the phase `loading` for its whole window (§1.4).
+    async fn activate_inner(self: Arc<Self>, name: String, boot: bool) -> Result<(), String> {
         let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.switching.store(true, Ordering::SeqCst);
+        self.set_phase(Phase {
+            phase: "loading",
+            model: Some(name.clone()),
+            ..Default::default()
+        });
         self.events
             .emit(EngineEvent::ProfileActivating { name: name.clone() });
 
         let result = self.run_activation(&name, my_gen).await;
 
-        // Only the newest run owns the switching flag.
+        // Only the newest run owns the switching flag and the phase.
         if self.generation.load(Ordering::SeqCst) == my_gen {
             self.switching.store(false, Ordering::SeqCst);
+            if !boot {
+                self.settle_phase();
+            }
         }
         result
+    }
+
+    /// Terminal phase after an activation completes outside the boot
+    /// window: `ready` when it can serve, else `failed` with the real
+    /// reason.
+    fn settle_phase(&self) {
+        if self.is_serving() {
+            self.set_phase(Phase {
+                phase: "ready",
+                ..Default::default()
+            });
+            return;
+        }
+        let (reason, detail) = self.failure_reason();
+        self.set_phase(Phase {
+            phase: "failed",
+            error: detail.clone(),
+            reason,
+            detail,
+            ..Default::default()
+        });
+    }
+
+    fn set_phase(&self, phase: Phase) {
+        if let Ok(mut p) = self.phase.lock() {
+            *p = phase;
+        }
+    }
+
+    /// True when the active profile's declared slots are settled and at
+    /// least one is loaded — the engine can answer a request right now.
+    fn is_serving(&self) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(active) = inner.active.as_ref() else {
+            return false;
+        };
+        let Some(profile) = self.profile(active) else {
+            return false;
+        };
+        let mut any_loaded = false;
+        for slot in &profile.slots {
+            match inner.slots.get(&slot.id) {
+                Some(SlotState::Loading) => return false,
+                Some(SlotState::Loaded { .. }) => any_loaded = true,
+                _ => {}
+            }
+        }
+        any_loaded
+    }
+
+    /// Closed reason + detail for a profile that cannot serve, derived
+    /// from its real slot state (shared by `failed` phase and §1.5).
+    fn failure_reason(&self) -> (Option<String>, Option<String>) {
+        let Ok(inner) = self.inner.lock() else {
+            return (None, None);
+        };
+        // A failed slot is the most specific cause.
+        if let Some((id, SlotState::Failed { cause, reason })) = inner
+            .slots
+            .iter()
+            .find(|(_, s)| matches!(s, SlotState::Failed { .. }))
+        {
+            let label = match cause {
+                FailCause::Vram => UnavailableReason::DroppedVram,
+                FailCause::Load => UnavailableReason::LoadFailed,
+            };
+            return (
+                Some(label.as_str().to_string()),
+                Some(format!("'{id}': {reason}")),
+            );
+        }
+        if !inner.dropped.is_empty() {
+            return (
+                Some(UnavailableReason::DroppedVram.as_str().to_string()),
+                Some(format!("dropped for VRAM: {}", inner.dropped.join(", "))),
+            );
+        }
+        if inner.active.is_none() {
+            return (
+                Some(UnavailableReason::NotResident.as_str().to_string()),
+                Some("no profile active".into()),
+            );
+        }
+        (None, None)
     }
 
     async fn run_activation(&self, name: &str, my_gen: u64) -> Result<(), String> {
@@ -707,7 +906,10 @@ impl ProfileManager {
             });
             for (_, slot) in targets.iter().skip(1) {
                 let resident = matches!(
-                    self.inner.lock().ok().and_then(|i| i.slots.get(&slot.id).cloned()),
+                    self.inner
+                        .lock()
+                        .ok()
+                        .and_then(|i| i.slots.get(&slot.id).cloned()),
                     Some(SlotState::Loaded { .. })
                 );
                 if !resident {
@@ -1144,7 +1346,9 @@ impl ProfileManager {
             // Unloaded but recorded as dropped: evicted by OOM recovery.
             _ if dropped => (
                 UnavailableReason::DroppedVram,
-                Some(format!("'{id}' was evicted to recover from a CUDA out-of-memory error")),
+                Some(format!(
+                    "'{id}' was evicted to recover from a CUDA out-of-memory error"
+                )),
             ),
             _ => (UnavailableReason::NotResident, None),
         };
@@ -1367,8 +1571,40 @@ impl ProfileManager {
 
     // -- views ---------------------------------------------------------------
 
-    /// `GET /engine/status` payload.
-    pub fn status(&self) -> serde_json::Value {
+    /// `(ready, {ready, phase:{…}})` — the readiness gate shared by
+    /// `/engine/ready` and the extra fields on `/engine/status`
+    /// (residency contract §1.4). Live slot state decides `ready`; the
+    /// tracked phase supplies what only boot knows (`loading` retries,
+    /// `failed`, `downloading`). `engine_loaded` is the caller's view.
+    pub fn readiness(&self, engine_loaded: bool) -> (bool, serde_json::Value) {
+        let ready = engine_loaded && self.is_serving();
+        let mut phase = self.phase.lock().map(|p| p.clone()).unwrap_or_default();
+        match (ready, phase.phase) {
+            (true, _) => phase.phase = "ready",
+            // Serving state regressed (unloaded/deactivated): never keep
+            // advertising a stale `ready`.
+            (false, "ready") => phase.phase = "loading",
+            _ => {}
+        }
+        let body = serde_json::json!({
+            "ready": ready,
+            "phase": {
+                "phase": phase.phase,
+                "model": phase.model,
+                "bytes_done": phase.bytes_done,
+                "bytes_total": phase.bytes_total,
+                "error": phase.error,
+                "reason": phase.reason,
+                "detail": phase.detail,
+            },
+        });
+        (ready, body)
+    }
+
+    /// `GET /engine/status` payload — liveness plus per-slot residency.
+    /// Always 200 while the process is up; `ready` + `phase` are the
+    /// readiness view (residency contract §1.4, amendment).
+    pub fn status(&self, engine_loaded: bool) -> serde_json::Value {
         let inner = self.inner.lock().map(|i| i.clone()).unwrap_or_default();
         let mut ids: Vec<String> = inner.slots.keys().cloned().collect();
         for p in &self.config.profile {
@@ -1434,11 +1670,14 @@ impl ProfileManager {
             })
             .collect();
 
+        let (ready, readiness) = self.readiness(engine_loaded);
         serde_json::json!({
             "active": inner.active,
             "switching": self.switching(),
             "degraded": { "dropped": inner.dropped, "shrunk": inner.shrunk },
             "slots": slots,
+            "ready": ready,
+            "phase": readiness["phase"],
         })
     }
 
@@ -1917,6 +2156,53 @@ mod tests {
         assert_eq!(active_name(&fresh), None);
     }
 
+    // -- readiness phase (§1.4) --------------------------------------------------
+
+    #[tokio::test]
+    async fn boot_reaches_ready_and_reports_phase() {
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m1"])], 8 * GIB, |cfg| {
+            cfg.profile[0].default = true;
+        });
+        fx.manager.clone().boot_activate().await;
+
+        let (ready, body) = fx.manager.readiness(true);
+        assert!(ready, "{body}");
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["phase"]["phase"], "ready");
+        assert_eq!(body["phase"]["error"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn boot_reports_failed_with_reason_after_window() {
+        // Nothing fits the budget, so every slot is dropped and the window
+        // cannot end in `ready`: the phase must settle on `failed` with the
+        // real reason, not stay `loading` forever.
+        let fx = Fixture::build_fiddled(&["m1"], &[("p", &["m1"])], 0, |cfg| {
+            cfg.profile[0].default = true;
+            cfg.engine.ready_timeout_secs = Some(1);
+        });
+        fx.manager.clone().boot_activate().await;
+
+        let (ready, body) = fx.manager.readiness(true);
+        assert!(!ready);
+        assert_eq!(body["phase"]["phase"], "failed", "{body}");
+        assert_eq!(body["phase"]["reason"], "dropped_vram", "{body}");
+        assert!(body["phase"]["detail"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn readiness_needs_a_live_engine_handle() {
+        let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+
+        // Slots are loaded, but with no engine handle the process cannot
+        // serve: `/engine/ready` must gate on both.
+        assert!(fx.manager.readiness(true).0);
+        let (ready, body) = fx.manager.readiness(false);
+        assert!(!ready, "{body}");
+        assert_eq!(body["phase"]["phase"], "loading");
+    }
+
     #[tokio::test]
     async fn overlap_stays_resident_across_switch() {
         let fx = Fixture::build(&[("p1", &["m1", "m2"]), ("p2", &["m1"])], 8 * GIB);
@@ -2083,15 +2369,26 @@ mod tests {
         let reason = |id: &str, engine: bool| m.unavailability(id, engine).reason;
 
         assert_eq!(reason("m9", true), R::NotResident);
-        assert_eq!(reason("m9", false), R::NoEngine, "no engine wins over slot state");
+        assert_eq!(
+            reason("m9", false),
+            R::NoEngine,
+            "no engine wins over slot state"
+        );
 
         m.set_slot("m9", SlotState::Loading);
         assert_eq!(reason("m9", true), R::Loading);
 
-        m.fail_slot("m9", FailCause::Vram, "needs 9 bytes, 1 free (no rung fits)");
+        m.fail_slot(
+            "m9",
+            FailCause::Vram,
+            "needs 9 bytes, 1 free (no rung fits)",
+        );
         let u = m.unavailability("m9", true);
         assert_eq!(u.reason, R::DroppedVram);
-        assert_eq!(u.detail.as_deref(), Some("needs 9 bytes, 1 free (no rung fits)"));
+        assert_eq!(
+            u.detail.as_deref(),
+            Some("needs 9 bytes, 1 free (no rung fits)")
+        );
 
         m.fail_slot("m9", FailCause::Load, "bad gguf");
         assert_eq!(reason("m9", true), R::LoadFailed);
@@ -2116,11 +2413,21 @@ mod tests {
         let fx = Fixture::build(&[("p", &["m1", "m2"])], MIB);
         assert!(fx.manager.clone().activate("p".into()).await.is_err());
         let first = fx.manager.unavailability("m1", true);
-        assert_eq!(first.reason, crate::unavailable::UnavailableReason::DroppedVram);
+        assert_eq!(
+            first.reason,
+            crate::unavailable::UnavailableReason::DroppedVram
+        );
         let second = fx.manager.unavailability("m2", true);
-        assert_eq!(second.reason, crate::unavailable::UnavailableReason::DroppedVram);
+        assert_eq!(
+            second.reason,
+            crate::unavailable::UnavailableReason::DroppedVram
+        );
         assert!(
-            second.detail.as_deref().unwrap_or("").contains("not attempted"),
+            second
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("not attempted"),
             "{second:?}"
         );
     }

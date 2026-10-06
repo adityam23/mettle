@@ -366,6 +366,12 @@ pub struct EngineOptions {
     /// does not model, plus other processes' usage. Default: 512 MiB.
     #[serde(default)]
     pub vram_margin_bytes: Option<u64>,
+
+    /// Bounded window (seconds) that boot activation retries a failed
+    /// profile with backoff before `/engine/ready` reports `failed`
+    /// (residency contract §1.4). Default: 60 s.
+    #[serde(default)]
+    pub ready_timeout_secs: Option<u64>,
 }
 
 impl Default for EngineOptions {
@@ -379,6 +385,7 @@ impl Default for EngineOptions {
             n_batch: None,
             n_ctx: None,
             vram_margin_bytes: None,
+            ready_timeout_secs: None,
         }
     }
 }

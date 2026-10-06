@@ -157,6 +157,48 @@ async fn status_starts_idle_with_no_slots() {
     assert_eq!(json["degraded"]["dropped"].as_array().unwrap().len(), 0);
     assert_eq!(json["degraded"]["shrunk"].as_array().unwrap().len(), 0);
     assert_eq!(json["slots"].as_array().unwrap().len(), 0);
+    // Liveness stays 200; readiness rides along as data (§1.4).
+    assert_eq!(json["ready"], false);
+    assert_eq!(json["phase"]["phase"], "loading");
+}
+
+// ---------------------------------------------------------------------------
+// GET /engine/ready
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ready_gate_is_503_until_engine_can_serve() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = test_state(tmp.path(), Vec::new(), Vec::new());
+    let router = build_router(state);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/engine/ready")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // `loading` is the one retryable phase.
+    assert_eq!(resp.headers()["retry-after"], "2");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["ready"], false);
+    assert_eq!(json["phase"]["phase"], "loading");
+}
+
+#[tokio::test]
+async fn status_stays_200_while_ready_is_503() {
+    // The amendment: `/engine/status` is liveness (always 200); only
+    // `/engine/ready` is the gate.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = test_state(tmp.path(), Vec::new(), Vec::new());
+    let router = build_router(state);
+
+    let (status, _) = send(&router, "GET", "/engine/status", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (ready, _) = send(&router, "GET", "/engine/ready", None).await;
+    assert_eq!(ready, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +406,8 @@ async fn bearer_auth_enforced_on_engine_routes() {
 
     for (method, uri) in [
         ("GET", "/engine/status"),
+        // The probe stays behind auth too (operator decision, Q1).
+        ("GET", "/engine/ready"),
         ("GET", "/engine/profiles"),
         ("GET", "/engine/device"),
         ("POST", "/engine/slots/m1/load"),
