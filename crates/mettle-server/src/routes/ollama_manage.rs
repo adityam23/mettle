@@ -224,103 +224,22 @@ fn pull_stream(
     }
 }
 
-/// NDJSON progress reporter for hf-hub downloads.
-#[derive(Clone)]
-struct NdjsonProgress {
-    tx: tokio::sync::mpsc::UnboundedSender<PullProgress>,
-    filename: String,
-    total: u64,
-    completed: u64,
-}
-
-impl hf_hub::api::tokio::Progress for NdjsonProgress {
-    async fn init(&mut self, size: usize, filename: &str) {
-        self.filename = filename.to_string();
-        self.total = size as u64;
-        self.completed = 0;
-        let _ = self.tx.send(progress_bytes(
-            format!("downloading {}", self.filename),
-            self.total,
-            0,
-        ));
-    }
-
-    async fn update(&mut self, size: usize) {
-        self.completed += size as u64;
-        let _ = self.tx.send(progress_bytes(
-            format!("downloading {}", self.filename),
-            self.total,
-            self.completed,
-        ));
-    }
-
-    async fn finish(&mut self) {
-        let _ = self.tx.send(progress_bytes(
-            format!("verifying {}", self.filename),
-            self.total,
-            self.total,
-        ));
-    }
-}
-
 /// Download a model's files into the standard Hugging Face cache, where the
-/// engine loader finds them. GGUF entries fetch the quantised file; other
-/// entries fetch the full safetensors set.
+/// engine loader finds them, forwarding NDJSON progress.
 async fn download_model_files(
     entry: &RegistryEntry,
     progress: Option<tokio::sync::mpsc::UnboundedSender<PullProgress>>,
 ) -> Result<(), String> {
-    let api = hf_hub::api::tokio::ApiBuilder::from_env()
-        .with_progress(false)
-        .build()
-        .map_err(|e| format!("hf api: {}", e))?;
-    let repo = api.model(entry.hf_repo_id.clone());
-
-    let filenames: Vec<String> = if let Some(quant) = &entry.hf_quant_filename {
-        vec![quant.clone()]
-    } else {
-        let info = repo
-            .info()
-            .await
-            .map_err(|e| format!("failed to fetch repo info for {}: {}", entry.hf_repo_id, e))?;
-        info.siblings
-            .into_iter()
-            .map(|s| s.rfilename)
-            .filter(|f| {
-                f.ends_with(".safetensors")
-                    || f.ends_with(".json")
-                    || f.ends_with(".jinja")
-                    || f.ends_with(".model")
-            })
-            .collect()
-    };
-
-    if filenames.is_empty() {
-        return Err(format!("no downloadable files in {}", entry.hf_repo_id));
-    }
-
-    for filename in &filenames {
-        match &progress {
-            Some(tx) => {
-                let reporter = NdjsonProgress {
-                    tx: tx.clone(),
-                    filename: filename.clone(),
-                    total: 0,
-                    completed: 0,
-                };
-                repo.download_with_progress(filename, reporter)
-                    .await
-                    .map_err(|e| format!("download of {} failed: {}", filename, e))?;
-            }
-            None => {
-                repo.get(filename)
-                    .await
-                    .map_err(|e| format!("download of {} failed: {}", filename, e))?;
-            }
-        }
-    }
-
-    Ok(())
+    let sink: Option<crate::weights::ProgressSink> = progress.map(|tx| {
+        std::sync::Arc::new(move |p: crate::weights::WeightProgress| {
+            let _ = tx.send(progress_bytes(
+                format!("downloading {}", p.filename),
+                p.bytes_total,
+                p.bytes_done,
+            ));
+        }) as crate::weights::ProgressSink
+    });
+    crate::weights::fetch_model_files(entry, sink).await
 }
 
 /// Load a freshly pulled model into the running engine. The engine worker

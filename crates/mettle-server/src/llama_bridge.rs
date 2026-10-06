@@ -197,20 +197,27 @@ pub fn resolve_gguf_path(entry: &RegistryEntry) -> Result<PathBuf, String> {
             p.display()
         ));
     }
-    let filename = entry
-        .hf_quant_filename
-        .as_ref()
-        .ok_or_else(|| format!("model '{}' has no GGUF filename", entry.alias))?;
     let cache = hf_hub::Cache::from_env();
-    cache
-        .model(entry.hf_repo_id.clone())
-        .get(filename)
-        .ok_or_else(|| {
-            format!(
-                "GGUF '{}' for '{}' not in cache; pull it first",
-                filename, entry.alias
-            )
-        })
+    if let Some(filename) = &entry.hf_quant_filename {
+        if let Some(path) = cache.model(entry.hf_repo_id.clone()).get(filename) {
+            return Ok(path);
+        }
+    }
+    // Entries that name no quant file (user-defined GGUF entries, repos with
+    // a single quant) take whatever GGUF this repo already has in the cache.
+    if let Some(path) = crate::weights::cached_gguf(entry) {
+        return Ok(path);
+    }
+    Err(match &entry.hf_quant_filename {
+        Some(filename) => format!(
+            "GGUF '{}' for '{}' not in cache; pull it first",
+            filename, entry.alias
+        ),
+        None => format!(
+            "no GGUF for '{}' in the HF cache; pull it first",
+            entry.alias
+        ),
+    })
 }
 
 /// Resolve a vision entry's mmproj file: config-local path first, then the

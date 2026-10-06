@@ -649,6 +649,15 @@ impl ProfileManager {
             return;
         };
 
+        // First run: mettle owns its weights. Download anything the target
+        // profile pins that is not on disk yet, reporting progress through
+        // the readiness phase, before the planner tries to size it. On
+        // failure the phase is already `failed` with the failing model id.
+        if let Err(e) = self.ensure_profile_weights(&name).await {
+            tracing::error!("boot: cannot acquire weights for profile '{name}': {e}");
+            return;
+        }
+
         // Bounded retry with backoff (§1.4): another process holding VRAM
         // at boot is transient, so keep the phase `loading` for the window
         // and only report `failed` once it runs out.
@@ -697,6 +706,76 @@ impl ProfileManager {
             detail,
             ..Default::default()
         });
+    }
+
+    /// Acquire any weights the named profile pins that are not on disk yet,
+    /// one model at a time, reporting `downloading` progress (§1.1–§1.3 of
+    /// the first-run contract). Local-path entries are never downloaded: a
+    /// missing one stays the config error the activation path already
+    /// reports (§M6 decision).
+    async fn ensure_profile_weights(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        let Some(profile) = self.profile(name) else {
+            return Ok(());
+        };
+        let offline = self.config.server.offline;
+        let pinned: Vec<RegistryEntry> = {
+            let reg = match self.deps.registry.read() {
+                Ok(r) => r,
+                Err(_) => return Err("registry lock poisoned".into()),
+            };
+            profile
+                .slots
+                .iter()
+                .filter_map(|slot| reg.resolve(&slot.id).ok().cloned())
+                .collect()
+        };
+        for entry in pinned {
+            if crate::llama_bridge::resolve_gguf_path(&entry).is_ok() {
+                continue;
+            }
+            if entry.local_path.is_some() || !crate::weights::is_downloadable(&entry) {
+                continue;
+            }
+            let model = entry.alias.clone();
+            self.set_phase(Phase {
+                phase: "downloading",
+                model: Some(model.clone()),
+                ..Default::default()
+            });
+            let manager = Arc::clone(self);
+            let phase_model = model.clone();
+            let sink: crate::weights::ProgressSink =
+                Arc::new(move |p: crate::weights::WeightProgress| {
+                    manager.set_phase(Phase {
+                        phase: "downloading",
+                        model: Some(phase_model.clone()),
+                        bytes_done: Some(p.bytes_done),
+                        bytes_total: Some(p.bytes_total),
+                        ..Default::default()
+                    });
+                });
+            crate::weights::ensure_weights(&entry, offline, Some(sink))
+                .await
+                .map_err(|e| format!("{model}: {e}"))
+                .inspect_err(|e| {
+                    // The consumer wants to know WHICH model failed, not
+                    // which profile was booting.
+                    self.set_phase(Phase {
+                        phase: "failed",
+                        model: Some(model.clone()),
+                        error: Some(e.clone()),
+                        reason: Some(UnavailableReason::NotResident.as_str().to_string()),
+                        detail: Some(e.clone()),
+                        ..Default::default()
+                    });
+                })?;
+            self.set_phase(Phase {
+                phase: "loading",
+                model: Some(model),
+                ..Default::default()
+            });
+        }
+        Ok(())
     }
 
     fn ready_timeout(&self) -> Duration {

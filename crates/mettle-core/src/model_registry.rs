@@ -187,7 +187,7 @@ impl ModelRegistry {
                     "ggml-org/embeddinggemma-300M-GGUF",
                     Embedding {
                         pooling: Pooling::Mean,
-                        quant_filename: None,
+                        quant_filename: Some("embeddinggemma-300M-Q8_0.gguf".into()),
                     },
                     false,
                     "gemma",
