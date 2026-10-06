@@ -40,6 +40,30 @@ async fn main() {
         std::process::exit(tune::run(&config, output));
     }
 
+    // Bind BEFORE any model/CUDA work. A port clash must exit with code 98
+    // without a half-initialised CUDA context behind it: `std::process::exit`
+    // runs atexit handlers, and tearing one down while the loader threads are
+    // still live segfaults (observed: a clash reported 139, which docket's
+    // supervisor reads as a crash rather than "another engine holds the port",
+    // residency contract §1.6).
+    let addr = SocketAddr::new(
+        config.server.host.parse().expect("invalid host"),
+        config.server.port,
+    );
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::error!("port {} is already in use: {e}", addr.port());
+            eprintln!("mettled: port {} is already in use", addr.port());
+            std::process::exit(98);
+        }
+        Err(e) => {
+            tracing::error!("failed to bind {addr}: {e}");
+            eprintln!("mettled: failed to bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let app_state = Arc::new(state::AppState::new(config.clone()));
 
     // Load existing collections from disk on startup.
@@ -73,29 +97,8 @@ async fn main() {
     tokio::spawn(app_state.profiles.clone().boot_activate());
     tokio::spawn(app_state.profiles.clone().ttl_sweeper_loop());
 
-    let addr = SocketAddr::new(
-        config.server.host.parse().expect("invalid host"),
-        config.server.port,
-    );
-
     let router = app::build_router(app_state);
 
-    // Exit 98 (EADDRINUSE) is the contract's "another engine holds the
-    // port" signal (residency contract §1.6): docket maps it to `offline`
-    // and does not respawn, rather than treating it as a crash.
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            tracing::error!("port {} is already in use: {e}", addr.port());
-            eprintln!("mettled: port {} is already in use", addr.port());
-            std::process::exit(98);
-        }
-        Err(e) => {
-            tracing::error!("failed to bind {addr}: {e}");
-            eprintln!("mettled: failed to bind {addr}: {e}");
-            std::process::exit(1);
-        }
-    };
     tracing::info!(
         "engine listening on {} (Ollama /api/*, OpenAI /v1/*, Anthropic /v1/messages, OCR /v1/ocr)",
         addr
