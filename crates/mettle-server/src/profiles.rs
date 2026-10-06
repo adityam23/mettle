@@ -511,6 +511,13 @@ impl ProfileManager {
         if m.engine_version != STATE_ENGINE_VERSION || m.gguf_mtime_secs != mtime {
             return None;
         }
+        // A GPU-placed slot that allocated nothing recorded a 0 delta — a
+        // backend that silently stayed on CPU, or a state file written by
+        // another binary against the same model. Trusting it would admit the
+        // slot for free, so fall back to the header estimate instead.
+        if m.bytes == 0 {
+            return None;
+        }
         // Slope comes from the header when it is readable (measurements
         // don't change it); a measurement without a header projects flat.
         let kv_per_token = estimate_vram(&gguf, self.full_ctx(), self.kv_q8(), self.n_seq_max())
@@ -1428,7 +1435,20 @@ impl ProfileManager {
                             i128::from(mem_before.free_bytes) - i128::from(after.free_bytes);
                         u64::try_from(delta.max(0)).ok()
                     });
-                    if let (Some(bytes), Some(gguf)) = (measured, gguf_for_measure.as_ref()) {
+                    if measured == Some(0) {
+                        // A GPU-placed load that moved no free memory: the
+                        // backend did not allocate (CPU fallback inside the
+                        // engine, or a device that is not the one decoding).
+                        // Persisting a 0-byte cost would let the planner admit
+                        // this slot for free, so it is logged and dropped.
+                        tracing::warn!(
+                            "'{id}' loaded for the GPU but free device memory did not move; \
+                             not persisting a 0-byte measurement"
+                        );
+                    }
+                    if let (Some(bytes), Some(gguf)) =
+                        (measured.filter(|b| *b > 0), gguf_for_measure.as_ref())
+                    {
                         if let Some(mtime) = gguf_mtime_secs(gguf) {
                             if let Ok(mut store) = self.measured.lock() {
                                 store.insert(
@@ -2825,6 +2845,19 @@ mod tests {
             .get_mut("m1")
             .unwrap()
             .gguf_mtime_secs = mtime + 1;
+        assert!(fx.manager.measured_cost("m1", &entry).is_none());
+
+        // A 0-byte record (a GPU-placed load that allocated nothing) is
+        // ignored too: trusting it would admit the slot for free.
+        fx.manager.measured.lock().unwrap().insert(
+            "m1".into(),
+            MeasuredEntry {
+                bytes: 0,
+                ctx: 4096,
+                engine_version: STATE_ENGINE_VERSION.to_string(),
+                gguf_mtime_secs: mtime,
+            },
+        );
         assert!(fx.manager.measured_cost("m1", &entry).is_none());
     }
 
