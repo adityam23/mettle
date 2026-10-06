@@ -175,6 +175,11 @@ fn slot_error_response(err: SlotOpError) -> Response {
 // GET /engine/events — SSE, replaying the last 100 on connect
 // ---------------------------------------------------------------------------
 
+/// SSE keepalive interval. Contract with docket (QUESTIONS from docket Q6):
+/// consumers bound proxy-thread lifetime by it, so it is pinned here rather
+/// than inherited from axum's default.
+const EVENTS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub async fn events_handler(
     State(state): State<std::sync::Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -195,5 +200,5 @@ pub async fn events_handler(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(EVENTS_KEEPALIVE))
 }

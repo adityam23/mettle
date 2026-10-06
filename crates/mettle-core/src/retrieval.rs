@@ -175,6 +175,30 @@ pub struct CollectionStore {
     default_bit_width: usize,
 }
 
+/// Maximum collection-name length (bytes; the allowed charset is ASCII).
+const MAX_COLLECTION_NAME_LEN: usize = 128;
+
+/// Collection names become directory names under `<data_dir>/collections/`,
+/// so they are restricted to `[A-Za-z0-9._-]{1,128}` with no leading dot —
+/// no separators, no `..`, no hidden directories. Document ids are NOT
+/// constrained by this: they are only ever SQLite keys.
+pub fn validate_collection_name(name: &str) -> Result<(), CoreError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_COLLECTION_NAME_LEN
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidRequest(format!(
+            "invalid collection name '{name}': must match [A-Za-z0-9._-]{{1,{MAX_COLLECTION_NAME_LEN}}} \
+             and must not start with '.'"
+        )))
+    }
+}
+
 impl CollectionStore {
     pub fn new(data_dir: PathBuf, default_bit_width: usize) -> Self {
         Self {
@@ -195,6 +219,7 @@ impl CollectionStore {
         embedding_model: &str,
         dim: usize,
     ) -> Result<&Arc<Mutex<Collection>>, CoreError> {
+        validate_collection_name(name)?;
         if self.collections.contains_key(name) {
             return Err(CoreError::Conflict(format!(
                 "collection '{}' already exists",
@@ -221,8 +246,13 @@ impl CollectionStore {
         Ok(self.collections.get(name).unwrap())
     }
 
-    /// Delete a collection and its data.
+    /// Delete a collection and its data. Only names of loaded collections
+    /// are ever turned into a path, so an arbitrary (e.g. percent-decoded
+    /// `../..`) name can never reach `remove_dir_all`.
     pub fn delete(&mut self, name: &str) -> Result<(), CoreError> {
+        if !self.collections.contains_key(name) {
+            return Err(CoreError::CollectionNotFound(name.to_string()));
+        }
         let coll_dir = self.data_dir.join("collections").join(name);
         if coll_dir.exists() {
             std::fs::remove_dir_all(&coll_dir).map_err(|e| {
@@ -255,6 +285,10 @@ impl CollectionStore {
                 .map_err(|e| CoreError::Retrieval(format!("failed to read dir entry: {}", e)))?;
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().into_owned();
+                if let Err(e) = validate_collection_name(&name) {
+                    tracing::warn!("skipping collection directory: {e}");
+                    continue;
+                }
                 let coll = Collection::load(&name, &entry.path())?;
                 self.collections.insert(name, Arc::new(Mutex::new(coll)));
                 count += 1;

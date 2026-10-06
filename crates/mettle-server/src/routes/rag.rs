@@ -223,7 +223,7 @@ pub async fn delete_collection(
     match state.collections.lock() {
         Ok(mut store) => match store.delete(&name) {
             Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(e) => api_error(StatusCode::NOT_FOUND, e.to_string()).into_response(),
+            Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
         },
         Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
     }

@@ -805,3 +805,41 @@ async fn embeddings_rejects_reranker_with_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].is_string());
 }
+
+#[tokio::test]
+async fn collection_names_are_validated_and_never_reach_the_filesystem() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // A sibling directory a traversal would target.
+    let victim = tmp.path().join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    let data_dir = tmp.path().join("data");
+    let router = build_router(test_state(&data_dir));
+
+    for bad in ["../victim", ".hidden", "a/b", "", &"x".repeat(129)] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/collections",
+            Some(serde_json::json!({ "name": bad, "embedding_model": "embed-gemma:latest" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "name {bad:?}: {body}");
+    }
+
+    // Percent-encoded traversal in the path decodes to `../../victim`
+    // inside a single segment; it must be a 404, not a remove_dir_all.
+    let (status, _) = send(&router, "DELETE", "/v1/collections/..%2F..%2Fvictim", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&router, "DELETE", "/v1/collections/never-created", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(victim.exists(), "traversal deleted a directory outside the data dir");
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/v1/collections",
+        Some(serde_json::json!({ "name": "Fin_bench-2.0", "embedding_model": "embed-gemma:latest" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
