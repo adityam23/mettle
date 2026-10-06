@@ -28,7 +28,11 @@ fn port_clash_exits_98() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_mettled"))
         .env("METTLE_CONFIG", &config)
-        .env("RUST_LOG", "error")
+        // Hermetic: never read the operator's real collections dir. The
+        // `info` level is load-bearing - the ordering assertion below reads
+        // a startup log line, and `error` would suppress it.
+        .env("XDG_DATA_HOME", &dir)
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -53,6 +57,13 @@ fn port_clash_exits_98() {
         .expect("piped stderr")
         .read_to_string(&mut stderr)
         .unwrap();
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut stdout)
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!(
@@ -63,5 +74,13 @@ fn port_clash_exits_98() {
     assert!(
         stderr.contains("already in use"),
         "stderr should name the clash, got: {stderr}"
+    );
+    // Ordering, not just the code: `load_all` logs this unconditionally at
+    // startup, so its presence proves post-bind work ran before the bind
+    // (the ordering that segfaulted on a CUDA host behind `exit(98)`).
+    // Exit code and message alone stay green with the bind moved back.
+    assert!(
+        !stdout.contains("collections from disk"),
+        "startup work ran before the bind; stdout: {stdout}"
     );
 }

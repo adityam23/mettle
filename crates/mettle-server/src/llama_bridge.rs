@@ -202,6 +202,16 @@ pub fn resolve_gguf_path(entry: &RegistryEntry) -> Result<PathBuf, String> {
         if let Some(path) = cache.model(entry.hf_repo_id.clone()).get(filename) {
             return Ok(path);
         }
+        // A named file must resolve to THAT file. Falling through to
+        // "whatever GGUF this repo has" would silently substitute a
+        // different model: the gemma4 MTP drafter names
+        // `mtp-gemma-4-*` in the target's own repo, which no normal
+        // pull or first-run download ever fetches, so the substituted
+        // sibling is the target itself - wired as its own drafter.
+        return Err(format!(
+            "GGUF '{}' for '{}' not in cache; pull it first",
+            filename, entry.alias
+        ));
     }
     // Entries that name no quant file (user-defined GGUF entries, repos with
     // a single quant) take whatever GGUF this repo already has in the cache.

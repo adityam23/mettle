@@ -11,8 +11,9 @@
 //! and continues it with a `Range` request after a kill, verifying the sha
 //! before the file appears under its real name.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use mettle_core::model_registry::RegistryEntry;
 
@@ -144,6 +145,69 @@ pub fn cached_gguf(entry: &RegistryEntry) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Process-wide cap on concurrent mettle-originated downloads.
+///
+/// A pull storm (or a boot pass racing a pull) must not launch unbounded
+/// parallel multi-GB fetches; two keeps a link busy without trampling the
+/// cache disk.
+const MAX_CONCURRENT_DOWNLOADS: usize = 2;
+
+static DOWNLOAD_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+
+/// In-process per-file download locks, keyed by `(repo, filename)`.
+///
+/// hf-hub's own per-blob `flock` is non-blocking (five one-second retries,
+/// then `LockAcquisition`), so two mettle downloads of the same file race and
+/// the loser errors out after ~5s. Waiting here serialises them; the waiter
+/// then finds the file cached and skips the transfer.
+type FileLocks = Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+
+static FILE_LOCKS: LazyLock<FileLocks> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn file_lock(repo_id: &str, filename: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = FILE_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(
+        locks
+            .entry((repo_id.to_string(), filename.to_string()))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+/// Is `name` a plain relative path (no absolute root, no `..`/`.` component)?
+///
+/// Repo listings are remote input, and hf-hub's `symlink_or_rename` does not
+/// reject traversal, so anything else is dropped before it can reach the cache.
+fn is_safe_relative_path(name: &str) -> bool {
+    use std::path::Component;
+    let path = std::path::Path::new(name);
+    !name.is_empty()
+        && !path.is_absolute()
+        && path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Resolve `filename` in the local Hugging Face cache without any network I/O.
+///
+/// hf-hub's streaming path (`download_with_progress`) never consults the cache
+/// — it always fetches metadata and rewrites the blob — so the pull path
+/// checks here first and skips the transfer for files already on disk.
+fn cached_file(repo_id: &str, filename: &str) -> Option<PathBuf> {
+    hf_hub::Cache::from_env()
+        .model(repo_id.to_string())
+        .get(filename)
+}
+
+/// Report an already-cached file to the sink as a finished transfer, keeping
+/// the progress event sequence valid for NDJSON clients.
+fn report_cached(sink: &ProgressSink, filename: &str, path: &std::path::Path) {
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    sink(WeightProgress {
+        filename: filename.to_string(),
+        bytes_done: bytes,
+        bytes_total: bytes,
+    });
+}
+
 /// Download an entry's files into the standard Hugging Face cache, where the
 /// engine loader finds them. GGUF entries fetch the quantised file; entries
 /// without one fetch the full safetensors set.
@@ -151,6 +215,13 @@ pub async fn fetch_model_files(
     entry: &RegistryEntry,
     sink: Option<ProgressSink>,
 ) -> Result<(), String> {
+    // Bound concurrent downloads process-wide. Held for the whole entry, so
+    // the files of one entry occupy one download slot.
+    let _download_slot = DOWNLOAD_PERMITS
+        .acquire()
+        .await
+        .map_err(|e| format!("download limiter closed: {}", e))?;
+
     let api = hf_hub::api::tokio::ApiBuilder::from_env()
         .with_progress(false)
         .build()
@@ -163,7 +234,14 @@ pub async fn fetch_model_files(
             .info()
             .await
             .map_err(|e| format!("failed to fetch repo info for {}: {}", entry.hf_repo_id, e))?;
-        let listing: Vec<String> = info.siblings.into_iter().map(|s| s.rfilename).collect();
+        // Repo listings are remote input: drop anything that is not a plain
+        // relative path before it can reach the cache filesystem.
+        let listing: Vec<String> = info
+            .siblings
+            .into_iter()
+            .map(|s| s.rfilename)
+            .filter(|f| is_safe_relative_path(f))
+            .collect();
         // An entry that names no quant file (a user-defined GGUF entry, or a
         // repo with a single quant) still needs its weight file.
         match pick_gguf(&listing, &entry.metadata.quantization) {
@@ -186,6 +264,26 @@ pub async fn fetch_model_files(
     }
 
     for filename in &filenames {
+        // Cache-first: hf-hub's streaming path re-downloads even a fully
+        // cached file, so resolve it here and skip the network entirely.
+        if let Some(path) = cached_file(&entry.hf_repo_id, filename) {
+            if let Some(sink) = &sink {
+                report_cached(sink, filename, &path);
+            }
+            continue;
+        }
+
+        // Serialise with any other in-process download of this exact file,
+        // then re-check: the download we queued behind may have cached it.
+        let lock = file_lock(&entry.hf_repo_id, filename);
+        let _file_guard = lock.lock().await;
+        if let Some(path) = cached_file(&entry.hf_repo_id, filename) {
+            if let Some(sink) = &sink {
+                report_cached(sink, filename, &path);
+            }
+            continue;
+        }
+
         match &sink {
             Some(sink) => {
                 let reporter = SinkProgress::new(Arc::clone(sink), filename.clone());

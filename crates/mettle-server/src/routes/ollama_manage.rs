@@ -168,6 +168,42 @@ pub async fn pull_handler(
     }
 }
 
+/// Owns the detached download task and aborts it when the NDJSON stream is
+/// dropped by the client, so a disconnected pull stops instead of running to
+/// completion.
+///
+/// hf-hub's `.sync.part` file is left untouched, so an aborted download stays
+/// resumable, and a completed one still lands in the cache exactly as before.
+struct DownloadGuard {
+    handle: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl DownloadGuard {
+    fn new(handle: tokio::task::JoinHandle<Result<(), String>>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Await the task. The handle stays owned here while waiting, so dropping
+    /// this future (stream dropped mid-wait) still triggers the abort in
+    /// `Drop`.
+    async fn join(&mut self) -> Result<Result<(), String>, tokio::task::JoinError> {
+        match self.handle.as_mut() {
+            Some(handle) => handle.await,
+            None => Ok(Err("download task already finished".to_string())),
+        }
+    }
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 fn pull_stream(
     state: Arc<AppState>,
     entry: RegistryEntry,
@@ -176,10 +212,12 @@ fn pull_stream(
         yield Ok(progress(format!("pulling manifest for {}", entry.alias)));
 
         // Run downloads on a task, forwarding progress events as they arrive.
+        // The guard aborts that task if this stream is dropped.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PullProgress>();
         let dl_entry = entry.clone();
-        let mut download =
-            tokio::spawn(async move { download_model_files(&dl_entry, Some(tx)).await });
+        let mut download = DownloadGuard::new(tokio::spawn(async move {
+            download_model_files(&dl_entry, Some(tx)).await
+        }));
 
         loop {
             tokio::select! {
@@ -187,7 +225,7 @@ fn pull_stream(
                     Some(p) => yield Ok(p),
                     None => break, // downloads finished; join below
                 },
-                result = &mut download => {
+                result = download.join() => {
                     // Drain remaining progress, then handle the result.
                     while let Ok(p) = rx.try_recv() {
                         yield Ok(p);
@@ -209,7 +247,7 @@ fn pull_stream(
         }
 
         // Channel closed before the task completed (all progress drained).
-        match download.await {
+        match download.join().await {
             Ok(Ok(())) => {
                 yield Ok(progress("loading model"));
                 if let Err(e) = ensure_loaded(&state, &entry.alias).await {
@@ -230,6 +268,20 @@ async fn download_model_files(
     entry: &RegistryEntry,
     progress: Option<tokio::sync::mpsc::UnboundedSender<PullProgress>>,
 ) -> Result<(), String> {
+    // Boot-path gate parity (`weights::ensure_weights`): refuse anything the
+    // boot path would refuse, before any network call. A `[[model]]` entry
+    // with no built-in alias has the bare alias as its "repo" (nothing to
+    // fetch), and a non-GGUF builtin names no quantised file — pulling it
+    // would fetch a full safetensors set the GGUF engine cannot load.
+    if !crate::weights::is_downloadable(entry) {
+        let reason = if entry.local_path.is_some() {
+            "it is configured from a local path"
+        } else {
+            "it names no quantised GGUF file in its Hugging Face repo"
+        };
+        return Err(format!("model '{}' cannot be pulled: {}", entry.alias, reason));
+    }
+
     let sink: Option<crate::weights::ProgressSink> = progress.map(|tx| {
         std::sync::Arc::new(move |p: crate::weights::WeightProgress| {
             let _ = tx.send(progress_bytes(

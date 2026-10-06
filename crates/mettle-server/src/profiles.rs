@@ -733,7 +733,25 @@ impl ProfileManager {
             if crate::llama_bridge::resolve_gguf_path(&entry).is_ok() {
                 continue;
             }
-            if entry.local_path.is_some() || !crate::weights::is_downloadable(&entry) {
+            // Not downloadable: never a boot failure (other slots may cover
+            // the role), but never silent either - a slot pinned by the
+            // active profile that cannot be acquired is a config error and
+            // shows up as an unloaded slot in `/engine/status`.
+            if let Some(p) = &entry.local_path {
+                tracing::warn!(
+                    "profile '{name}': slot '{}' is not on disk and its configured local path '{}' does not exist",
+                    entry.alias,
+                    p.display()
+                );
+                continue;
+            }
+            if !crate::weights::is_downloadable(&entry) {
+                tracing::warn!(
+                    "profile '{name}': slot '{}' has no downloadable GGUF (repo '{}', no quant file); \
+                     skipping - configure a local path to serve it",
+                    entry.alias,
+                    entry.hf_repo_id
+                );
                 continue;
             }
             let model = entry.alias.clone();
@@ -1763,8 +1781,15 @@ impl ProfileManager {
     /// (residency contract §1.4). Live slot state decides `ready`; the
     /// tracked phase supplies what only boot knows (`loading` retries,
     /// `failed`, `downloading`). `engine_loaded` is the caller's view.
+    ///
+    /// `switching` is part of the gate (§1.4: ready is true only when "no
+    /// activation is in progress"): while a target profile is still loading,
+    /// the slots of the OUTGOING profile may all be resident and serving, so
+    /// `is_serving()` alone would advertise the model the caller is waiting
+    /// to replace. The phase then reads `loading`, which is what bounds the
+    /// poll (`Retry-After`).
     pub fn readiness(&self, engine_loaded: bool) -> (bool, serde_json::Value) {
-        let ready = engine_loaded && self.is_serving();
+        let ready = engine_loaded && !self.switching() && self.is_serving();
         let mut phase = self.phase.lock().map(|p| p.clone()).unwrap_or_default();
         match (ready, phase.phase) {
             (true, _) => phase.phase = "ready",
@@ -2412,6 +2437,26 @@ mod tests {
         assert_eq!(body["ready"], true);
         assert_eq!(body["phase"]["phase"], "ready");
         assert_eq!(body["phase"]["error"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn readiness_is_false_while_a_switch_is_in_flight() {
+        // §1.4: ready only when "no activation is in progress". The
+        // outgoing profile's slots stay resident while the target loads, so
+        // `is_serving()` alone advertises the model being replaced
+        // (observed live: 200 with the old profile, then a 503 on the
+        // target the caller had just switched to).
+        let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
+        fx.manager.clone().activate("p".into()).await.unwrap();
+        assert!(fx.manager.readiness(true).0);
+
+        fx.manager.switching.store(true, Ordering::SeqCst);
+        let (ready, body) = fx.manager.readiness(true);
+        assert!(!ready, "{body}");
+        assert_eq!(body["phase"]["phase"], "loading", "{body}");
+
+        fx.manager.switching.store(false, Ordering::SeqCst);
+        assert!(fx.manager.readiness(true).0, "cleared switch must re-ready");
     }
 
     #[tokio::test]
