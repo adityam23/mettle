@@ -155,19 +155,12 @@ impl AppState {
     // -- /v1 resolution (profiles contract §4) -------------------------------
 
     /// Structured unavailability for a registry-known model that is not
-    /// resident (dropped slot, TTL-evicted JIT slot, nothing activated).
-    /// The body shape is part of the profiles contract; consumers branch on
-    /// `code`/`missing`, so a generic message would hide the degradation.
-    fn unavailable_response(&self, id: &str) -> Response {
-        let mut resp = (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(self.profiles.slot_unavailable_payload(id)),
-        )
-            .into_response();
-        if let Ok(v) = HeaderValue::from_str("2") {
-            resp.headers_mut().insert(header::RETRY_AFTER, v);
-        }
-        resp
+    /// resident. The body shape is part of the profiles contract; consumers
+    /// branch on `code`/`reason`/`missing`.
+    fn unavailable_response(&self, id: &str, engine_loaded: bool) -> Response {
+        self.profiles
+            .unavailability(id, engine_loaded)
+            .into_response()
     }
 
     /// `/v1` engine handle: like [`Self::engine_for`], but not-resident is
@@ -178,9 +171,11 @@ impl AppState {
         let entry = self
             .resolve_model(id)
             .map_err(|e| api_error(StatusCode::NOT_FOUND, e.to_string()).into_response())?;
-        let engine = self.engine().ok_or_else(|| self.unavailable_response(id))?;
+        let engine = self
+            .engine()
+            .ok_or_else(|| self.unavailable_response(id, false))?;
         if !engine.loaded().iter().any(|a| a == &entry.alias) {
-            return Err(self.unavailable_response(id));
+            return Err(self.unavailable_response(id, true));
         }
         // Single touch point for the JIT TTL sweeper.
         self.profiles.touch(&entry.alias);

@@ -44,6 +44,7 @@ use mettle_llama::vram::estimate_vram;
 use crate::events::{EngineEvent, EventBus};
 use crate::llama_bridge;
 use crate::state::SharedEngine;
+use crate::unavailable::{Unavailable, UnavailableReason};
 
 /// Planner margin when `[engine] vram_margin_bytes` is unset: absorbs CUDA
 /// workspace/cuda-graph overhead the header estimate does not model plus
@@ -115,8 +116,19 @@ pub enum SlotState {
         shrunk: bool,
     },
     Failed {
+        cause: FailCause,
         reason: String,
     },
+}
+
+/// Why a slot ended up [`SlotState::Failed`]: the planner refused it for
+/// budget (`dropped_vram` on the wire) or the load itself could not happen
+/// (`load_failed`). Kept separate from the human-readable reason so the
+/// `/v1` unavailability payload never has to parse text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailCause {
+    Vram,
+    Load,
 }
 
 impl SlotState {
@@ -685,6 +697,27 @@ impl ProfileManager {
         }
 
         if let Some(reason) = refusal {
+            // Slots after the refused first one were never attempted; record
+            // the refusal on them so `/v1` reports why they are missing.
+            let first_cause = targets.first().and_then(|(_, first)| {
+                match self.inner.lock().ok()?.slots.get(&first.id) {
+                    Some(SlotState::Failed { cause, .. }) => Some(*cause),
+                    _ => None,
+                }
+            });
+            for (_, slot) in targets.iter().skip(1) {
+                let resident = matches!(
+                    self.inner.lock().ok().and_then(|i| i.slots.get(&slot.id).cloned()),
+                    Some(SlotState::Loaded { .. })
+                );
+                if !resident {
+                    self.fail_slot(
+                        &slot.id,
+                        first_cause.unwrap_or(FailCause::Load),
+                        &format!("not attempted: activation of '{name}' refused ({reason})"),
+                    );
+                }
+            }
             if let Ok(mut inner) = self.inner.lock() {
                 inner.dropped = profile.slots.iter().map(|s| s.id.clone()).collect();
                 inner.shrunk.clear();
@@ -737,7 +770,7 @@ impl ProfileManager {
 
         let Some(catalog) = self.catalog_entry(id) else {
             let reason = format!("model '{id}' is not in the catalog");
-            self.fail_slot(id, &reason);
+            self.fail_slot(id, FailCause::Load, &reason);
             return LadderOutcome::Dropped(reason);
         };
         let reg_entry = match self.deps.registry.read() {
@@ -747,7 +780,7 @@ impl ProfileManager {
         let reg_entry = match reg_entry {
             Ok(e) => e,
             Err(reason) => {
-                self.fail_slot(id, &reason);
+                self.fail_slot(id, FailCause::Load, &reason);
                 return LadderOutcome::Dropped(reason);
             }
         };
@@ -758,7 +791,7 @@ impl ProfileManager {
             let spec = match self.slot_spec(&reg_entry, Placement::Cpu, None) {
                 Ok(s) => s,
                 Err(reason) => {
-                    self.fail_slot(id, &reason);
+                    self.fail_slot(id, FailCause::Load, &reason);
                     return LadderOutcome::Dropped(reason);
                 }
             };
@@ -768,7 +801,7 @@ impl ProfileManager {
                     return LadderOutcome::Loaded { shrunk: false };
                 }
                 Err(reason) => {
-                    self.fail_slot(id, &reason);
+                    self.fail_slot(id, FailCause::Load, &reason);
                     return LadderOutcome::Dropped(reason);
                 }
             }
@@ -777,20 +810,20 @@ impl ProfileManager {
         // GPU path: budget = free − margin (fresh snapshot per slot).
         let Some(device) = self.device.as_ref() else {
             let reason = "no accelerator detected (GPU-or-refuse)".to_string();
-            self.fail_slot(id, &reason);
+            self.fail_slot(id, FailCause::Load, &reason);
             return LadderOutcome::Dropped(reason);
         };
         device.clear_cache();
         let Some(mem_before) = device.memory() else {
             let reason = "accelerator unreachable".to_string();
-            self.fail_slot(id, &reason);
+            self.fail_slot(id, FailCause::Load, &reason);
             return LadderOutcome::Dropped(reason);
         };
         let budget = mem_before.free_bytes.saturating_sub(self.margin_bytes());
 
         let Some(cost) = self.slot_cost(&reg_entry) else {
             let reason = format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
-            self.fail_slot(id, &reason);
+            self.fail_slot(id, FailCause::Load, &reason);
             return LadderOutcome::Dropped(reason);
         };
 
@@ -804,7 +837,7 @@ impl ProfileManager {
                 cost.at(self.full_ctx()),
                 budget
             );
-            self.fail_slot(id, &reason);
+            self.fail_slot(id, FailCause::Vram, &reason);
             return LadderOutcome::Dropped(reason);
         }
         for (rung_idx, ctx) in ctx_rungs(self.full_ctx(), catalog.min_ctx)
@@ -822,7 +855,7 @@ impl ProfileManager {
             let spec = match self.slot_spec(&reg_entry, Placement::Gpu, Some(ctx)) {
                 Ok(s) => s,
                 Err(reason) => {
-                    self.fail_slot(id, &reason);
+                    self.fail_slot(id, FailCause::Load, &reason);
                     return LadderOutcome::Dropped(reason);
                 }
             };
@@ -882,7 +915,7 @@ impl ProfileManager {
             cost.at(self.full_ctx()),
             budget
         );
-        self.fail_slot(id, &reason);
+        self.fail_slot(id, FailCause::Vram, &reason);
         LadderOutcome::Dropped(reason)
     }
 
@@ -909,10 +942,11 @@ impl ProfileManager {
             .emit(EngineEvent::SlotLoaded { id: id.to_string() });
     }
 
-    fn fail_slot(&self, id: &str, reason: &str) {
+    fn fail_slot(&self, id: &str, cause: FailCause, reason: &str) {
         self.set_slot(
             id,
             SlotState::Failed {
+                cause,
                 reason: reason.to_string(),
             },
         );
@@ -991,7 +1025,7 @@ impl ProfileManager {
                 Ok(())
             }
             Err(reason) => {
-                self.fail_slot(id, &reason);
+                self.fail_slot(id, FailCause::Load, &reason);
                 Err(SlotOpError::LoadFailed(reason))
             }
         }
@@ -1082,25 +1116,44 @@ impl ProfileManager {
 
     // -- /v1 structured unavailability ---------------------------------------
 
-    /// Wire payload for a registry-known model that cannot serve right now:
-    /// dropped/unloaded JIT slot, failed load, or nothing resident at all.
-    /// `profile_degraded` reflects whether the CURRENT session degraded a
-    /// profile (dropped/shrunk slots); consumers surface the reason instead
-    /// of retrying blindly.
-    pub fn slot_unavailable_payload(&self, id: &str) -> serde_json::Value {
-        let (dropped, shrunk) = self
+    /// Why `id` cannot serve right now, derived from its real slot state
+    /// (residency contract §1.5). `engine_loaded` is the caller's view of
+    /// whether any engine exists at all.
+    pub fn unavailability(&self, id: &str, engine_loaded: bool) -> Unavailable {
+        let (state, dropped, degraded) = self
             .inner
             .lock()
-            .map(|i| (i.dropped.clone(), i.shrunk.clone()))
-            .unwrap_or_default();
-        serde_json::json!({
-            "error": {
-                "code": "slot_unavailable",
-                "reason": "vram",
-                "profile_degraded": !dropped.is_empty() || !shrunk.is_empty(),
-                "missing": [id],
-            }
-        })
+            .map(|i| {
+                (
+                    i.slots.get(id).cloned(),
+                    i.dropped.iter().any(|d| d == id),
+                    !i.dropped.is_empty() || !i.shrunk.is_empty(),
+                )
+            })
+            .unwrap_or((None, false, false));
+        let (reason, detail) = match state {
+            _ if !engine_loaded => (UnavailableReason::NoEngine, None),
+            Some(SlotState::Loading) => (UnavailableReason::Loading, None),
+            Some(SlotState::Failed { cause, reason }) => (
+                match cause {
+                    FailCause::Vram => UnavailableReason::DroppedVram,
+                    FailCause::Load => UnavailableReason::LoadFailed,
+                },
+                Some(reason),
+            ),
+            // Unloaded but recorded as dropped: evicted by OOM recovery.
+            _ if dropped => (
+                UnavailableReason::DroppedVram,
+                Some(format!("'{id}' was evicted to recover from a CUDA out-of-memory error")),
+            ),
+            _ => (UnavailableReason::NotResident, None),
+        };
+        Unavailable {
+            id: id.to_string(),
+            reason,
+            detail,
+            profile_degraded: degraded,
+        }
     }
 
     /// VRAM footprint for `/v1/models`: a fresh measurement wins over the
@@ -1344,7 +1397,7 @@ impl ProfileManager {
                         *shrunk,
                         None,
                     ),
-                    Some(SlotState::Failed { reason }) => {
+                    Some(SlotState::Failed { reason, .. }) => {
                         ("failed", None, None, None, false, Some(reason.clone()))
                     }
                     Some(SlotState::Loading) => ("loading", None, None, None, false, None),
@@ -2023,17 +2076,52 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_payload_reports_degradation() {
+    fn unavailable_reason_follows_slot_state() {
+        use crate::unavailable::UnavailableReason as R;
         let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
-        let j = fx.manager.slot_unavailable_payload("m9");
+        let m = &fx.manager;
+        let reason = |id: &str, engine: bool| m.unavailability(id, engine).reason;
+
+        assert_eq!(reason("m9", true), R::NotResident);
+        assert_eq!(reason("m9", false), R::NoEngine, "no engine wins over slot state");
+
+        m.set_slot("m9", SlotState::Loading);
+        assert_eq!(reason("m9", true), R::Loading);
+
+        m.fail_slot("m9", FailCause::Vram, "needs 9 bytes, 1 free (no rung fits)");
+        let u = m.unavailability("m9", true);
+        assert_eq!(u.reason, R::DroppedVram);
+        assert_eq!(u.detail.as_deref(), Some("needs 9 bytes, 1 free (no rung fits)"));
+
+        m.fail_slot("m9", FailCause::Load, "bad gguf");
+        assert_eq!(reason("m9", true), R::LoadFailed);
+
+        // OOM eviction leaves the slot Unloaded but recorded as dropped.
+        m.set_slot("m9", SlotState::Unloaded);
+        m.inner.lock().unwrap().dropped.push("m9".into());
+        let u = m.unavailability("m9", true);
+        assert_eq!(u.reason, R::DroppedVram);
+        assert!(u.profile_degraded);
+
+        let j = u.payload();
         assert_eq!(j["error"]["code"], "slot_unavailable", "{j}");
-        assert_eq!(j["error"]["reason"], "vram");
+        assert_eq!(j["error"]["reason"], "dropped_vram");
         assert_eq!(j["error"]["missing"][0], "m9");
-        assert_eq!(j["error"]["profile_degraded"], false);
-        fx.manager.inner.lock().unwrap().dropped.push("m9".into());
-        assert_eq!(
-            fx.manager.slot_unavailable_payload("m9")["error"]["profile_degraded"],
-            true
+    }
+
+    #[tokio::test]
+    async fn refused_activation_marks_untried_slots_with_the_refusal() {
+        // 1 MiB free: the first slot cannot fit, so the whole profile is
+        // refused and the second slot is never attempted.
+        let fx = Fixture::build(&[("p", &["m1", "m2"])], MIB);
+        assert!(fx.manager.clone().activate("p".into()).await.is_err());
+        let first = fx.manager.unavailability("m1", true);
+        assert_eq!(first.reason, crate::unavailable::UnavailableReason::DroppedVram);
+        let second = fx.manager.unavailability("m2", true);
+        assert_eq!(second.reason, crate::unavailable::UnavailableReason::DroppedVram);
+        assert!(
+            second.detail.as_deref().unwrap_or("").contains("not attempted"),
+            "{second:?}"
         );
     }
 

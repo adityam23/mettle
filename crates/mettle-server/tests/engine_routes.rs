@@ -413,7 +413,7 @@ fn chat_request(model: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn v1_chat_for_unloaded_model_is_structured_503_with_retry_after() {
+async fn v1_chat_for_unloaded_model_is_structured_503() {
     let tmp = tempfile::TempDir::new().unwrap();
     let gguf = tmp.path().join("m1.gguf");
     write_synthetic_gguf(&gguf);
@@ -438,14 +438,14 @@ async fn v1_chat_for_unloaded_model_is_structured_503_with_retry_after() {
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        resp.headers().get("retry-after").is_some(),
-        "structured unavailability carries Retry-After"
-    );
+    // Only an in-flight load is retryable; a never-activated slot needs a
+    // consumer action, so no Retry-After (residency contract §1.5).
+    assert!(resp.headers().get("retry-after").is_none());
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["error"]["code"], "slot_unavailable", "{json}");
-    assert_eq!(json["error"]["reason"], "vram");
+    // No engine in this test state at all.
+    assert_eq!(json["error"]["reason"], "no_engine");
     assert_eq!(json["error"]["missing"][0], "m1");
     // Nothing degraded yet: no profile ever activated in this session.
     assert_eq!(json["error"]["profile_degraded"], false);
