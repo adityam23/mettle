@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use mettle_core::config::{KVCacheSetting, RootConfig, SpeculativeSetting};
 use mettle_core::engine::{GenConstraint, ModelKind, ModelLoadSpec, SamplingParams};
-use mettle_core::model_registry::{LoaderKind, ModelRegistry, RegistryEntry};
+use mettle_core::model_registry::{LoaderKind, ModelRegistry, RegistryEntry, WeightSource};
 use mettle_core::ollama_types::{FormatOption, TimingInfo};
 
 use mettle_llama::{LlamaConfig, SpecConfig};
@@ -188,61 +188,48 @@ pub fn resolve_mtp_drafter(
     registry.resolve(&drafter_alias).ok().cloned()
 }
 
-/// Resolve a registry entry to a local GGUF path: config-local path first,
-/// then the HF cache.
+/// Resolve a registry entry to a local GGUF path per its
+/// [`WeightSource`]: the configured path, else the HF cache. No network.
 pub fn resolve_gguf_path(entry: &RegistryEntry) -> Result<PathBuf, String> {
-    if let Some(p) = &entry.local_path {
-        if p.exists() {
-            return Ok(p.clone());
+    match entry.weight_source() {
+        WeightSource::Local(path) if path.exists() => Ok(path.to_path_buf()),
+        WeightSource::Local(path) => Err(crate::weights::WeightError::LocalPathMissing {
+            alias: entry.alias.clone(),
+            path: path.to_path_buf(),
         }
-        return Err(format!(
-            "model '{}' configured local path '{}' does not exist",
-            entry.alias,
-            p.display()
-        ));
-    }
-    let cache = hf_hub::Cache::from_env();
-    if let Some(filename) = &entry.hf_quant_filename {
-        if let Some(path) = cache.model(entry.hf_repo_id.clone()).get(filename) {
-            return Ok(path);
-        }
+        .to_string()),
         // A named file must resolve to THAT file. Falling through to
         // "whatever GGUF this repo has" would silently substitute a
-        // different model: the gemma4 MTP drafter names
-        // `mtp-gemma-4-*` in the target's own repo, which no normal
-        // pull or first-run download ever fetches, so the substituted
-        // sibling is the target itself - wired as its own drafter.
-        return Err(format!(
-            "GGUF '{}' for '{}' not in cache; pull it first",
-            filename, entry.alias
-        ));
+        // different model: the gemma4 MTP drafter names `mtp-gemma-4-*` in
+        // the target's own repo, which no normal pull or first-run download
+        // ever fetches, so the substituted sibling is the target itself -
+        // wired as its own drafter.
+        WeightSource::HfFile { repo, file } => {
+            crate::weights::cached_file(repo, file).ok_or_else(|| {
+                format!(
+                    "GGUF '{}' for '{}' not in cache; pull it first",
+                    file, entry.alias
+                )
+            })
+        }
+        // Entries that name no quant file (user-defined GGUF entries, repos
+        // with a single quant) take whatever GGUF this repo already has in
+        // the cache.
+        WeightSource::HfAnyGguf { repo } => {
+            crate::weights::cached_gguf(repo, &entry.metadata.quantization).ok_or_else(|| {
+                format!(
+                    "no GGUF for '{}' in the HF cache; pull it first",
+                    entry.alias
+                )
+            })
+        }
     }
-    // Entries that name no quant file (user-defined GGUF entries, repos with
-    // a single quant) take whatever GGUF this repo already has in the cache.
-    if let Some(path) = crate::weights::cached_gguf(entry) {
-        return Ok(path);
-    }
-    Err(match &entry.hf_quant_filename {
-        Some(filename) => format!(
-            "GGUF '{}' for '{}' not in cache; pull it first",
-            filename, entry.alias
-        ),
-        None => format!(
-            "no GGUF for '{}' in the HF cache; pull it first",
-            entry.alias
-        ),
-    })
 }
 
 /// Resolve a vision entry's mmproj file: config-local path first, then the
 /// HF cache (the cache may be cleared once models live in the repo).
 pub fn resolve_mmproj_path(entry: &RegistryEntry) -> Option<PathBuf> {
-    let LoaderKind::GgufVision {
-        mmproj_filename, ..
-    } = &entry.loader_kind
-    else {
-        return None;
-    };
+    let mmproj_filename = entry.mmproj_filename()?;
     if let Some(p) = &entry.mmproj_path {
         if p.exists() {
             return Some(p.clone());
@@ -253,9 +240,7 @@ pub fn resolve_mmproj_path(entry: &RegistryEntry) -> Option<PathBuf> {
             p.display()
         );
     }
-    hf_hub::Cache::from_env()
-        .model(entry.hf_repo_id.clone())
-        .get(mmproj_filename)
+    crate::weights::cached_file(&entry.hf_repo_id, mmproj_filename)
 }
 
 /// Map a registry entry to a load spec; hard error when the GGUF is not
