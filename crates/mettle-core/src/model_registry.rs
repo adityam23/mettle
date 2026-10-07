@@ -83,6 +83,25 @@ pub struct RegistryEntry {
     pub embedding_dim: Option<usize>,
 }
 
+impl RegistryEntry {
+    /// True for embedding-only models (the only kind a collection can use).
+    pub fn is_embedding(&self) -> bool {
+        matches!(self.loader_kind, LoaderKind::Embedding { .. })
+    }
+
+    /// The registry-declared vector dimension of an embedding model: the
+    /// fallback for sizing a collection when the GGUF header (the
+    /// authoritative source) is not readable. `None` for non-embeddings and
+    /// for embedders without a declared dim.
+    pub fn declared_embedding_dim(&self) -> Option<usize> {
+        if self.is_embedding() {
+            self.embedding_dim
+        } else {
+            None
+        }
+    }
+}
+
 /// The model registry holds built-in aliases (Gemma 4 family) and
 /// user-supplied overrides. It resolves Ollama-style `model:tag` names
 /// to Hugging Face repos.
@@ -499,22 +518,66 @@ impl ModelRegistry {
             .find(|e| matches!(e.loader_kind, LoaderKind::GgufVision { .. }))
             .map(|e| e.alias.clone())
     }
-    /// The embedding dimension for an embedding-model alias, used to size a
-    /// collection's turbovec index to the real model. Falls back to the
-    /// declared dim (built-in embedders) when the entry is `Embedding`-kind
-    /// but has no declared dim. `None` for unknown aliases / non-embeddings.
-    pub fn embedding_dim_for(&self, alias: &str) -> Option<usize> {
-        let entry = self.entries.get(alias)?;
-        match entry.loader_kind {
-            LoaderKind::Embedding { .. } => entry.embedding_dim,
-            _ => None,
+
+    /// The registry default alias for `role` when `name` asks for it: an
+    /// empty name or the literal `"default"`. `None` means `name` is an
+    /// explicit model id the caller resolves itself. This is the one place
+    /// the "empty or `default` means the registry default" rule lives.
+    pub fn default_alias_for(&self, name: &str, role: DefaultRole) -> Option<&str> {
+        if !name.is_empty() && name != "default" {
+            return None;
         }
+        let entry = match role {
+            DefaultRole::Embedding => self.default_embedding(),
+            DefaultRole::Rerank => self.default_rerank(),
+        };
+        Some(entry.alias.as_str())
     }
+}
+
+/// Which registry default an empty / `"default"` model name selects
+/// ([`ModelRegistry::default_alias_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultRole {
+    Embedding,
+    Rerank,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_alias_for_only_maps_empty_and_default() {
+        let reg = ModelRegistry::new();
+        for name in ["", "default"] {
+            assert_eq!(
+                reg.default_alias_for(name, DefaultRole::Embedding),
+                Some(reg.default_embedding().alias.as_str())
+            );
+            assert_eq!(
+                reg.default_alias_for(name, DefaultRole::Rerank),
+                Some(reg.default_rerank().alias.as_str())
+            );
+        }
+        assert_eq!(
+            reg.default_alias_for("bge-m3", DefaultRole::Embedding),
+            None
+        );
+        assert_eq!(reg.default_alias_for("Default", DefaultRole::Rerank), None);
+    }
+
+    #[test]
+    fn declared_embedding_dim_is_embedder_only() {
+        let reg = ModelRegistry::new();
+        let embedder = reg.default_embedding();
+        assert!(embedder.is_embedding());
+        assert_eq!(embedder.declared_embedding_dim(), embedder.embedding_dim);
+        assert!(embedder.declared_embedding_dim().is_some());
+        let chat = reg.resolve("gemma4:e4b").unwrap();
+        assert!(!chat.is_embedding());
+        assert_eq!(chat.declared_embedding_dim(), None);
+    }
 
     #[test]
     fn resolve_exact_match() {

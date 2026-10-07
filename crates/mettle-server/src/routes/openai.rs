@@ -15,6 +15,7 @@ use mettle_core::engine::{
     RerankError, SamplingParams,
 };
 use mettle_core::hooks::RequestCtx;
+use mettle_core::model_registry::DefaultRole;
 use mettle_core::ollama_types::{ChatMessage, OneOrMany};
 use mettle_core::openai_types::{
     ChatChoice, ChatChunkChoice, ChatCompletionChunk, ChatCompletionRequest,
@@ -470,17 +471,15 @@ pub async fn rerank_handler(
     // Adoption contract §1.4: empty or "default" model resolves to the
     // registry's default rerank alias (qwen3-reranker-0.6b:latest); explicit
     // ids and "role:rerank" keep their existing paths.
-    let model_id = if req.model.is_empty() || req.model == "default" {
-        match state.registry.read() {
-            Ok(r) => r.default_rerank().alias.clone(),
-            Err(_) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
-                    .into_response()
-            }
+    let default_alias = match state.registry.read() {
+        Ok(r) => r
+            .default_alias_for(&req.model, DefaultRole::Rerank)
+            .map(str::to_owned),
+        Err(_) => {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
         }
-    } else {
-        state.profiles.resolve_alias(&req.model)
     };
+    let model_id = default_alias.unwrap_or_else(|| state.profiles.resolve_alias(&req.model));
     let entry = match state.resolve_model(&model_id) {
         Ok(v) => v,
         Err(e) => {
