@@ -505,19 +505,18 @@ impl Collection {
         let chunks = chunk_document(doc, chunk_tokens, chunk_overlap);
         let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let embeddings = embed_fn(&chunk_texts)?;
-        self.add_document_chunks(doc, &chunks, &embeddings)
+        self.add_document_chunks(doc, &chunks, embeddings)
     }
 
-    /// Insert a pre-chunked, pre-embedded document. This is the path the
-    /// server uses so embedding can happen asynchronously (no collection
-    /// lock held across `.await`).
+    /// Insert one pre-chunked, pre-embedded document: a one-document
+    /// [`Self::add_documents_chunks`].
     pub fn add_document_chunks(
         &mut self,
         doc: &Document,
         chunks: &[Chunk],
-        embeddings: &[f32],
+        embeddings: Vec<f32>,
     ) -> Result<Vec<String>, CoreError> {
-        let per_doc = self.add_documents_chunks(&[(doc.clone(), chunks.to_vec())], embeddings)?;
+        let per_doc = self.add_documents_chunks(&[(doc, chunks)], embeddings)?;
         Ok(per_doc.into_iter().next().unwrap_or_default())
     }
 
@@ -528,22 +527,19 @@ impl Collection {
     /// transaction, one caller-side flush.
     ///
     /// `embeddings` is the flat `[f32; total_chunks * dim]` array for every
-    /// document in `docs`, in order. Chunk-less documents write nothing and
-    /// come back with an empty id list.
+    /// document in `docs`, in order; it is normalised in place, hence taken
+    /// by value. Chunk-less documents write nothing and come back with an
+    /// empty id list.
     pub fn add_documents_chunks(
         &mut self,
-        docs: &[(Document, Vec<Chunk>)],
-        embeddings: &[f32],
+        docs: &[(&Document, &[Chunk])],
+        mut embeddings: Vec<f32>,
     ) -> Result<Vec<Vec<String>>, CoreError> {
         let db_path = self.data_dir.join("metadata.db");
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
 
-        let total_chunks: usize = docs
-            .iter()
-            .filter(|(_, chunks)| !chunks.is_empty())
-            .map(|(_, chunks)| chunks.len())
-            .sum();
+        let total_chunks: usize = docs.iter().map(|(_, chunks)| chunks.len()).sum();
         if total_chunks == 0 {
             return Ok(docs.iter().map(|_| Vec::new()).collect());
         }
@@ -569,6 +565,9 @@ impl Collection {
         // appears twice in the batch, fails the whole batch before a single
         // row is written.
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut exists_stmt = conn
+            .prepare_cached("SELECT COUNT(*) > 0 FROM documents WHERE id = ?1")
+            .map_err(|e| CoreError::Retrieval(format!("sqlite prepare: {}", e)))?;
         for (doc, _) in docs {
             if !seen.insert(doc.id.as_str()) {
                 return Err(CoreError::Conflict(format!(
@@ -576,12 +575,8 @@ impl Collection {
                     doc.id
                 )));
             }
-            let existing: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM documents WHERE id = ?1",
-                    [&doc.id],
-                    |row| row.get(0),
-                )
+            let existing: bool = exists_stmt
+                .query_row([&doc.id], |row| row.get(0))
                 .unwrap_or(false);
             if existing {
                 return Err(CoreError::Conflict(format!(
@@ -590,12 +585,12 @@ impl Collection {
                 )));
             }
         }
+        drop(exists_stmt);
 
         // turbovec scores estimate the inner product <v, q>; the served models
         // emit unnormalized embeddings, so normalize here — dense ranking must
         // be cosine or long high-norm chunks dominate regardless of similarity.
-        let mut normalized = embeddings.to_vec();
-        for row in normalized.chunks_exact_mut(self.dim) {
+        for row in embeddings.chunks_exact_mut(self.dim) {
             l2_normalize(row);
         }
 
@@ -603,9 +598,6 @@ impl Collection {
         // vector in ONE turbovec insert, then commit. Any failure before the
         // commit rolls the rows back (the transaction drops) and a failed
         // commit removes the vectors again — no half-written batch survives.
-        // One index write per batch is also what makes a ~1000-document
-        // ingest feasible: the single-document path rewrites the whole
-        // index.bin on every call.
         let base_id = self.next_int_id;
         let int_ids: Vec<u64> = (base_id..base_id + total_chunks as u64).collect();
 
@@ -614,51 +606,60 @@ impl Collection {
             .map_err(|e| CoreError::Retrieval(format!("sqlite begin: {}", e)))?;
 
         let mut per_doc = Vec::with_capacity(docs.len());
-        let mut next_int = 0usize;
-        for (doc, chunks) in docs {
-            // A chunk-less document writes no row at all (single-path parity).
-            if chunks.is_empty() {
-                per_doc.push(Vec::new());
-                continue;
-            }
-            tx.execute(
-                "INSERT INTO documents (id, metadata_json) VALUES (?1, ?2)",
-                rusqlite::params![
-                    doc.id,
-                    serde_json::to_string(&doc.metadata).unwrap_or_default()
-                ],
-            )
-            .map_err(|e| CoreError::Retrieval(format!("sqlite insert document: {}", e)))?;
+        {
+            let prepare = |sql: &str| {
+                tx.prepare_cached(sql)
+                    .map_err(|e| CoreError::Retrieval(format!("sqlite prepare: {}", e)))
+            };
+            let mut insert_doc =
+                prepare("INSERT INTO documents (id, metadata_json) VALUES (?1, ?2)")?;
+            let mut insert_chunk = prepare(
+                "INSERT INTO chunks (id, int_id, document_id, text, char_offset) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            let mut insert_fts =
+                prepare("INSERT INTO chunks_fts (chunk_id, text) VALUES (?1, ?2)")?;
 
-            let mut chunk_ids = Vec::with_capacity(chunks.len());
-            for (i, chunk) in chunks.iter().enumerate() {
-                let chunk_id = format!("{}/chunk/{}", doc.id, i);
-                tx.execute(
-                    "INSERT INTO chunks (id, int_id, document_id, text, char_offset) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        chunk_id,
-                        int_ids[next_int] as i64,
+            let mut next_int = 0usize;
+            for (doc, chunks) in docs {
+                // A chunk-less document writes no row at all (single-path parity).
+                if chunks.is_empty() {
+                    per_doc.push(Vec::new());
+                    continue;
+                }
+                insert_doc
+                    .execute(rusqlite::params![
                         doc.id,
-                        chunk.text,
-                        chunk.char_offset as i64,
-                    ],
-                )
-                .map_err(|e| CoreError::Retrieval(format!("sqlite insert chunk: {}", e)))?;
+                        serde_json::to_string(&doc.metadata).unwrap_or_default()
+                    ])
+                    .map_err(|e| CoreError::Retrieval(format!("sqlite insert document: {}", e)))?;
 
-                tx.execute(
-                    "INSERT INTO chunks_fts (chunk_id, text) VALUES (?1, ?2)",
-                    rusqlite::params![chunk_id, chunk.text],
-                )
-                .map_err(|e| CoreError::Retrieval(format!("sqlite fts insert: {}", e)))?;
+                let mut chunk_ids = Vec::with_capacity(chunks.len());
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let chunk_id = format!("{}/chunk/{}", doc.id, i);
+                    insert_chunk
+                        .execute(rusqlite::params![
+                            chunk_id,
+                            int_ids[next_int] as i64,
+                            doc.id,
+                            chunk.text,
+                            chunk.char_offset as i64,
+                        ])
+                        .map_err(|e| CoreError::Retrieval(format!("sqlite insert chunk: {}", e)))?;
 
-                chunk_ids.push(chunk_id);
-                next_int += 1;
+                    insert_fts
+                        .execute(rusqlite::params![chunk_id, chunk.text])
+                        .map_err(|e| CoreError::Retrieval(format!("sqlite fts insert: {}", e)))?;
+
+                    chunk_ids.push(chunk_id);
+                    next_int += 1;
+                }
+                per_doc.push(chunk_ids);
             }
-            per_doc.push(chunk_ids);
         }
 
         self.index
-            .add_with_ids(&normalized, &int_ids)
+            .add_with_ids(&embeddings, &int_ids)
             .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
 
         // The rows above are normalised, so stamp the collection inside the

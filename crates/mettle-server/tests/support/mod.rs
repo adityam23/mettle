@@ -1,5 +1,6 @@
 //! Shared fixtures for the HTTP integration tests.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mettle_core::engine::{
@@ -17,6 +18,8 @@ pub struct FakeEmbedder {
     /// `(alias, detail)` for a reranker whose per-call context "does not
     /// fit" — drives the §1.1 `rerank_context_vram` refusal.
     rerank_vram_refusal: Arc<Mutex<Option<(String, String)>>>,
+    /// Embedding requests received (one per input text).
+    embed_calls: Arc<AtomicUsize>,
 }
 
 impl FakeEmbedder {
@@ -29,6 +32,8 @@ impl FakeEmbedder {
         let worker_resident = Arc::clone(&resident);
         let refusal: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
         let worker_refusal = Arc::clone(&refusal);
+        let embed_calls = Arc::new(AtomicUsize::new(0));
+        let worker_embed_calls = Arc::clone(&embed_calls);
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let dim = worker_resident
@@ -51,10 +56,15 @@ impl FakeEmbedder {
                             }
                         }
                     }
-                    RequestKind::Embedding { input } => match dim {
-                        Some(dim) => EngineResponse::Embeddings(bag_of_words(input, dim)),
-                        None => EngineResponse::Error(format!("model {} is not loaded", req.model)),
-                    },
+                    RequestKind::Embedding { input } => {
+                        worker_embed_calls.fetch_add(1, Ordering::SeqCst);
+                        match dim {
+                            Some(dim) => EngineResponse::Embeddings(bag_of_words(input, dim)),
+                            None => {
+                                EngineResponse::Error(format!("model {} is not loaded", req.model))
+                            }
+                        }
+                    }
                     _ => EngineResponse::Error("fake embedder only embeds".into()),
                 };
                 let _ = req.response.send(reply).await;
@@ -64,7 +74,13 @@ impl FakeEmbedder {
             tx,
             resident,
             rerank_vram_refusal: refusal,
+            embed_calls,
         })
+    }
+
+    /// Embedding requests received so far (one per input text).
+    pub fn embed_calls(&self) -> usize {
+        self.embed_calls.load(Ordering::SeqCst)
     }
 
     pub fn unload(&self, alias: &str) {
