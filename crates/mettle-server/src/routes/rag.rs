@@ -300,7 +300,7 @@ pub async fn reindex_collection(
     }
 
     let (chunks, documents) = with_collection(&handle, move |collection| {
-        collection.rebuild_index(&vectors, &int_ids)?;
+        collection.rebuild_index(vectors, &int_ids)?;
         let documents = collection.list_documents()?.len();
         Ok::<_, CoreError>((collection.len(), documents))
     })
@@ -399,7 +399,19 @@ async fn parse_ingest_request(
                         .is_some_and(|f| f.to_lowercase().ends_with(".pdf"))
                         || bytes.starts_with(b"%PDF-");
                     let text = if is_pdf {
-                        pdf_extract::extract_text_from_mem(&bytes).map_err(|e| {
+                        // CPU-bound and unbounded in page count: keep it off
+                        // the async executor.
+                        tokio::task::spawn_blocking(move || {
+                            pdf_extract::extract_text_from_mem(&bytes)
+                        })
+                        .await
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("PDF extraction task failed: {e}"),
+                            )
+                        })?
+                        .map_err(|e| {
                             (
                                 StatusCode::BAD_REQUEST,
                                 format!("PDF text extraction failed: {}", e),

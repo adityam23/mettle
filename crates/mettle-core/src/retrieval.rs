@@ -1131,7 +1131,11 @@ impl Collection {
     ///
     /// Errors — without touching the live index — if `int_ids` is not exactly
     /// the stored chunk set or the vector count is not `int_ids.len() * dim`.
-    pub fn rebuild_index(&mut self, vectors: &[f32], int_ids: &[u64]) -> Result<(), CoreError> {
+    pub fn rebuild_index(
+        &mut self,
+        mut vectors: Vec<f32>,
+        int_ids: &[u64],
+    ) -> Result<(), CoreError> {
         let db_path = self.data_dir.join("metadata.db");
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
@@ -1174,16 +1178,15 @@ impl Collection {
             )));
         }
 
-        // Same normalisation the insert path applies.
-        let mut normalized = vectors.to_vec();
-        for row in normalized.chunks_exact_mut(self.dim) {
+        // Same normalisation the insert path applies, in place.
+        for row in vectors.chunks_exact_mut(self.dim) {
             l2_normalize(row);
         }
 
         let mut rebuilt = IdMapIndex::new(self.dim, self.bit_width)
             .map_err(|e| CoreError::Retrieval(format!("failed to create turbovec index: {}", e)))?;
         rebuilt
-            .add_with_ids(&normalized, int_ids)
+            .add_with_ids(&vectors, int_ids)
             .map_err(|e| CoreError::Retrieval(format!("turbovec add failed: {}", e)))?;
 
         // Every fallible build step has succeeded; only now overwrite the
@@ -1823,7 +1826,7 @@ mod tests {
         let stored = legacy.texts_for_reindex().unwrap();
         let ids: Vec<u64> = stored.iter().map(|(id, _)| *id).collect();
         let vectors = vec![3.0f32; stored.len() * 16];
-        legacy.rebuild_index(&vectors, &ids).unwrap();
+        legacy.rebuild_index(vectors.clone(), &ids).unwrap();
         assert!(
             !legacy.needs_reindex(),
             "rebuild_index repairs the collection"
@@ -1920,7 +1923,7 @@ mod tests {
         for (row, (int_id, _)) in stored.iter().enumerate() {
             vectors[row * 16 + *int_id as usize] = 1.0;
         }
-        coll.rebuild_index(&vectors, &int_ids).unwrap();
+        coll.rebuild_index(vectors.clone(), &int_ids).unwrap();
 
         assert_eq!(coll.len(), int_ids.len(), "len() == int_ids.len()");
         assert!(!coll.needs_reindex());
@@ -1997,7 +2000,7 @@ mod tests {
 
         // Wrong float count for the given id set.
         let err = coll
-            .rebuild_index(&vec![0.9f32; ids.len() * 16 - 1], &ids)
+            .rebuild_index(vec![0.9f32; ids.len() * 16 - 1], &ids)
             .unwrap_err();
         assert!(matches!(err, CoreError::Retrieval(_)), "got {err:?}");
 
@@ -2005,14 +2008,14 @@ mod tests {
         let mut extra = ids.clone();
         extra.push(9999);
         assert!(
-            coll.rebuild_index(&vec![0.9f32; extra.len() * 16], &extra)
+            coll.rebuild_index(vec![0.9f32; extra.len() * 16], &extra)
                 .is_err(),
             "an unknown int_id must be rejected"
         );
 
         // A stored chunk left out.
         assert!(
-            coll.rebuild_index(&vec![0.9f32; (ids.len() - 1) * 16], &ids[..ids.len() - 1])
+            coll.rebuild_index(vec![0.9f32; (ids.len() - 1) * 16], &ids[..ids.len() - 1])
                 .is_err(),
             "a missing int_id must be rejected"
         );
@@ -2021,7 +2024,7 @@ mod tests {
         let mut dup = ids.clone();
         dup[0] = dup[1];
         assert!(
-            coll.rebuild_index(&vec![0.9f32; dup.len() * 16], &dup)
+            coll.rebuild_index(vec![0.9f32; dup.len() * 16], &dup)
                 .is_err(),
             "a duplicated int_id must be rejected"
         );
