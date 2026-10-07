@@ -368,7 +368,7 @@ impl FitInputs {
     fn read(self) -> Option<SlotGeometry> {
         let header = estimate_vram(&self.gguf, self.full_ctx, self.kv_q8, self.n_seq_max);
         let rerank = if self.rerank {
-            mettle_llama::vram::rerank_geometry(&self.gguf, self.kv_q8)
+            mettle_llama::vram::rerank_geometry(&self.gguf)
         } else {
             None
         };

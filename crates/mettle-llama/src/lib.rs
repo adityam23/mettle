@@ -434,7 +434,7 @@ fn load_runtime(
             // Rerank preflight coefficients (§1.1); only meaningful when the
             // context will hold GPU buffers.
             let rerank_geometry = (matches!(kind, ModelKind::Rerank) && op_offload)
-                .then(|| vram::rerank_geometry(&spec.gguf_path, cfg.kv_cache_q8))
+                .then(|| vram::rerank_geometry(&spec.gguf_path))
                 .flatten();
             return Ok(ModelRuntime {
                 sched: None,

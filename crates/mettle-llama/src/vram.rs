@@ -293,10 +293,12 @@ impl RerankGeometry {
 }
 
 impl RerankGeometry {
-    /// [`rerank_cap_cost`] over already-read coefficients: pure arithmetic,
-    /// so a planner walking several cap rungs parses the header once. A
-    /// full pass at the cap with the greedy fill's nominal (roughly even)
-    /// sequence lengths.
+    /// Worst-case per-call cost a rerank slot must budget at admission for
+    /// a packed-token cap of `cap_tokens` under a `micro_batch`-sequence
+    /// shape: a full pass at the cap with the greedy fill's nominal (roughly
+    /// even) sequence lengths. Pure arithmetic over already-read
+    /// coefficients, so a planner walking several cap rungs parses the
+    /// header once; the per-call preflight re-checks the real shape.
     pub fn cap_cost(&self, cap_tokens: usize, micro_batch: usize) -> RerankContextCost {
         let cap = cap_tokens.max(1);
         let n_seqs = micro_batch.max(1).min(cap);
@@ -317,28 +319,18 @@ impl RerankContextCost {
     }
 }
 
-/// Read the rerank-context cost coefficients for `gguf`.
-pub fn rerank_geometry(gguf: &Path, kv_q8: bool) -> Option<RerankGeometry> {
+/// Read the rerank-context cost coefficients for `gguf`. KV is always
+/// costed at f16: rerank/embed contexts (`embed_ctx_params`) never set a KV
+/// type, so `[engine] kv_cache = "fp8"` does not apply to them — pricing
+/// it at q8 would under-budget the per-call KV by ~2x.
+pub fn rerank_geometry(gguf: &Path) -> Option<RerankGeometry> {
     let ctx = GgufContext::from_file(gguf)?;
-    let g = geometry(&ctx, kv_q8)?;
+    let g = geometry(&ctx, false)?;
     Some(RerankGeometry {
         base_bytes: COMPUTE_BASE_BYTES,
         compute_bytes_per_token: RERANK_COMPUTE_BYTES_PER_TOKEN_AT_1024 * g.n_embd / 1024,
         kv_bytes_per_token: g.kv_bytes_per_token,
     })
-}
-
-/// Worst-case-per-call cost a rerank slot must budget at admission for a
-/// packed-token cap of `cap_tokens` under a `micro_batch`-sequence shape:
-/// a full pass at the cap with the greedy fill's nominal (roughly even)
-/// sequence lengths. The per-call preflight re-checks the real geometry.
-pub fn rerank_cap_cost(
-    gguf: &Path,
-    cap_tokens: usize,
-    micro_batch: usize,
-    kv_q8: bool,
-) -> Option<RerankContextCost> {
-    rerank_geometry(gguf, kv_q8).map(|g| g.cap_cost(cap_tokens, micro_batch))
 }
 
 #[cfg(test)]
@@ -404,6 +396,20 @@ mod tests {
         assert_eq!(est.kv_bytes_per_token, 36 * (128 + 128) * 8 * 2);
         let total = est.total_bytes(8192);
         assert!(total > file_len + 73_728 * 8192);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rerank_kv_is_costed_at_f16_even_under_fp8_kv() {
+        // Rerank contexts never set a KV type, so they allocate f16 KV no
+        // matter what `[engine] kv_cache` says; the budget must match.
+        let dir = std::env::temp_dir().join("mettle-vram-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synthetic-rerank-kv.gguf");
+        write_synthetic_gguf(&path, "qwen3");
+        let f16 = estimate_vram(&path, 4096, false, 16).unwrap();
+        let g = rerank_geometry(&path).unwrap();
+        assert_eq!(g.kv_bytes_per_token, f16.kv_bytes_per_token);
         std::fs::remove_file(&path).ok();
     }
 
