@@ -216,6 +216,18 @@ impl RerankGeometry {
     }
 }
 
+impl RerankGeometry {
+    /// [`rerank_cap_cost`] over already-read coefficients: pure arithmetic,
+    /// so a planner walking several cap rungs parses the header once.
+    pub fn cap_cost(&self, cap_tokens: usize, micro_batch: usize) -> RerankContextCost {
+        let cap = cap_tokens.max(1);
+        let n_seqs = micro_batch.max(1).min(cap);
+        let max_len = cap.div_ceil(n_seqs);
+        let kv_cells = max_len.div_ceil(256) * 256 * n_seqs;
+        self.cost(kv_cells, cap)
+    }
+}
+
 /// Estimated cost of one rerank call's context (residency contract §1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RerankContextCost {
@@ -250,11 +262,7 @@ pub fn rerank_cap_cost(
     micro_batch: usize,
     kv_q8: bool,
 ) -> Option<RerankContextCost> {
-    let cap = cap_tokens.max(1);
-    let n_seqs = micro_batch.max(1).min(cap);
-    let max_len = cap.div_ceil(n_seqs);
-    let kv_cells = max_len.div_ceil(256) * 256 * n_seqs;
-    rerank_geometry(gguf, kv_q8).map(|g| g.cost(kv_cells, cap))
+    rerank_geometry(gguf, kv_q8).map(|g| g.cap_cost(cap_tokens, micro_batch))
 }
 
 #[cfg(test)]
