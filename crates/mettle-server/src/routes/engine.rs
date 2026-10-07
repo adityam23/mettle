@@ -6,7 +6,7 @@
 use std::convert::Infallible;
 
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -16,13 +16,23 @@ use serde_json::json;
 
 use crate::profiles::SlotOpError;
 use crate::state::AppState;
+use crate::unavailable::{with_retry_after, UnavailableReason};
 
 // ---------------------------------------------------------------------------
 // GET /engine/profiles — definitions + active + fit preview
 // ---------------------------------------------------------------------------
 
 pub async fn profiles_handler(State(state): State<std::sync::Arc<AppState>>) -> Response {
-    Json(state.profiles.profiles_view()).into_response()
+    // The fit preview parses GGUF headers: keep it off the executor.
+    let profiles = std::sync::Arc::clone(&state.profiles);
+    match tokio::task::spawn_blocking(move || profiles.profiles_view()).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => crate::routes::error::api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("profiles view failed: {e}"),
+        )
+        .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,30 +83,23 @@ pub async fn activate_handler(
 /// consumer that only polls this endpoint can still render the phase
 /// (residency contract §1.4, amendment).
 pub async fn status_handler(State(state): State<std::sync::Arc<AppState>>) -> Response {
-    let engine_loaded = state.engine().is_some();
-    Json(state.profiles.status(engine_loaded)).into_response()
+    Json(state.profiles.status()).into_response()
 }
 
 /// `GET /engine/ready` — the single readiness gate. 200 when the engine
 /// can serve the active profile, 503 with the same `{ready, phase}` body
 /// otherwise. A 404 means the engine predates this endpoint.
 pub async fn ready_handler(State(state): State<std::sync::Arc<AppState>>) -> Response {
-    let engine_loaded = state.engine().is_some();
-    let (ready, body) = state.profiles.readiness(engine_loaded);
-    let loading = body["phase"]["phase"] == "loading";
-    let status = if ready {
+    let readiness = state.profiles.readiness();
+    let status = if readiness.ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let mut resp = (status, Json(body)).into_response();
     // Only an in-flight `loading` is worth an automatic retry; a `failed`
     // phase needs an operator action first (§1.5 semantics).
-    if !ready && loading {
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
-    }
-    resp
+    let retry_after = readiness.retry_after();
+    with_retry_after((status, Json(readiness)).into_response(), retry_after)
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +169,7 @@ fn slot_error_response(err: SlotOpError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "switch_in_progress",
             Some("a profile activation is in flight"),
-            Some("2"),
+            UnavailableReason::Loading.retry_after(),
         ),
         SlotOpError::Vram(reason) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -185,17 +188,12 @@ fn slot_error_response(err: SlotOpError) -> Response {
         }
     };
 
-    let mut response = (
+    let response = (
         status,
         Json(json!({ "error": { "code": code, "reason": reason } })),
     )
         .into_response();
-    if let Some(secs) = retry_after {
-        if let Ok(value) = header::HeaderValue::from_str(secs) {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-    }
-    response
+    with_retry_after(response, retry_after)
 }
 
 // ---------------------------------------------------------------------------

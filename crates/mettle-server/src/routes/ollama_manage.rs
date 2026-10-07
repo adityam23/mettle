@@ -308,12 +308,6 @@ async fn ensure_loaded(state: &Arc<AppState>, alias: &str) -> Result<(), String>
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-
-    if let Ok(mut loaded) = state.loaded_models.lock() {
-        if !loaded.iter().any(|a| a == alias) {
-            loaded.push(alias.to_string());
-        }
-    }
     Ok(())
 }
 
@@ -344,9 +338,6 @@ pub async fn delete_handler(
         if let Err(e) = engine.remove_model(&removed.alias) {
             tracing::debug!("engine remove_model: {}", e);
         }
-    }
-    if let Ok(mut loaded) = state.loaded_models.lock() {
-        loaded.retain(|a| a != &removed.alias);
     }
 
     // Remove cached weights if no other registry entry references the repo.

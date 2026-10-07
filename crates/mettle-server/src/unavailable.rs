@@ -12,8 +12,10 @@ use axum::Json;
 /// Seconds a consumer should wait before retrying a `loading` slot.
 const LOADING_RETRY_AFTER_SECS: &str = "2";
 
-/// Why a registry-known model cannot serve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a registry-known model cannot serve. Serialises to the wire
+/// strings of [`Self::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     /// Known model, not in the active profile, never JIT-loaded.
     NotResident,
@@ -41,9 +43,11 @@ impl UnavailableReason {
         }
     }
 
+    /// `Retry-After` seconds — the one retry policy for every surface
+    /// (`slot_unavailable` 503s, `/engine/ready`, switch-in-progress).
     /// Only an in-flight load is worth an automatic retry; every other
     /// reason needs an operator or consumer action first.
-    fn retry_after(self) -> Option<&'static str> {
+    pub fn retry_after(self) -> Option<&'static str> {
         matches!(self, Self::Loading).then_some(LOADING_RETRY_AFTER_SECS)
     }
 }
@@ -64,7 +68,7 @@ impl Unavailable {
         serde_json::json!({
             "error": {
                 "code": "slot_unavailable",
-                "reason": self.reason.as_str(),
+                "reason": self.reason,
                 "detail": self.detail,
                 "profile_degraded": self.profile_degraded,
                 "missing": [self.id],
@@ -76,11 +80,16 @@ impl Unavailable {
 impl IntoResponse for Unavailable {
     fn into_response(self) -> Response {
         let retry_after = self.reason.retry_after();
-        let mut resp = (StatusCode::SERVICE_UNAVAILABLE, Json(self.payload())).into_response();
-        if let Some(secs) = retry_after {
-            resp.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static(secs));
-        }
-        resp
+        let resp = (StatusCode::SERVICE_UNAVAILABLE, Json(self.payload())).into_response();
+        with_retry_after(resp, retry_after)
     }
+}
+
+/// Stamp `Retry-After` on `resp` when the policy asked for one.
+pub fn with_retry_after(mut resp: Response, secs: Option<&'static str>) -> Response {
+    if let Some(secs) = secs {
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static(secs));
+    }
+    resp
 }

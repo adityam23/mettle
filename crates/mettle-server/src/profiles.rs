@@ -94,7 +94,6 @@ fn parse_role(s: &str) -> Option<ModelRole> {
 pub struct ProfileDeps {
     pub engine: Arc<std::sync::RwLock<Option<SharedEngine>>>,
     pub registry: Arc<std::sync::RwLock<ModelRegistry>>,
-    pub loaded_models: Arc<Mutex<Vec<String>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +138,15 @@ pub enum FailCause {
     Load,
 }
 
+impl From<FailCause> for UnavailableReason {
+    fn from(cause: FailCause) -> Self {
+        match cause {
+            FailCause::Vram => Self::DroppedVram,
+            FailCause::Load => Self::LoadFailed,
+        }
+    }
+}
+
 impl SlotState {
     /// Wire label for `/engine/status` (`loading/loaded/unloaded/failed`).
     pub fn label(&self) -> &'static str {
@@ -151,36 +159,120 @@ impl SlotState {
     }
 }
 
-/// Readiness phase rendered by `/engine/status` and `/engine/ready`
-/// (residency contract §1.4, merged with the first-run surface contract).
-/// `phase` is a closed set; the rest carry whatever that phase knows.
-#[derive(Debug, Clone, serde::Serialize)]
+/// Closed readiness phase set (residency contract §1.4, first-run surface
+/// contract). Serialises to the lowercase wire strings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseKind {
+    Downloading,
+    #[default]
+    Loading,
+    Failed,
+    Ready,
+}
+
+/// Readiness phase rendered by `/engine/status` and `/engine/ready`.
+/// The rest of the fields carry whatever that phase knows.
+#[derive(Debug, Clone, Default)]
 pub struct Phase {
-    /// `downloading` | `loading` | `failed` | `ready`.
-    pub phase: &'static str,
+    pub phase: PhaseKind,
     /// Model the phase is about (the boot target, or the download in flight).
     pub model: Option<String>,
     pub bytes_done: Option<u64>,
     pub bytes_total: Option<u64>,
-    /// Error text for `failed`.
-    pub error: Option<String>,
     /// Closed reason for `failed` (`dropped_vram` / `load_failed` / …).
-    pub reason: Option<String>,
-    /// Human-readable cause paired with `reason`.
+    pub reason: Option<UnavailableReason>,
+    /// Human-readable cause paired with `reason` (or `retry N` while
+    /// loading).
     pub detail: Option<String>,
 }
 
-impl Default for Phase {
-    fn default() -> Self {
+impl Phase {
+    pub fn loading(model: Option<String>) -> Self {
         Self {
-            phase: "loading",
-            model: None,
-            bytes_done: None,
-            bytes_total: None,
-            error: None,
-            reason: None,
-            detail: None,
+            model,
+            ..Default::default()
         }
+    }
+
+    pub fn ready() -> Self {
+        Self {
+            phase: PhaseKind::Ready,
+            ..Default::default()
+        }
+    }
+
+    /// `progress` is `(bytes_done, bytes_total)` once the download reports.
+    pub fn downloading(model: String, progress: Option<(u64, u64)>) -> Self {
+        Self {
+            phase: PhaseKind::Downloading,
+            model: Some(model),
+            bytes_done: progress.map(|(done, _)| done),
+            bytes_total: progress.map(|(_, total)| total),
+            ..Default::default()
+        }
+    }
+
+    pub fn failed(
+        model: Option<String>,
+        reason: Option<UnavailableReason>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            phase: PhaseKind::Failed,
+            model,
+            reason,
+            detail,
+            ..Default::default()
+        }
+    }
+}
+
+impl serde::Serialize for Phase {
+    /// Wire shape: the struct plus `error`, which consumers render for a
+    /// `failed` phase — it is the `detail` text of that phase, derived here
+    /// so the two can never drift. Fields are declared in the (sorted)
+    /// order the JSON has always carried.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Wire<'a> {
+            bytes_done: Option<u64>,
+            bytes_total: Option<u64>,
+            detail: Option<&'a str>,
+            error: Option<&'a str>,
+            model: Option<&'a str>,
+            phase: PhaseKind,
+            reason: Option<UnavailableReason>,
+        }
+        let detail = self.detail.as_deref();
+        Wire {
+            bytes_done: self.bytes_done,
+            bytes_total: self.bytes_total,
+            detail,
+            error: detail.filter(|_| self.phase == PhaseKind::Failed),
+            model: self.model.as_deref(),
+            phase: self.phase,
+            reason: self.reason,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// The readiness gate shared by `/engine/ready` and `/engine/status`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Readiness {
+    pub phase: Phase,
+    pub ready: bool,
+}
+
+impl Readiness {
+    /// `Retry-After` for a not-ready gate: only an in-flight `loading` is
+    /// worth an automatic retry, with the same policy as a `loading` slot.
+    pub fn retry_after(&self) -> Option<&'static str> {
+        if self.ready || self.phase.phase != PhaseKind::Loading {
+            return None;
+        }
+        UnavailableReason::Loading.retry_after()
     }
 }
 
@@ -252,6 +344,160 @@ fn ctx_rungs(full: u32, min_ctx: Option<u32>) -> Vec<u32> {
     rungs
 }
 
+/// Disk-facing inputs of a slot's fit model, resolved by
+/// [`ProfileManager::fit_inputs`]. Owned so [`Self::read`] can move to a
+/// blocking thread.
+struct FitInputs {
+    gguf: PathBuf,
+    mmproj: Option<PathBuf>,
+    /// Drafter GGUF and whether it rides as MTP (own full-size KV → scales
+    /// with the target's ctx) rather than as a standard drafter.
+    drafter: Option<(PathBuf, bool)>,
+    /// Fresh persisted measurement, when one exists.
+    measured: Option<MeasuredEntry>,
+    /// Rerank slot: its KV is per-call, budgeted by the packed-token cap.
+    rerank: bool,
+    full_ctx: u32,
+    kv_q8: bool,
+    n_seq_max: usize,
+}
+
+impl FitInputs {
+    /// Parse the GGUF header(s) once (blocking I/O). `None` when the
+    /// header is unreadable and no measurement can stand in for it.
+    fn read(self) -> Option<SlotGeometry> {
+        let header = estimate_vram(&self.gguf, self.full_ctx, self.kv_q8, self.n_seq_max);
+        let rerank = if self.rerank {
+            mettle_llama::vram::rerank_geometry(&self.gguf, self.kv_q8)
+        } else {
+            None
+        };
+        let (resident, flat) = match self.measured {
+            // A measurement anchors the cost at its own ctx; the slope comes
+            // from the header when it is readable (measurements don't change
+            // it) and a measurement without a header projects flat.
+            Some(m) => {
+                let kv_per_token = header.map(|e| e.kv_bytes_per_token).unwrap_or(0);
+                let resident = SlotCost {
+                    anchor_bytes: m.bytes,
+                    anchor_ctx: m.ctx,
+                    kv_per_token,
+                };
+                (
+                    resident,
+                    SlotCost {
+                        kv_per_token: 0,
+                        ..resident
+                    },
+                )
+            }
+            // Header estimate: weights + mmproj + drafters + compute, plus
+            // the KV slope.
+            None => {
+                let est = header?;
+                let mut anchor = est.weights_bytes + est.compute_bytes;
+                let mut slope = est.kv_bytes_per_token;
+                if let Some(mmproj) = &self.mmproj {
+                    anchor += std::fs::metadata(mmproj).map(|m| m.len()).unwrap_or(0);
+                }
+                if let Some((draft_gguf, mtp)) = &self.drafter {
+                    if let Some(d_est) =
+                        estimate_vram(draft_gguf, self.full_ctx, self.kv_q8, self.n_seq_max)
+                    {
+                        anchor += d_est.weights_bytes + d_est.compute_bytes;
+                        if *mtp {
+                            slope += d_est.kv_bytes_per_token;
+                        } else {
+                            // standard drafter: short-context KV, treat as constant
+                            anchor += d_est.kv_bytes_per_token * 1024;
+                        }
+                    }
+                }
+                let resident = SlotCost {
+                    anchor_bytes: anchor + slope * u64::from(self.full_ctx),
+                    anchor_ctx: self.full_ctx,
+                    kv_per_token: slope,
+                };
+                let flat = SlotCost {
+                    anchor_bytes: anchor,
+                    anchor_ctx: self.full_ctx,
+                    kv_per_token: 0,
+                };
+                (resident, flat)
+            }
+        };
+        Some(SlotGeometry {
+            gguf: self.gguf,
+            resident,
+            flat,
+            rerank,
+        })
+    }
+}
+
+/// A slot's fit model, read once per slot: every ladder rung's cost is
+/// arithmetic over it ([`Self::cost`]).
+struct SlotGeometry {
+    /// The GGUF the geometry was read from (keys persisted measurements).
+    gguf: PathBuf,
+    /// Cost of a slot holding a resident, ctx-scaled KV.
+    resident: SlotCost,
+    /// `resident` without the ctx slope: what a rerank slot holds besides
+    /// its per-call context.
+    flat: SlotCost,
+    /// Rerank-context coefficients (rerank slots with a readable header).
+    rerank: Option<mettle_llama::vram::RerankGeometry>,
+}
+
+impl SlotGeometry {
+    /// Cost with an optional rerank packed-token cap. §1.1: a rerank slot's
+    /// KV lives in the per-call context, not in a resident cache, so it is
+    /// charged its flat cost plus ONE capped context — never the full-ctx
+    /// slope on top (that double-charged the qwen3 reranker by ~900 MiB).
+    /// `None` when a cap is asked for but the rerank geometry is unknown.
+    fn cost(&self, rerank_cap: Option<usize>) -> Option<SlotCost> {
+        let Some(cap) = rerank_cap else {
+            return Some(self.resident);
+        };
+        let per_call = self
+            .rerank?
+            .cap_cost(cap, mettle_llama::RERANK_MICRO_BATCH)
+            .total();
+        Some(SlotCost {
+            anchor_bytes: self.flat.anchor_bytes.saturating_add(per_call),
+            ..self.flat
+        })
+    }
+}
+
+/// Profile slots highest priority first; unprioritized slots follow, and
+/// declaration order breaks ties (stable sort — config.rs documents the
+/// semantics).
+fn by_priority(profile: &ProfileConfig) -> Vec<&ProfileSlot> {
+    let mut slots: Vec<&ProfileSlot> = profile.slots.iter().collect();
+    slots.sort_by_key(|s| s.priority.unwrap_or(u32::MAX));
+    slots
+}
+
+/// Degradation of the outcome profile (`profile.degraded` on the wire),
+/// derived from live slot state by [`ProfileManager::degradation`].
+#[derive(Debug, Default, serde::Serialize)]
+struct Degradation {
+    /// Slots given up on (dropped by the planner, refused, OOM-evicted).
+    dropped: Vec<String>,
+    /// Slots loaded below full context (or a lowered rerank cap).
+    shrunk: Vec<String>,
+    /// `auto` slots running on CPU because the GPU could not hold them.
+    demoted: Vec<String>,
+}
+
+impl Degradation {
+    /// Whether the profile lost capability (dropped or shrunk a slot).
+    fn profile_degraded(&self) -> bool {
+        !self.dropped.is_empty() || !self.shrunk.is_empty()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
@@ -260,10 +506,10 @@ fn ctx_rungs(full: u32, min_ctx: Option<u32>) -> Vec<u32> {
 struct Inner {
     active: Option<String>,
     slots: HashMap<String, SlotState>,
-    dropped: Vec<String>,
-    shrunk: Vec<String>,
-    /// `auto` slots running on CPU because the GPU could not hold them.
-    demoted: Vec<String>,
+    /// Profile whose last activation outcome (committed or refused) the
+    /// degradation view describes. Its dropped/shrunk/demoted slots are
+    /// derived from `slots`, never stored twice.
+    outcome: Option<String>,
 }
 
 pub struct ProfileManager {
@@ -303,13 +549,7 @@ impl ProfileManager {
             config,
             events,
             device,
-            inner: Mutex::new(Inner {
-                active: None,
-                slots: HashMap::new(),
-                dropped: Vec::new(),
-                shrunk: Vec::new(),
-                demoted: Vec::new(),
-            }),
+            inner: Mutex::new(Inner::default()),
             measured: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
             last_used: Mutex::new(HashMap::new()),
@@ -444,68 +684,34 @@ impl ProfileManager {
         rungs
     }
 
-    /// Header-derived fit model for a slot (weights + mmproj + drafters +
-    /// KV slope + compute heuristic + a rerank slot's per-call context).
-    /// `None` when the GGUF is unreadable or lacks geometry keys — the slot
-    /// is then unloadable (GPU-or-refuse cannot verify fit).
-    fn estimate_cost(
-        &self,
-        reg_entry: &RegistryEntry,
-        rerank_cap: Option<usize>,
-    ) -> Option<SlotCost> {
+    /// Everything the fit model needs from config, registry and the state
+    /// cache for one slot — cheap path resolution only, so the header parse
+    /// ([`FitInputs::read`]) can run on a blocking thread. `None` when the
+    /// GGUF does not resolve (the slot is then unloadable: GPU-or-refuse
+    /// cannot verify fit).
+    fn fit_inputs(&self, reg_entry: &RegistryEntry) -> Option<FitInputs> {
         let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
-        let est = estimate_vram(&gguf, self.full_ctx(), self.kv_q8(), self.n_seq_max())?;
-
-        let mut anchor = est.weights_bytes + est.compute_bytes;
-        let mut slope = est.kv_bytes_per_token;
-        if let Some(mmproj) = llama_bridge::resolve_mmproj_path(reg_entry) {
-            anchor += std::fs::metadata(mmproj).map(|m| m.len()).unwrap_or(0);
-        }
-        if let Some(wiring) = self.draft_wiring(reg_entry) {
-            if let Some(d_est) = estimate_vram(
-                &wiring.gguf_path,
-                self.full_ctx(),
-                self.kv_q8(),
-                self.n_seq_max(),
-            ) {
-                anchor += d_est.weights_bytes + d_est.compute_bytes;
-                if self.wiring_is_mtp(reg_entry, &wiring) {
-                    slope += d_est.kv_bytes_per_token;
-                } else {
-                    // standard drafter: short-context KV, treat as constant
-                    anchor += d_est.kv_bytes_per_token * 1024;
-                }
-            }
-        }
-
-        // §1.1: a rerank slot's KV lives in the per-call context, not in a
-        // resident cache — budget that context at the packed-token cap and
-        // drop the ctx-projected slope (its resident memory is weights +
-        // compute only).
-        if let Some(cap) = rerank_cap {
-            let per_call = mettle_llama::vram::rerank_cap_cost(
-                &gguf,
-                cap,
-                mettle_llama::RERANK_MICRO_BATCH,
-                self.kv_q8(),
-            )?;
-            anchor += per_call.total();
-            slope = 0;
-        }
-
-        Some(SlotCost {
-            anchor_bytes: anchor + slope * u64::from(self.full_ctx()),
-            anchor_ctx: self.full_ctx(),
-            kv_per_token: slope,
+        let measured = self.fresh_measurement(&reg_entry.alias, &gguf);
+        let drafter = self.draft_wiring(reg_entry).map(|wiring| {
+            let mtp = self.wiring_is_mtp(reg_entry, &wiring);
+            (wiring.gguf_path, mtp)
+        });
+        Some(FitInputs {
+            mmproj: llama_bridge::resolve_mmproj_path(reg_entry),
+            gguf,
+            drafter,
+            measured,
+            rerank: self.rerank_cap(reg_entry).is_some(),
+            full_ctx: self.full_ctx(),
+            kv_q8: self.kv_q8(),
+            n_seq_max: self.n_seq_max(),
         })
     }
 
-    /// Fresh persisted measurement for this exact binary + file, projected
-    /// through the header KV slope. `None` = stale/absent → use the header
-    /// estimate.
-    fn measured_cost(&self, id: &str, reg_entry: &RegistryEntry) -> Option<SlotCost> {
-        let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
-        let mtime = gguf_mtime_secs(&gguf)?;
+    /// Persisted measurement for this exact binary + file, or `None`
+    /// (stale/absent → the planner uses the header estimate).
+    fn fresh_measurement(&self, id: &str, gguf: &Path) -> Option<MeasuredEntry> {
+        let mtime = gguf_mtime_secs(gguf)?;
         let measured = self.measured.lock().ok()?;
         let m = measured.get(id)?;
         if m.engine_version != STATE_ENGINE_VERSION || m.gguf_mtime_secs != mtime {
@@ -518,46 +724,23 @@ impl ProfileManager {
         if m.bytes == 0 {
             return None;
         }
-        // Slope comes from the header when it is readable (measurements
-        // don't change it); a measurement without a header projects flat.
-        let kv_per_token = estimate_vram(&gguf, self.full_ctx(), self.kv_q8(), self.n_seq_max())
-            .map(|e| e.kv_bytes_per_token)
-            .unwrap_or(0);
-        Some(SlotCost {
-            anchor_bytes: m.bytes,
-            anchor_ctx: m.ctx,
-            kv_per_token,
-        })
+        Some(m.clone())
     }
 
-    fn slot_cost(&self, reg_entry: &RegistryEntry, rerank_cap: Option<usize>) -> Option<SlotCost> {
-        match self.measured_cost(&reg_entry.alias, reg_entry) {
-            // A measurement sees the resident delta at load; a rerank slot's
-            // per-call context is created per call, so the cap cost must be
-            // added here. The cached measurement carries no ctx-projected
-            // slope for a rerank slot (`kv_per_token = 0`).
-            Some(mut cost) => {
-                if let Some(cap) = rerank_cap {
-                    let gguf = llama_bridge::resolve_gguf_path(reg_entry).ok()?;
-                    let per_call = mettle_llama::vram::rerank_cap_cost(
-                        &gguf,
-                        cap,
-                        mettle_llama::RERANK_MICRO_BATCH,
-                        self.kv_q8(),
-                    )?;
-                    cost.anchor_bytes = cost.anchor_bytes.saturating_add(per_call.total());
-                    cost.kv_per_token = 0;
-                }
-                Some(cost)
-            }
-            // Header estimate: cap-aware, so the rerank slot is charged
-            // weights + compute + ONE capped context and never the resident
-            // full-ctx KV it does not hold (§1.1). Passing the cap here (and
-            // not adding it again) is what keeps the planner honest: the
-            // full-ctx slope on top of the cap double-charged the slot by
-            // `kv_per_token * full_ctx` — ~900 MiB on the qwen3 reranker.
-            None => self.estimate_cost(reg_entry, rerank_cap),
-        }
+    /// Fit geometry for one slot, parsed on the calling thread. Async
+    /// callers use [`Self::slot_geometry_blocking`] instead.
+    fn slot_geometry(&self, reg_entry: &RegistryEntry) -> Option<SlotGeometry> {
+        self.fit_inputs(reg_entry)?.read()
+    }
+
+    /// [`Self::slot_geometry`] with the GGUF header parse (several MB of
+    /// tokenizer tables) moved off the async executor.
+    async fn slot_geometry_blocking(&self, reg_entry: &RegistryEntry) -> Option<SlotGeometry> {
+        let inputs = self.fit_inputs(reg_entry)?;
+        tokio::task::spawn_blocking(move || inputs.read())
+            .await
+            .ok()
+            .flatten()
     }
 
     // -- engine plumbing ----------------------------------------------------
@@ -586,24 +769,36 @@ impl ProfileManager {
             .map_err(|e| format!("unload task panicked: {e}"))?
     }
 
-    fn remember_loaded(&self, alias: &str) {
-        if let Ok(mut l) = self.deps.loaded_models.lock() {
-            if !l.iter().any(|a| a == alias) {
-                l.push(alias.to_string());
-            }
-        }
-    }
-
-    fn remember_unloaded(&self, alias: &str) {
-        if let Ok(mut l) = self.deps.loaded_models.lock() {
-            l.retain(|a| a != alias);
-        }
+    /// Whether any engine is installed (the `no_engine` / readiness gate).
+    fn engine_loaded(&self) -> bool {
+        self.deps
+            .engine
+            .read()
+            .map(|e| e.is_some())
+            .unwrap_or(false)
     }
 
     fn set_slot(&self, id: &str, state: SlotState) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.slots.insert(id.to_string(), state);
         }
+    }
+
+    /// Snapshot of one slot's state (`None` = never touched).
+    fn slot_state(&self, id: &str) -> Option<SlotState> {
+        self.inner.lock().ok()?.slots.get(id).cloned()
+    }
+
+    fn is_loaded(&self, id: &str) -> bool {
+        matches!(self.slot_state(id), Some(SlotState::Loaded(_)))
+    }
+
+    /// Loaded, or a load in flight.
+    fn is_resident(&self, id: &str) -> bool {
+        matches!(
+            self.slot_state(id),
+            Some(SlotState::Loaded(_) | SlotState::Loading)
+        )
     }
 
     /// Build the full load instruction for one slot: placement-forced
@@ -662,13 +857,11 @@ impl ProfileManager {
         };
         let Some(name) = target else {
             tracing::info!("no active profile persisted; engine idles until one is activated");
-            self.set_phase(Phase {
-                phase: "failed",
-                reason: Some(UnavailableReason::NotResident.as_str().to_string()),
-                detail: Some("no profile configured to activate".into()),
-                error: Some("no profile configured to activate".into()),
-                ..Default::default()
-            });
+            self.set_phase(Phase::failed(
+                None,
+                Some(UnavailableReason::NotResident),
+                Some("no profile configured to activate".into()),
+            ));
             return;
         };
 
@@ -711,10 +904,8 @@ impl ProfileManager {
             }
             attempt += 1;
             self.set_phase(Phase {
-                phase: "loading",
-                model: Some(name.clone()),
                 detail: (attempt > 1).then(|| format!("retry {attempt}")),
-                ..Default::default()
+                ..Phase::loading(Some(name.clone()))
             });
             tracing::info!("boot: activating profile '{name}' (attempt {attempt})");
             if let Err(e) = Arc::clone(&self).activate_inner(name.clone(), true).await {
@@ -732,10 +923,7 @@ impl ProfileManager {
             }
             last_gen = Some(now_gen);
             if self.is_serving() {
-                self.set_phase(Phase {
-                    phase: "ready",
-                    ..Default::default()
-                });
+                self.set_phase(Phase::ready());
                 tracing::info!("boot: profile '{name}' ready after {attempt} attempt(s)");
                 return;
             }
@@ -757,31 +945,21 @@ impl ProfileManager {
         // the generic slot-derived reason.
         if let Some((model, error)) = acquire_err {
             tracing::warn!("boot: profile '{name}' not ready; weight acquisition failed: {error}");
-            self.set_phase(Phase {
-                phase: "failed",
+            self.set_phase(Phase::failed(
                 model,
-                error: Some(error.clone()),
-                reason: Some(UnavailableReason::NotResident.as_str().to_string()),
-                detail: Some(error),
-                ..Default::default()
-            });
+                Some(UnavailableReason::NotResident),
+                Some(error),
+            ));
             return;
         }
-        let (reason, detail) = self.failure_reason();
+        let (reason, detail) = self.failure_reason().unzip();
         tracing::warn!(
             "boot: profile '{name}' not ready within {}s ({}: {})",
             window.as_secs(),
-            reason.as_deref().unwrap_or("unknown"),
+            reason.map_or("unknown", UnavailableReason::as_str),
             detail.as_deref().unwrap_or("no detail")
         );
-        self.set_phase(Phase {
-            phase: "failed",
-            model: Some(name),
-            error: detail.clone(),
-            reason,
-            detail,
-            ..Default::default()
-        });
+        self.set_phase(Phase::failed(Some(name), reason, detail));
     }
 
     /// Acquire any weights the named profile pins that are not on disk yet,
@@ -849,46 +1027,32 @@ impl ProfileManager {
                 continue;
             }
             let model = entry.alias.clone();
-            self.set_phase(Phase {
-                phase: "downloading",
-                model: Some(model.clone()),
-                ..Default::default()
-            });
+            self.set_phase(Phase::downloading(model.clone(), None));
             let manager = Arc::clone(self);
             let phase_model = model.clone();
             let sink: crate::weights::ProgressSink =
                 Arc::new(move |p: crate::weights::WeightProgress| {
-                    manager.set_phase(Phase {
-                        phase: "downloading",
-                        model: Some(phase_model.clone()),
-                        bytes_done: Some(p.bytes_done),
-                        bytes_total: Some(p.bytes_total),
-                        ..Default::default()
-                    });
+                    manager.set_phase(Phase::downloading(
+                        phase_model.clone(),
+                        Some((p.bytes_done, p.bytes_total)),
+                    ));
                 });
             if let Err(e) = crate::weights::ensure_weights(&entry, offline, Some(sink)).await {
                 let msg = format!("{e}");
                 // The consumer wants to know WHICH model failed, not which
                 // profile was booting.
-                self.set_phase(Phase {
-                    phase: "failed",
-                    model: Some(model.clone()),
-                    error: Some(msg.clone()),
-                    reason: Some(UnavailableReason::NotResident.as_str().to_string()),
-                    detail: Some(msg.clone()),
-                    ..Default::default()
-                });
+                self.set_phase(Phase::failed(
+                    Some(model.clone()),
+                    Some(UnavailableReason::NotResident),
+                    Some(msg.clone()),
+                ));
                 tracing::warn!("profile '{name}': acquiring '{model}' failed: {msg}");
                 if first_err.is_none() {
                     first_err = Some((Some(model.clone()), msg));
                 }
                 continue;
             }
-            self.set_phase(Phase {
-                phase: "loading",
-                model: Some(model),
-                ..Default::default()
-            });
+            self.set_phase(Phase::loading(Some(model)));
         }
         match first_err {
             Some(e) => Err(e),
@@ -972,11 +1136,7 @@ impl ProfileManager {
     async fn activate_inner(self: Arc<Self>, name: String, boot: bool) -> Result<(), String> {
         let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.switching.store(true, Ordering::SeqCst);
-        self.set_phase(Phase {
-            phase: "loading",
-            model: Some(name.clone()),
-            ..Default::default()
-        });
+        self.set_phase(Phase::loading(Some(name.clone())));
         self.events
             .emit(EngineEvent::ProfileActivating { name: name.clone() });
 
@@ -997,20 +1157,11 @@ impl ProfileManager {
     /// reason.
     fn settle_phase(&self) {
         if self.is_serving() {
-            self.set_phase(Phase {
-                phase: "ready",
-                ..Default::default()
-            });
+            self.set_phase(Phase::ready());
             return;
         }
-        let (reason, detail) = self.failure_reason();
-        self.set_phase(Phase {
-            phase: "failed",
-            error: detail.clone(),
-            reason,
-            detail,
-            ..Default::default()
-        });
+        let (reason, detail) = self.failure_reason().unzip();
+        self.set_phase(Phase::failed(None, reason, detail));
     }
 
     fn set_phase(&self, phase: Phase) {
@@ -1055,39 +1206,51 @@ impl ProfileManager {
     }
 
     /// Closed reason + detail for a profile that cannot serve, derived
-    /// from its real slot state (shared by `failed` phase and §1.5).
-    fn failure_reason(&self) -> (Option<String>, Option<String>) {
-        let Ok(inner) = self.inner.lock() else {
-            return (None, None);
-        };
+    /// from its real slot state (shared by `failed` phase and §1.5). A
+    /// dropped slot is always `Failed`, so the failed-slot arm covers it.
+    fn failure_reason(&self) -> Option<(UnavailableReason, String)> {
+        let inner = self.inner.lock().ok()?;
         // A failed slot is the most specific cause.
         if let Some((id, SlotState::Failed { cause, reason })) = inner
             .slots
             .iter()
             .find(|(_, s)| matches!(s, SlotState::Failed { .. }))
         {
-            let label = match cause {
-                FailCause::Vram => UnavailableReason::DroppedVram,
-                FailCause::Load => UnavailableReason::LoadFailed,
-            };
-            return (
-                Some(label.as_str().to_string()),
-                Some(format!("'{id}': {reason}")),
-            );
+            return Some(((*cause).into(), format!("'{id}': {reason}")));
         }
-        if !inner.dropped.is_empty() {
-            return (
-                Some(UnavailableReason::DroppedVram.as_str().to_string()),
-                Some(format!("dropped for VRAM: {}", inner.dropped.join(", "))),
-            );
+        inner.active.is_none().then(|| {
+            (
+                UnavailableReason::NotResident,
+                "no profile active".to_string(),
+            )
+        })
+    }
+
+    /// Dropped/shrunk/demoted slots of the outcome profile, in activation
+    /// (priority) order, derived from their live states: `Failed` is
+    /// dropped (planner refusal, refused activation, OOM eviction), a
+    /// shrunk residency is shrunk, an `auto` slot resident on CPU is
+    /// demoted.
+    fn degradation(&self, inner: &Inner) -> Degradation {
+        let mut degradation = Degradation::default();
+        let Some(profile) = inner.outcome.as_deref().and_then(|n| self.profile(n)) else {
+            return degradation;
+        };
+        for slot in by_priority(&profile) {
+            match inner.slots.get(&slot.id) {
+                Some(SlotState::Failed { .. }) => degradation.dropped.push(slot.id.clone()),
+                Some(SlotState::Loaded(r)) => {
+                    if r.shrunk {
+                        degradation.shrunk.push(slot.id.clone());
+                    }
+                    if r.on_cpu && slot.placement == Some(Placement::Auto) {
+                        degradation.demoted.push(slot.id.clone());
+                    }
+                }
+                _ => {}
+            }
         }
-        if inner.active.is_none() {
-            return (
-                Some(UnavailableReason::NotResident.as_str().to_string()),
-                Some("no profile active".into()),
-            );
-        }
-        (None, None)
+        degradation
     }
 
     async fn run_activation(&self, name: &str, my_gen: u64) -> Result<(), String> {
@@ -1095,10 +1258,7 @@ impl ProfileManager {
             return Err(format!("unknown profile '{name}'"));
         };
 
-        // Highest priority first; unprioritized slots follow in declaration
-        // order (stable sort — config.rs documents the semantics).
-        let mut targets: Vec<(usize, &ProfileSlot)> = profile.slots.iter().enumerate().collect();
-        targets.sort_by_key(|(i, s)| (s.priority.unwrap_or(u32::MAX), *i));
+        let targets = by_priority(&profile);
 
         // 1. Diff: unload everything resident that the target doesn't name.
         let target_ids: HashSet<&str> = profile.slots.iter().map(|s| s.id.as_str()).collect();
@@ -1119,11 +1279,7 @@ impl ProfileManager {
                 continue; // overlapping models stay resident
             }
             match self.unload_via_engine(&id).await {
-                Ok(()) => {
-                    self.set_slot(&id, SlotState::Unloaded);
-                    self.remember_unloaded(&id);
-                    self.events.emit(EngineEvent::SlotUnloaded { id });
-                }
+                Ok(()) => self.record_unloaded(&id),
                 Err(e) => tracing::warn!("unload '{id}' failed during switch: {e}"),
             }
         }
@@ -1135,17 +1291,11 @@ impl ProfileManager {
         let mut demoted: Vec<String> = Vec::new();
         let mut refusal: Option<String> = None;
 
-        for (idx, (_, slot)) in targets.iter().enumerate() {
+        for (idx, slot) in targets.iter().enumerate() {
             if self.stale(my_gen) {
                 return Ok(());
             }
-            if matches!(
-                self.inner
-                    .lock()
-                    .ok()
-                    .and_then(|i| i.slots.get(&slot.id).cloned()),
-                Some(SlotState::Loaded(_))
-            ) {
+            if self.is_loaded(&slot.id) {
                 loaded_any = true; // overlap: already resident
                 continue;
             }
@@ -1181,21 +1331,14 @@ impl ProfileManager {
         if let Some(reason) = refusal {
             // Slots after the refused first one were never attempted; record
             // the refusal on them so `/v1` reports why they are missing.
-            let first_cause = targets.first().and_then(|(_, first)| {
-                match self.inner.lock().ok()?.slots.get(&first.id) {
-                    Some(SlotState::Failed { cause, .. }) => Some(*cause),
+            let first_cause = targets
+                .first()
+                .and_then(|first| match self.slot_state(&first.id) {
+                    Some(SlotState::Failed { cause, .. }) => Some(cause),
                     _ => None,
-                }
-            });
-            for (_, slot) in targets.iter().skip(1) {
-                let resident = matches!(
-                    self.inner
-                        .lock()
-                        .ok()
-                        .and_then(|i| i.slots.get(&slot.id).cloned()),
-                    Some(SlotState::Loaded(_))
-                );
-                if !resident {
+                });
+            for slot in targets.iter().skip(1) {
+                if !self.is_loaded(&slot.id) {
                     self.fail_slot(
                         &slot.id,
                         first_cause.unwrap_or(FailCause::Load),
@@ -1203,10 +1346,10 @@ impl ProfileManager {
                     );
                 }
             }
+            // The refused profile's failed slots are now its `dropped`
+            // view; the previously active profile stays active.
             if let Ok(mut inner) = self.inner.lock() {
-                inner.dropped = profile.slots.iter().map(|s| s.id.clone()).collect();
-                inner.shrunk.clear();
-                inner.demoted.clear();
+                inner.outcome = Some(name.to_string());
             }
             self.events.emit(EngineEvent::ProfileDegraded {
                 name: name.to_string(),
@@ -1224,9 +1367,7 @@ impl ProfileManager {
         }
         if let Ok(mut inner) = self.inner.lock() {
             inner.active = Some(name.to_string());
-            inner.dropped = dropped.clone();
-            inner.shrunk = shrunk.clone();
-            inner.demoted = demoted.clone();
+            inner.outcome = Some(name.to_string());
         }
         self.persist_state();
 
@@ -1370,19 +1511,22 @@ impl ProfileManager {
             .collect();
 
         // Fast planner pass: when no rung fits even on paper, refuse the
-        // slot without a doomed cudaMalloc round-trip.
-        let mut costs = Vec::with_capacity(rungs.len());
-        for (cap, _ctx) in &rungs {
-            match self.slot_cost(reg_entry, *cap) {
-                Some(cost) => costs.push(cost),
-                None => {
-                    let reason =
-                        format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
-                    return LadderOutcome::Dropped(FailCause::Load, reason);
-                }
-            }
-        }
-        let gguf_for_measure = llama_bridge::resolve_gguf_path(reg_entry).ok();
+        // slot without a doomed cudaMalloc round-trip. The header is parsed
+        // once (off the executor); each rung's cost is arithmetic over it.
+        let unreadable = || {
+            let reason = format!("cannot estimate fit for '{}' (unreadable GGUF header)", id);
+            LadderOutcome::Dropped(FailCause::Load, reason)
+        };
+        let Some(geometry) = self.slot_geometry_blocking(reg_entry).await else {
+            return unreadable();
+        };
+        let Some(costs) = rungs
+            .iter()
+            .map(|(cap, _ctx)| geometry.cost(*cap))
+            .collect::<Option<Vec<SlotCost>>>()
+        else {
+            return unreadable();
+        };
         if rungs
             .iter()
             .zip(&costs)
@@ -1446,10 +1590,8 @@ impl ProfileManager {
                              not persisting a 0-byte measurement"
                         );
                     }
-                    if let (Some(bytes), Some(gguf)) =
-                        (measured.filter(|b| *b > 0), gguf_for_measure.as_ref())
-                    {
-                        if let Some(mtime) = gguf_mtime_secs(gguf) {
+                    if let Some(bytes) = measured.filter(|b| *b > 0) {
+                        if let Some(mtime) = gguf_mtime_secs(&geometry.gguf) {
                             if let Ok(mut store) = self.measured.lock() {
                                 store.insert(
                                     id.to_string(),
@@ -1497,10 +1639,16 @@ impl ProfileManager {
 
     fn record_load_success(&self, id: &str, residency: Residency) {
         self.set_slot(id, SlotState::Loaded(residency));
-        self.remember_loaded(id);
         self.touch(id);
         self.events
             .emit(EngineEvent::SlotLoaded { id: id.to_string() });
+    }
+
+    /// Twin of [`Self::record_load_success`] for a completed unload.
+    fn record_unloaded(&self, id: &str) {
+        self.set_slot(id, SlotState::Unloaded);
+        self.events
+            .emit(EngineEvent::SlotUnloaded { id: id.to_string() });
     }
 
     fn fail_slot(&self, id: &str, cause: FailCause, reason: &str) {
@@ -1511,7 +1659,6 @@ impl ProfileManager {
                 reason: reason.to_string(),
             },
         );
-        self.remember_unloaded(id);
         self.events.emit(EngineEvent::SlotFailed {
             id: id.to_string(),
             reason: reason.to_string(),
@@ -1529,13 +1676,7 @@ impl ProfileManager {
         if self.switching() {
             return Err(SlotOpError::SwitchInProgress);
         }
-        if matches!(
-            self.inner
-                .lock()
-                .ok()
-                .and_then(|i| i.slots.get(id).cloned()),
-            Some(SlotState::Loaded(_)) | Some(SlotState::Loading)
-        ) {
+        if self.is_resident(id) {
             return Err(SlotOpError::AlreadyResident);
         }
 
@@ -1566,9 +1707,13 @@ impl ProfileManager {
         let budget = mem.free_bytes.saturating_sub(self.margin_bytes());
 
         let rerank_cap = self.rerank_cap(&reg_entry);
-        let cost = self.slot_cost(&reg_entry, rerank_cap).ok_or_else(|| {
-            SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into())
-        })?;
+        let cost = self
+            .slot_geometry_blocking(&reg_entry)
+            .await
+            .and_then(|g| g.cost(rerank_cap))
+            .ok_or_else(|| {
+                SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into())
+            })?;
         let full = self.full_ctx();
         let needed = cost.at(full);
         if needed > budget {
@@ -1620,23 +1765,13 @@ impl ProfileManager {
         if self.switching() {
             return Err(SlotOpError::SwitchInProgress);
         }
-        let resident = matches!(
-            self.inner
-                .lock()
-                .ok()
-                .and_then(|i| i.slots.get(id).cloned()),
-            Some(SlotState::Loaded(_)) | Some(SlotState::Loading)
-        );
-        if !resident {
+        if !self.is_resident(id) {
             return Err(SlotOpError::NotResident);
         }
         self.unload_via_engine(id)
             .await
             .map_err(SlotOpError::LoadFailed)?;
-        self.set_slot(id, SlotState::Unloaded);
-        self.remember_unloaded(id);
-        self.events
-            .emit(EngineEvent::SlotUnloaded { id: id.to_string() });
+        self.record_unloaded(id);
         Ok(())
     }
 
@@ -1678,9 +1813,7 @@ impl ProfileManager {
     fn resolve_role_slot(&self, role: ModelRole) -> Option<String> {
         let active = self.inner.lock().ok()?.active.clone()?;
         let profile = self.profile(&active)?;
-        let mut ordered: Vec<&ProfileSlot> = profile.slots.iter().collect();
-        ordered.sort_by_key(|s| s.priority.unwrap_or(u32::MAX)); // stable ⇒ declaration tiebreak
-        ordered
+        by_priority(&profile)
             .into_iter()
             .find(|s| self.effective_role(&s.id) == role)
             .map(|s| s.id.clone())
@@ -1689,37 +1822,24 @@ impl ProfileManager {
     // -- /v1 structured unavailability ---------------------------------------
 
     /// Why `id` cannot serve right now, derived from its real slot state
-    /// (residency contract §1.5). `engine_loaded` is the caller's view of
-    /// whether any engine exists at all.
-    pub fn unavailability(&self, id: &str, engine_loaded: bool) -> Unavailable {
-        let (state, dropped, degraded) = self
+    /// (residency contract §1.5). An OOM-evicted member is `Failed`
+    /// (`Vram`), so it reports `dropped_vram` through the failed arm.
+    pub fn unavailability(&self, id: &str) -> Unavailable {
+        let engine_loaded = self.engine_loaded();
+        let (state, degraded) = self
             .inner
             .lock()
             .map(|i| {
                 (
                     i.slots.get(id).cloned(),
-                    i.dropped.iter().any(|d| d == id),
-                    !i.dropped.is_empty() || !i.shrunk.is_empty(),
+                    self.degradation(&i).profile_degraded(),
                 )
             })
-            .unwrap_or((None, false, false));
+            .unwrap_or((None, false));
         let (reason, detail) = match state {
             _ if !engine_loaded => (UnavailableReason::NoEngine, None),
             Some(SlotState::Loading) => (UnavailableReason::Loading, None),
-            Some(SlotState::Failed { cause, reason }) => (
-                match cause {
-                    FailCause::Vram => UnavailableReason::DroppedVram,
-                    FailCause::Load => UnavailableReason::LoadFailed,
-                },
-                Some(reason),
-            ),
-            // Unloaded but recorded as dropped: evicted by OOM recovery.
-            _ if dropped => (
-                UnavailableReason::DroppedVram,
-                Some(format!(
-                    "'{id}' was evicted to recover from a CUDA out-of-memory error"
-                )),
-            ),
+            Some(SlotState::Failed { cause, reason }) => (cause.into(), Some(reason)),
             _ => (UnavailableReason::NotResident, None),
         };
         Unavailable {
@@ -1735,7 +1855,7 @@ impl ProfileManager {
     pub fn profile_degraded(&self) -> bool {
         self.inner
             .lock()
-            .map(|i| !i.dropped.is_empty() || !i.shrunk.is_empty())
+            .map(|i| self.degradation(&i).profile_degraded())
             .unwrap_or(false)
     }
 
@@ -1756,8 +1876,15 @@ impl ProfileManager {
             .read()
             .ok()
             .and_then(|reg| reg.resolve(id).ok().cloned())?;
-        let cap = self.rerank_cap(&entry);
-        self.slot_cost(&entry, cap).map(|c| c.at(self.full_ctx()))
+        self.full_ctx_estimate(&entry)
+    }
+
+    /// Fit-preview bytes of a slot at full context (its rerank cap
+    /// applied) — the `/v1/models` and `/engine/profiles` estimate.
+    fn full_ctx_estimate(&self, entry: &RegistryEntry) -> Option<u64> {
+        self.slot_geometry(entry)?
+            .cost(self.rerank_cap(entry))
+            .map(|c| c.at(self.full_ctx()))
     }
 
     // -- JIT TTL sweeper -------------------------------------------------------
@@ -1814,11 +1941,7 @@ impl ProfileManager {
                 return; // superseded mid-sweep; next tick re-derives
             }
             match self.unload_via_engine(&id).await {
-                Ok(()) => {
-                    self.set_slot(&id, SlotState::Unloaded);
-                    self.remember_unloaded(&id);
-                    self.events.emit(EngineEvent::SlotUnloaded { id });
-                }
+                Ok(()) => self.record_unloaded(&id),
                 Err(e) => tracing::warn!("TTL unload '{id}' failed: {e}"),
             }
         }
@@ -1868,10 +1991,7 @@ impl ProfileManager {
             };
             let member_of_active = self.is_pinned(&victim);
             self.unload_via_engine(&victim).await?;
-            self.set_slot(&victim, SlotState::Unloaded);
-            self.remember_unloaded(&victim);
-            self.events
-                .emit(EngineEvent::SlotUnloaded { id: victim.clone() });
+            self.record_unloaded(&victim);
             // An `auto` member moves to CPU instead of disappearing
             // (docket M1: reach a steady state rather than drop).
             if member_of_active
@@ -1883,10 +2003,20 @@ impl ProfileManager {
             // Losing a profile member is degradation; announce it so the
             // consumer can surface "OCR unavailable" rather than guess.
             if member_of_active {
-                if let Ok(mut inner) = self.inner.lock() {
-                    if !inner.dropped.contains(&victim) {
-                        inner.dropped.push(victim.clone());
-                    }
+                // The member stays visibly dropped (`Failed`, derived into
+                // `degraded.dropped`). A failed CPU demotion already
+                // recorded its own, more specific failure. No `slot.failed`
+                // event: the eviction was announced as `slot.unloaded`.
+                if !matches!(self.slot_state(&victim), Some(SlotState::Failed { .. })) {
+                    self.set_slot(
+                        &victim,
+                        SlotState::Failed {
+                            cause: FailCause::Vram,
+                            reason: format!(
+                                "'{victim}' was evicted to recover from a CUDA out-of-memory error"
+                            ),
+                        },
+                    );
                 }
                 if let Some(name) = self.inner.lock().ok().and_then(|i| i.active.clone()) {
                     self.events.emit(EngineEvent::ProfileDegraded {
@@ -1918,11 +2048,6 @@ impl ProfileManager {
         match outcome {
             LadderOutcome::Loaded { .. } => {
                 tracing::warn!("demoted '{id}' to CPU after a CUDA out-of-memory error");
-                if let Ok(mut inner) = self.inner.lock() {
-                    if !inner.demoted.iter().any(|d| d == id) {
-                        inner.demoted.push(id.to_string());
-                    }
-                }
                 if let Some(name) = self.inner.lock().ok().and_then(|i| i.active.clone()) {
                     self.events.emit(EngineEvent::ProfileDegraded {
                         name,
@@ -1946,21 +2071,21 @@ impl ProfileManager {
         }
     }
 
-    /// Configured placement of `id`: the active profile's slot wins, then
-    /// any profile declaring it; `Gpu` when unspecified (JIT slots).
-    fn slot_placement(&self, id: &str) -> Placement {
+    /// The profile slot declaring `id`: the active profile's wins, then
+    /// the first profile declaring it; `None` for JIT-only models.
+    fn configured_slot(&self, id: &str) -> Option<ProfileSlot> {
         let active = self.inner.lock().ok().and_then(|i| i.active.clone());
-        let from = |p: &ProfileConfig| {
-            p.slots
-                .iter()
-                .find(|s| s.id == id)
-                .and_then(|s| s.placement)
-        };
+        let find = |p: &ProfileConfig| p.slots.iter().find(|s| s.id == id).cloned();
         active
             .and_then(|name| self.profile(&name))
-            .and_then(|p| from(&p))
-            .or_else(|| self.config.profile.iter().find_map(from))
-            .unwrap_or(Placement::Gpu)
+            .and_then(|p| find(&p))
+            .or_else(|| self.config.profile.iter().find_map(find))
+    }
+
+    /// Configured placement of `id` ([`Self::configured_slot`]); `Gpu`
+    /// when unspecified (JIT slots).
+    fn slot_placement(&self, id: &str) -> Placement {
+        placement_of(self.configured_slot(id).as_ref())
     }
 
     /// Eviction choice: oldest-touched JIT resident wins; otherwise the
@@ -2014,11 +2139,10 @@ impl ProfileManager {
 
     // -- views ---------------------------------------------------------------
 
-    /// `(ready, {ready, phase:{…}})` — the readiness gate shared by
-    /// `/engine/ready` and the extra fields on `/engine/status`
-    /// (residency contract §1.4). Live slot state decides `ready`; the
-    /// tracked phase supplies what only boot knows (`loading` retries,
-    /// `failed`, `downloading`). `engine_loaded` is the caller's view.
+    /// The readiness gate shared by `/engine/ready` and the extra fields on
+    /// `/engine/status` (residency contract §1.4). Live slot state decides
+    /// `ready`; the tracked phase supplies what only boot knows (`loading`
+    /// retries, `failed`, `downloading`).
     ///
     /// `switching` is part of the gate (§1.4: ready is true only when "no
     /// activation is in progress"): while a target profile is still loading,
@@ -2026,36 +2150,25 @@ impl ProfileManager {
     /// `is_serving()` alone would advertise the model the caller is waiting
     /// to replace. The phase then reads `loading`, which is what bounds the
     /// poll (`Retry-After`).
-    pub fn readiness(&self, engine_loaded: bool) -> (bool, serde_json::Value) {
-        let ready = engine_loaded && !self.switching() && self.is_serving();
+    pub fn readiness(&self) -> Readiness {
+        let ready = self.engine_loaded() && !self.switching() && self.is_serving();
         let mut phase = self.phase.lock().map(|p| p.clone()).unwrap_or_default();
         match (ready, phase.phase) {
-            (true, _) => phase.phase = "ready",
+            (true, _) => phase.phase = PhaseKind::Ready,
             // Serving state regressed (unloaded/deactivated): never keep
             // advertising a stale `ready`.
-            (false, "ready") => phase.phase = "loading",
+            (false, PhaseKind::Ready) => phase.phase = PhaseKind::Loading,
             _ => {}
         }
-        let body = serde_json::json!({
-            "ready": ready,
-            "phase": {
-                "phase": phase.phase,
-                "model": phase.model,
-                "bytes_done": phase.bytes_done,
-                "bytes_total": phase.bytes_total,
-                "error": phase.error,
-                "reason": phase.reason,
-                "detail": phase.detail,
-            },
-        });
-        (ready, body)
+        Readiness { phase, ready }
     }
 
     /// `GET /engine/status` payload — liveness plus per-slot residency.
     /// Always 200 while the process is up; `ready` + `phase` are the
     /// readiness view (residency contract §1.4, amendment).
-    pub fn status(&self, engine_loaded: bool) -> serde_json::Value {
+    pub fn status(&self) -> serde_json::Value {
         let inner = self.inner.lock().map(|i| i.clone()).unwrap_or_default();
+        let degradation = self.degradation(&inner);
         let mut ids: Vec<String> = inner.slots.keys().cloned().collect();
         for p in &self.config.profile {
             for s in &p.slots {
@@ -2068,75 +2181,51 @@ impl ProfileManager {
         let slots: Vec<serde_json::Value> = ids
             .iter()
             .map(|id| {
-                let st = inner.slots.get(id);
-                let (label, ctx, estimated, measured, shrunk, reason, micro_tokens) = match st {
-                    Some(SlotState::Loaded(r)) => (
-                        "loaded",
-                        Some(r.ctx),
-                        r.estimated_bytes,
-                        r.measured_bytes,
-                        r.shrunk,
-                        None,
-                        r.micro_tokens,
-                    ),
-                    Some(SlotState::Failed { reason, .. }) => (
-                        "failed",
-                        None,
-                        None,
-                        None,
-                        false,
-                        Some(reason.clone()),
-                        None,
-                    ),
-                    Some(SlotState::Loading) => ("loading", None, None, None, false, None, None),
-                    _ => ("unloaded", None, None, None, false, None, None),
+                let state = inner.slots.get(id);
+                let residency = match state {
+                    Some(SlotState::Loaded(r)) => Some(r),
+                    _ => None,
                 };
+                let reason = match state {
+                    Some(SlotState::Failed { reason, .. }) => Some(reason.as_str()),
+                    _ => None,
+                };
+                let configured = self.configured_slot(id);
+                let configured_placement = placement_of(configured.as_ref());
                 // Where the weights actually live once loaded (§1.2: the
                 // reported placement must describe real residency).
-                let configured = self.slot_placement(id);
-                let placement = match st {
-                    Some(SlotState::Loaded(r)) if r.on_cpu => Placement::Cpu,
-                    Some(SlotState::Loaded(_)) => Placement::Gpu,
-                    _ => configured,
+                let placement = match residency {
+                    Some(r) if r.on_cpu => Placement::Cpu,
+                    Some(_) => Placement::Gpu,
+                    None => configured_placement,
                 };
-                let priority = self
-                    .config
-                    .profile
-                    .iter()
-                    .flat_map(|p| p.slots.iter())
-                    .find(|s| s.id == *id)
-                    .and_then(|s| s.priority);
                 serde_json::json!({
                     "id": id,
                     "role": self.effective_role(id),
-                    "priority": priority,
+                    "priority": configured.as_ref().and_then(|s| s.priority),
                     "placement": placement,
-                    "configured_placement": configured,
-                    "demoted": inner.demoted.contains(id),
-                    "state": label,
-                    "ctx": ctx,
-                    "estimated_bytes": estimated,
-                    "measured_bytes": measured,
-                    "shrunk": shrunk,
+                    "configured_placement": configured_placement,
+                    "demoted": degradation.demoted.contains(id),
+                    "state": state.map_or("unloaded", SlotState::label),
+                    "ctx": residency.map(|r| r.ctx),
+                    "estimated_bytes": residency.and_then(|r| r.estimated_bytes),
+                    "measured_bytes": residency.and_then(|r| r.measured_bytes),
+                    "shrunk": residency.is_some_and(|r| r.shrunk),
                     "pinned": self.is_pinned(id),
                     "reason": reason,
-                    "micro_tokens": micro_tokens,
+                    "micro_tokens": residency.and_then(|r| r.micro_tokens),
                 })
             })
             .collect();
 
-        let (ready, readiness) = self.readiness(engine_loaded);
+        let readiness = self.readiness();
         serde_json::json!({
             "active": inner.active,
             "switching": self.switching(),
-            "degraded": {
-                "dropped": inner.dropped,
-                "shrunk": inner.shrunk,
-                "demoted": inner.demoted,
-            },
+            "degraded": degradation,
             "slots": slots,
-            "ready": ready,
-            "phase": readiness["phase"],
+            "ready": readiness.ready,
+            "phase": readiness.phase,
         })
     }
 
@@ -2157,8 +2246,12 @@ impl ProfileManager {
     /// `GET /engine/profiles` payload: definitions + active + per-slot /
     /// per-profile fit previews. Overlapping models across profiles are
     /// counted per profile (a preview, not an accounting identity).
+    ///
+    /// Reads GGUF headers (blocking I/O) — once per distinct model, even
+    /// when several profiles share it; the route runs it off the executor.
     pub fn profiles_view(&self) -> serde_json::Value {
         let active = self.inner.lock().ok().and_then(|i| i.active.clone());
+        let mut estimates: HashMap<&str, Option<u64>> = HashMap::new();
 
         let profiles: Vec<serde_json::Value> = self
             .config
@@ -2170,17 +2263,15 @@ impl ProfileManager {
                     .slots
                     .iter()
                     .map(|s| {
-                        let est = self
-                            .deps
-                            .registry
-                            .read()
-                            .ok()
-                            .and_then(|reg| reg.resolve(&s.id).ok().cloned())
-                            .and_then(|entry| {
-                                let cap = self.rerank_cap(&entry);
-                                self.slot_cost(&entry, cap)
-                            })
-                            .map(|c| c.at(self.full_ctx()));
+                        let est = *estimates.entry(s.id.as_str()).or_insert_with(|| {
+                            let entry = self
+                                .deps
+                                .registry
+                                .read()
+                                .ok()
+                                .and_then(|reg| reg.resolve(&s.id).ok().cloned())?;
+                            self.full_ctx_estimate(&entry)
+                        });
                         if est.is_none() {
                             total = None;
                         } else {
@@ -2189,7 +2280,7 @@ impl ProfileManager {
                         serde_json::json!({
                             "id": s.id,
                             "priority": s.priority,
-                            "placement": s.placement.unwrap_or(Placement::Gpu),
+                            "placement": placement_of(Some(s)),
                             "role": self.effective_role(&s.id),
                             "estimated_bytes": est,
                         })
@@ -2208,6 +2299,11 @@ impl ProfileManager {
 }
 
 // helpers ----------------------------------------------------------------
+
+/// Effective configured placement of a profile slot (`Gpu` by default).
+fn placement_of(slot: Option<&ProfileSlot>) -> Placement {
+    slot.and_then(|s| s.placement).unwrap_or(Placement::Gpu)
+}
 
 enum LadderOutcome {
     /// `demoted`: an `auto` slot that fell back to CPU.
@@ -2259,6 +2355,21 @@ mod tests {
 
     fn active_name(m: &ProfileManager) -> Option<String> {
         m.inner.lock().unwrap().active.clone()
+    }
+
+    fn degradation(m: &ProfileManager) -> Degradation {
+        m.degradation(&m.inner.lock().unwrap())
+    }
+
+    /// `(ready, wire JSON)` of the readiness gate.
+    fn readiness(m: &ProfileManager) -> (bool, serde_json::Value) {
+        let r = m.readiness();
+        (r.ready, serde_json::to_value(&r).unwrap())
+    }
+
+    /// Simulate a process with no engine installed.
+    fn drop_engine(m: &ProfileManager) {
+        *m.deps.engine.write().unwrap() = None;
     }
 
     const MIB: u64 = 1024 * 1024;
@@ -2469,7 +2580,6 @@ mod tests {
             let deps = ProfileDeps {
                 engine: Arc::new(std::sync::RwLock::new(Some(engine.clone() as SharedEngine))),
                 registry: Arc::new(std::sync::RwLock::new(registry)),
-                loaded_models: Arc::new(Mutex::new(Vec::new())),
             };
             let events = Arc::new(EventBus::new());
             let manager =
@@ -2533,9 +2643,10 @@ mod tests {
             .clone();
         let full = m.full_ctx();
         // The cap moves the cost: a rerank slot's KV is per-call.
-        let resident_only = m.slot_cost(&entry, None).unwrap().at(full);
-        let at_floor = m.slot_cost(&entry, Some(256)).unwrap().at(full);
-        let at_default = m.slot_cost(&entry, Some(2048)).unwrap().at(full);
+        let geometry = m.slot_geometry(&entry).unwrap();
+        let resident_only = geometry.cost(None).unwrap().at(full);
+        let at_floor = geometry.cost(Some(256)).unwrap().at(full);
+        let at_default = geometry.cost(Some(2048)).unwrap().at(full);
         assert!(
             at_floor > resident_only && at_default > at_floor,
             "per-call context must be budgeted: {resident_only} {at_floor} {at_default}"
@@ -2552,11 +2663,11 @@ mod tests {
         // A lowered cap is a shrunk slot, reported as degradation.
         assert!(m.profile_degraded());
         assert!(
-            m.inner.lock().unwrap().shrunk.iter().any(|s| s == "r1"),
+            degradation(&m).shrunk.iter().any(|s| s == "r1"),
             "slot recorded as shrunk"
         );
         // The effective cap is visible to the consumer (§1.1).
-        let status = m.status(true);
+        let status = m.status();
         assert_eq!(status["slots"][0]["micro_tokens"], 256, "{status}");
     }
 
@@ -2596,7 +2707,6 @@ mod tests {
                     fx.engine.clone() as SharedEngine
                 ))),
                 registry,
-                loaded_models: Arc::new(Mutex::new(Vec::new())),
             },
             fx.manager.config.clone(),
             fx.events.clone(),
@@ -2627,7 +2737,6 @@ mod tests {
                     r.apply_user_models(&fx.manager.config.model);
                     r
                 })),
-                loaded_models: Arc::new(Mutex::new(Vec::new())),
             },
             fx.manager.config.clone(),
             fx.events.clone(),
@@ -2654,7 +2763,6 @@ mod tests {
                     r.apply_user_models(&fx.manager.config.model);
                     r
                 })),
-                loaded_models: Arc::new(Mutex::new(Vec::new())),
             },
             fx.manager.config.clone(),
             fx.events.clone(),
@@ -2674,7 +2782,7 @@ mod tests {
         });
         fx.manager.clone().boot_activate().await;
 
-        let (ready, body) = fx.manager.readiness(true);
+        let (ready, body) = readiness(&fx.manager);
         assert!(ready, "{body}");
         assert_eq!(body["ready"], true);
         assert_eq!(body["phase"]["phase"], "ready");
@@ -2690,15 +2798,15 @@ mod tests {
         // target the caller had just switched to).
         let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
         fx.manager.clone().activate("p".into()).await.unwrap();
-        assert!(fx.manager.readiness(true).0);
+        assert!(fx.manager.readiness().ready);
 
         fx.manager.switching.store(true, Ordering::SeqCst);
-        let (ready, body) = fx.manager.readiness(true);
+        let (ready, body) = readiness(&fx.manager);
         assert!(!ready, "{body}");
         assert_eq!(body["phase"]["phase"], "loading", "{body}");
 
         fx.manager.switching.store(false, Ordering::SeqCst);
-        assert!(fx.manager.readiness(true).0, "cleared switch must re-ready");
+        assert!(fx.manager.readiness().ready, "cleared switch must re-ready");
     }
 
     #[tokio::test]
@@ -2712,11 +2820,13 @@ mod tests {
         });
         fx.manager.clone().boot_activate().await;
 
-        let (ready, body) = fx.manager.readiness(true);
+        let (ready, body) = readiness(&fx.manager);
         assert!(!ready);
         assert_eq!(body["phase"]["phase"], "failed", "{body}");
         assert_eq!(body["phase"]["reason"], "dropped_vram", "{body}");
         assert!(body["phase"]["detail"].is_string(), "{body}");
+        // `error` mirrors `detail` for a failed phase (consumers render it).
+        assert_eq!(body["phase"]["error"], body["phase"]["detail"], "{body}");
     }
 
     #[tokio::test]
@@ -2726,8 +2836,9 @@ mod tests {
 
         // Slots are loaded, but with no engine handle the process cannot
         // serve: `/engine/ready` must gate on both.
-        assert!(fx.manager.readiness(true).0);
-        let (ready, body) = fx.manager.readiness(false);
+        assert!(fx.manager.readiness().ready);
+        drop_engine(&fx.manager);
+        let (ready, body) = readiness(&fx.manager);
         assert!(!ready, "{body}");
         assert_eq!(body["phase"]["phase"], "loading");
     }
@@ -2835,7 +2946,7 @@ mod tests {
                 gguf_mtime_secs: mtime,
             },
         );
-        assert!(fx.manager.measured_cost("m1", &entry).is_some());
+        assert!(fx.manager.fresh_measurement("m1", &gguf).is_some());
 
         // Wrong mtime: discarded, planner falls back to the header estimate.
         fx.manager
@@ -2845,7 +2956,7 @@ mod tests {
             .get_mut("m1")
             .unwrap()
             .gguf_mtime_secs = mtime + 1;
-        assert!(fx.manager.measured_cost("m1", &entry).is_none());
+        assert!(fx.manager.fresh_measurement("m1", &gguf).is_none());
 
         // A 0-byte record (a GPU-placed load that allocated nothing) is
         // ignored too: trusting it would admit the slot for free.
@@ -2858,7 +2969,7 @@ mod tests {
                 gguf_mtime_secs: mtime,
             },
         );
-        assert!(fx.manager.measured_cost("m1", &entry).is_none());
+        assert!(fx.manager.fresh_measurement("m1", &gguf).is_none());
     }
 
     #[tokio::test]
@@ -2908,24 +3019,19 @@ mod tests {
         use crate::unavailable::UnavailableReason as R;
         let fx = Fixture::build(&[("p", &["m1"])], 8 * GIB);
         let m = &fx.manager;
-        let reason = |id: &str, engine: bool| m.unavailability(id, engine).reason;
+        let reason = |id: &str| m.unavailability(id).reason;
 
-        assert_eq!(reason("m9", true), R::NotResident);
-        assert_eq!(
-            reason("m9", false),
-            R::NoEngine,
-            "no engine wins over slot state"
-        );
+        assert_eq!(reason("m9"), R::NotResident);
 
         m.set_slot("m9", SlotState::Loading);
-        assert_eq!(reason("m9", true), R::Loading);
+        assert_eq!(reason("m9"), R::Loading);
 
         m.fail_slot(
             "m9",
             FailCause::Vram,
             "needs 9 bytes, 1 free (no rung fits)",
         );
-        let u = m.unavailability("m9", true);
+        let u = m.unavailability("m9");
         assert_eq!(u.reason, R::DroppedVram);
         assert_eq!(
             u.detail.as_deref(),
@@ -2933,19 +3039,22 @@ mod tests {
         );
 
         m.fail_slot("m9", FailCause::Load, "bad gguf");
-        assert_eq!(reason("m9", true), R::LoadFailed);
+        assert_eq!(reason("m9"), R::LoadFailed);
 
-        // OOM eviction leaves the slot Unloaded but recorded as dropped.
-        m.set_slot("m9", SlotState::Unloaded);
-        m.inner.lock().unwrap().dropped.push("m9".into());
-        let u = m.unavailability("m9", true);
+        // A failed member of the outcome profile is dropped: degraded.
+        m.inner.lock().unwrap().outcome = Some("p".into());
+        m.fail_slot("m1", FailCause::Vram, "no rung fits");
+        let u = m.unavailability("m1");
         assert_eq!(u.reason, R::DroppedVram);
         assert!(u.profile_degraded);
 
         let j = u.payload();
         assert_eq!(j["error"]["code"], "slot_unavailable", "{j}");
         assert_eq!(j["error"]["reason"], "dropped_vram");
-        assert_eq!(j["error"]["missing"][0], "m9");
+        assert_eq!(j["error"]["missing"][0], "m1");
+
+        drop_engine(m);
+        assert_eq!(reason("m1"), R::NoEngine, "no engine wins over slot state");
     }
 
     #[tokio::test]
@@ -2954,12 +3063,12 @@ mod tests {
         // refused and the second slot is never attempted.
         let fx = Fixture::build(&[("p", &["m1", "m2"])], MIB);
         assert!(fx.manager.clone().activate("p".into()).await.is_err());
-        let first = fx.manager.unavailability("m1", true);
+        let first = fx.manager.unavailability("m1");
         assert_eq!(
             first.reason,
             crate::unavailable::UnavailableReason::DroppedVram
         );
-        let second = fx.manager.unavailability("m2", true);
+        let second = fx.manager.unavailability("m2");
         assert_eq!(
             second.reason,
             crate::unavailable::UnavailableReason::DroppedVram
@@ -3052,13 +3161,15 @@ mod tests {
         assert!(ops.contains(&"unload:m1".to_string()), "{ops:?}");
         assert!(!ops.contains(&"unload:m2".to_string()), "{ops:?}");
         assert!(fx.replay_contains("\"profile.degraded\""));
-        assert!(fx
-            .manager
-            .inner
-            .lock()
-            .unwrap()
-            .dropped
-            .contains(&"m1".to_string()));
+        assert!(degradation(&fx.manager).dropped.contains(&"m1".to_string()));
+        // The evicted member answers `/v1` with the eviction as its cause.
+        let u = fx.manager.unavailability("m1");
+        assert_eq!(u.reason, crate::unavailable::UnavailableReason::DroppedVram);
+        assert_eq!(
+            u.detail.as_deref(),
+            Some("'m1' was evicted to recover from a CUDA out-of-memory error")
+        );
+        assert!(u.profile_degraded);
     }
 
     // -- placement = "auto" (docket M1) ----------------------------------------
@@ -3078,7 +3189,7 @@ mod tests {
             "{ops:?}"
         );
         assert!(
-            fx.manager.readiness(true).0,
+            fx.manager.readiness().ready,
             "a demoted profile still serves"
         );
         assert!(
@@ -3087,7 +3198,7 @@ mod tests {
         );
         assert!(fx.replay_contains("\"demoted\":[\"m1\"]"));
 
-        let status = fx.manager.status(true);
+        let status = fx.manager.status();
         let slot = &status["slots"][0];
         assert_eq!(slot["placement"], "cpu", "{status}");
         assert_eq!(slot["configured_placement"], "auto");
@@ -3125,10 +3236,10 @@ mod tests {
                 .any(|o| o.starts_with("load:m1@") && o.contains("ngl=Some(0)")),
             "{ops:?}"
         );
-        let inner = fx.manager.inner.lock().unwrap().clone();
-        assert!(inner.demoted.contains(&"m1".to_string()));
-        assert!(!inner.dropped.contains(&"m1".to_string()));
-        assert!(matches!(inner.slots.get("m1"), Some(SlotState::Loaded(r)) if r.on_cpu));
+        let degradation = degradation(&fx.manager);
+        assert!(degradation.demoted.contains(&"m1".to_string()));
+        assert!(!degradation.dropped.contains(&"m1".to_string()));
+        assert!(matches!(fx.manager.slot_state("m1"), Some(SlotState::Loaded(r)) if r.on_cpu));
     }
 
     #[tokio::test]

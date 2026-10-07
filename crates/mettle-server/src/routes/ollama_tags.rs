@@ -41,12 +41,9 @@ pub async fn tags_handler(State(state): State<Arc<AppState>>) -> Json<TagsRespon
 
 /// GET /api/ps — list models currently loaded into the engine.
 pub async fn ps_handler(State(state): State<Arc<AppState>>) -> Json<PsResponse> {
+    // The engine's own resident list is the single source of truth.
+    let loaded: Vec<String> = state.engine().map(|e| e.loaded()).unwrap_or_default();
     let registry = state.registry.read().expect("registry lock poisoned");
-    let loaded: Vec<String> = state
-        .loaded_models
-        .lock()
-        .map(|l| l.clone())
-        .unwrap_or_default();
 
     let models: Vec<PsModelInfo> = registry
         .list()

@@ -42,9 +42,6 @@ pub struct AppState {
     /// Notified when the engine becomes available (used to lazily start
     /// the OpenAI/Anthropic listener after a first pull).
     pub engine_ready: tokio::sync::Notify,
-    /// Aliases currently loaded into the engine (mirrors
-    /// `engine.loaded()`, updated by pulls and the profile manager).
-    pub loaded_models: Arc<Mutex<Vec<String>>>,
     /// Profile lifecycle events (SSE at `/engine/events`).
     pub events: Arc<crate::events::EventBus>,
     /// Runtime-switchable model profiles (`/engine/*` routes).
@@ -60,13 +57,11 @@ impl AppState {
         registry.apply_user_models(&config.model);
         let engine = Arc::new(RwLock::new(None));
         let registry = Arc::new(RwLock::new(registry));
-        let loaded_models = Arc::new(Mutex::new(Vec::new()));
         let events = Arc::new(crate::events::EventBus::new());
         let profiles = Arc::new(crate::profiles::ProfileManager::new(
             crate::profiles::ProfileDeps {
                 engine: engine.clone(),
                 registry: registry.clone(),
-                loaded_models: loaded_models.clone(),
             },
             config.clone(),
             events.clone(),
@@ -81,7 +76,6 @@ impl AppState {
             startup_time: Instant::now(),
             metrics: Metrics::default(),
             engine_ready: tokio::sync::Notify::new(),
-            loaded_models,
             events,
             profiles,
             next_request_id: AtomicUsize::new(0),
@@ -156,10 +150,8 @@ impl AppState {
     /// Structured unavailability for a registry-known model that is not
     /// resident. The body shape is part of the profiles contract; consumers
     /// branch on `code`/`reason`/`missing`.
-    fn unavailable_response(&self, id: &str, engine_loaded: bool) -> Response {
-        self.profiles
-            .unavailability(id, engine_loaded)
-            .into_response()
+    fn unavailable_response(&self, id: &str) -> Response {
+        self.profiles.unavailability(id).into_response()
     }
 
     /// `/v1` engine handle: like [`Self::engine_for`], but not-resident is
@@ -170,11 +162,9 @@ impl AppState {
         let entry = self
             .resolve_model(id)
             .map_err(|e| api_error(StatusCode::NOT_FOUND, e.to_string()).into_response())?;
-        let engine = self
-            .engine()
-            .ok_or_else(|| self.unavailable_response(id, false))?;
+        let engine = self.engine().ok_or_else(|| self.unavailable_response(id))?;
         if !engine.loaded().iter().any(|a| a == &entry.alias) {
-            return Err(self.unavailable_response(id, true));
+            return Err(self.unavailable_response(id));
         }
         // Single touch point for the JIT TTL sweeper.
         self.profiles.touch(&entry.alias);
