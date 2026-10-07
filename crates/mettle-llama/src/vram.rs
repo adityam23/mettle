@@ -64,19 +64,55 @@ struct Geometry {
     recurrent_state_per_seq: u64,
 }
 
-/// Read the geometry keys, resolving the arch prefix from
-/// `general.architecture` (falling back to `llama`).
+/// Fallback architecture prefix when a header lacks `general.architecture`.
+const DEFAULT_ARCH: &str = "llama";
+
+/// A top-level string metadata value (`None` when absent or not a string).
+pub(crate) fn str_key<'c>(ctx: &'c GgufContext, key: &str) -> Option<&'c str> {
+    let idx = ctx.find_key(key);
+    (idx >= 0).then(|| ctx.val_str(idx)).flatten()
+}
+
+/// Architecture-prefixed metadata lookup over one GGUF header. The prefix
+/// is `general.architecture` (falling back to `llama`), so
+/// `u32("block_count")` reads `{arch}.block_count`. The single place that
+/// resolves the prefix.
+pub struct ArchKeys<'c> {
+    ctx: &'c GgufContext,
+    arch: String,
+}
+
+impl<'c> ArchKeys<'c> {
+    pub fn new(ctx: &'c GgufContext) -> Self {
+        let arch = str_key(ctx, "general.architecture")
+            .unwrap_or(DEFAULT_ARCH)
+            .to_owned();
+        Self { ctx, arch }
+    }
+
+    /// The resolved architecture (`general.architecture`, else `llama`).
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    /// `{arch}.{name}` as a u32 (`None` when absent).
+    pub fn u32(&self, name: &str) -> Option<u32> {
+        let idx = self.ctx.find_key(&format!("{}.{name}", self.arch));
+        (idx >= 0).then(|| self.ctx.val_u32(idx))
+    }
+}
+
+/// Read one `{arch}.{name}` u32 straight from a GGUF file header. `None`
+/// when the file is unreadable or lacks the key.
+pub fn gguf_arch_u32(gguf: &Path, name: &str) -> Option<u32> {
+    let ctx = GgufContext::from_file(gguf)?;
+    ArchKeys::new(&ctx).u32(name)
+}
+
+/// Read the geometry keys (arch-prefixed, see [`ArchKeys`]).
 fn geometry(ctx: &GgufContext, kv_q8: bool) -> Option<Geometry> {
-    let arch_idx = ctx.find_key("general.architecture");
-    let arch = (arch_idx >= 0)
-        .then(|| ctx.val_str(arch_idx))
-        .flatten()
-        .unwrap_or("llama")
-        .to_owned();
-    let key = |name: &str| {
-        let idx = ctx.find_key(&format!("{arch}.{name}"));
-        (idx >= 0).then(|| ctx.val_u32(idx))
-    };
+    let keys = ArchKeys::new(ctx);
+    let key = |name: &str| keys.u32(name);
 
     let n_layer = u64::from(key("block_count")?);
     let n_embd = u64::from(key("embedding_length")?);
@@ -181,6 +217,47 @@ pub fn estimate_vram(
 /// scaled by `{arch}.embedding_length / 1024`.
 const RERANK_COMPUTE_BYTES_PER_TOKEN_AT_1024: u64 = 768 * 1024;
 
+/// llama.cpp sizes split-KV caches in 256-cell steps per sequence.
+const KV_CELL_ALIGN: usize = 256;
+
+/// Shape of one packed multi-sequence encoder pass (a rerank micro-batch,
+/// or a single-sequence embedding context). With `kv_unified = false` llama.cpp reserves
+/// `kv_cells / n_seqs` cells PER sequence, so every sequence is given the
+/// longest one's length rounded up to [`KV_CELL_ALIGN`].
+///
+/// The single source of that geometry: the planner's cap cost
+/// ([`RerankGeometry::cap_cost`]), the per-call rerank preflight and the
+/// context params actually allocated all derive from it, so estimate and
+/// allocation cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedShape {
+    /// Sequences packed into the pass.
+    pub n_seqs: usize,
+    /// Total tokens decoded in the pass (sizes the compute buffer).
+    pub tokens: usize,
+    /// KV cells reserved across all sequences.
+    pub kv_cells: usize,
+}
+
+impl PackedShape {
+    /// `n_seqs` sequences, the longest `max_len` tokens, `tokens` in total.
+    pub fn new(n_seqs: usize, max_len: usize, tokens: usize) -> Self {
+        Self {
+            n_seqs,
+            tokens,
+            kv_cells: max_len.max(1).div_ceil(KV_CELL_ALIGN) * KV_CELL_ALIGN * n_seqs,
+        }
+    }
+
+    /// A pass over sequences of the given lengths.
+    pub fn of(lens: impl IntoIterator<Item = usize>) -> Self {
+        let (n, max_len, tokens) = lens
+            .into_iter()
+            .fold((0, 0, 0), |(n, m, t), len| (n + 1, m.max(len), t + len));
+        Self::new(n, max_len, tokens)
+    }
+}
+
 /// Precomputed rerank-context cost coefficients for one model (read once
 /// at load; the per-call preflight stays arithmetic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,29 +283,28 @@ impl RerankGeometry {
         }
     }
 
-    /// Cost of a packed pass of `tokens` tokens over a KV of `kv_cells`
-    /// (split-KV: `max_len` rounded to 256 times the sequence count).
-    pub fn cost(&self, kv_cells: usize, tokens: usize) -> RerankContextCost {
+    /// Cost of a packed pass of the given shape.
+    pub fn cost(&self, shape: &PackedShape) -> RerankContextCost {
         RerankContextCost {
-            kv_bytes: self.kv_bytes_per_token * kv_cells as u64,
-            compute_bytes: self.base_bytes + self.compute_bytes_per_token * tokens as u64,
+            kv_bytes: self.kv_bytes_per_token * shape.kv_cells as u64,
+            compute_bytes: self.base_bytes + self.compute_bytes_per_token * shape.tokens as u64,
         }
     }
 }
 
 impl RerankGeometry {
     /// [`rerank_cap_cost`] over already-read coefficients: pure arithmetic,
-    /// so a planner walking several cap rungs parses the header once.
+    /// so a planner walking several cap rungs parses the header once. A
+    /// full pass at the cap with the greedy fill's nominal (roughly even)
+    /// sequence lengths.
     pub fn cap_cost(&self, cap_tokens: usize, micro_batch: usize) -> RerankContextCost {
         let cap = cap_tokens.max(1);
         let n_seqs = micro_batch.max(1).min(cap);
-        let max_len = cap.div_ceil(n_seqs);
-        let kv_cells = max_len.div_ceil(256) * 256 * n_seqs;
-        self.cost(kv_cells, cap)
+        self.cost(&PackedShape::new(n_seqs, cap.div_ceil(n_seqs), cap))
     }
 }
 
-/// Estimated cost of one rerank call's context (residency contract §1.1).
+/// Estimated cost of one rerank pass's context (residency contract §1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RerankContextCost {
     pub kv_bytes: u64,
@@ -355,6 +431,46 @@ mod tests {
         std::fs::write(&path, b"garbage").unwrap();
         assert!(estimate_vram(&path, 4096, false, 16).is_none());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn arch_prefixed_keys_resolve_the_real_arch() {
+        let dir = std::env::temp_dir().join("mettle-vram-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synthetic-arch-keys.gguf");
+        write_synthetic_gguf(&path, "qwen3");
+
+        let ctx = GgufContext::from_file(&path).unwrap();
+        let keys = ArchKeys::new(&ctx);
+        assert_eq!(keys.arch(), "qwen3");
+        assert_eq!(keys.u32("block_count"), Some(36));
+        assert_eq!(keys.u32("missing"), None);
+        assert_eq!(gguf_arch_u32(&path, "embedding_length"), Some(2560));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn packed_shape_rounds_per_sequence_kv() {
+        // Longest sequence 300 → 512 cells per sequence, 3 sequences.
+        let shape = PackedShape::of([300, 10, 256]);
+        assert_eq!(
+            shape,
+            PackedShape {
+                n_seqs: 3,
+                tokens: 566,
+                kv_cells: 512 * 3
+            }
+        );
+        // The planner's nominal cap shape agrees with the same formula:
+        // cap 2048 over 8 sequences = 8 × 256 tokens → 8 × 256 cells.
+        assert_eq!(
+            PackedShape::new(8, 2048_usize.div_ceil(8), 2048),
+            PackedShape::of([256; 8])
+        );
+        let geo = RerankGeometry::with_coefficients(10, 2, 3);
+        let cost = geo.cost(&shape);
+        assert_eq!(cost.kv_bytes, 3 * 512 * 3);
+        assert_eq!(cost.compute_bytes, 10 + 2 * 566);
     }
 
     /// Sanity against a real GGUF (qwen35-4b Q4_K_M from the finance

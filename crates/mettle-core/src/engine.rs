@@ -65,8 +65,10 @@ pub enum RequestKind {
         constraint: GenConstraint,
         streaming: bool,
     },
-    /// Embed a single input with a resident embedding model.
-    Embedding { input: String },
+    /// Embed `inputs` with a resident embedding model. The engine may pack
+    /// several inputs into one context; the reply is a single
+    /// [`EngineResponse::Embeddings`] with one vector per input, in order.
+    Embedding { inputs: Vec<String> },
     /// Score `documents` against `query` with a resident reranker
     /// (cross-encoder). One raw relevance score per document, request order.
     Rerank {
@@ -114,8 +116,9 @@ pub enum EngineResponse {
         usage: UsageInfo,
         logprobs: Vec<TokenLogprob>,
     },
-    /// One embedding vector (for `RequestKind::Embedding`).
-    Embeddings(Vec<f32>),
+    /// One embedding vector per input of a `RequestKind::Embedding`, in
+    /// request order.
+    Embeddings(Vec<Vec<f32>>),
     /// Rerank scores for `RequestKind::Rerank` — one raw relevance score
     /// per document, in request order.
     Scores(Vec<f32>),
@@ -228,31 +231,35 @@ pub async fn rerank_texts(
 }
 
 /// Embed `texts` with a resident embedding model. One vector per input.
-/// Shared by every embedding surface (Ollama, OpenAI, RAG).
+/// Shared by every embedding surface (Ollama, OpenAI, RAG). All texts ride
+/// ONE engine request so the engine can pack them into shared contexts.
 pub async fn embed_texts(
     engine: &dyn Engine,
     model_alias: &str,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, String> {
-    let sender = engine.sender();
-    let mut out = Vec::with_capacity(texts.len());
-    for text in texts {
-        let (tx, mut rx) = mpsc::channel::<EngineResponse>(1);
-        let req = EngineRequest {
-            model: model_alias.to_string(),
-            kind: RequestKind::Embedding {
-                input: text.clone(),
-            },
-            response: tx,
-        };
-        sender.send(req).await.map_err(|e| e.to_string())?;
-        match rx.recv().await {
-            Some(EngineResponse::Embeddings(v)) => out.push(v),
-            Some(EngineResponse::Error(e)) => return Err(e),
-            other => return Err(format!("unexpected embedding response: {other:?}")),
-        }
+    if texts.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(out)
+    let (tx, mut rx) = mpsc::channel::<EngineResponse>(1);
+    let req = EngineRequest {
+        model: model_alias.to_string(),
+        kind: RequestKind::Embedding {
+            inputs: texts.to_vec(),
+        },
+        response: tx,
+    };
+    engine.sender().send(req).await.map_err(|e| e.to_string())?;
+    match rx.recv().await {
+        Some(EngineResponse::Embeddings(v)) if v.len() == texts.len() => Ok(v),
+        Some(EngineResponse::Embeddings(v)) => Err(format!(
+            "engine returned {} embeddings for {} inputs",
+            v.len(),
+            texts.len()
+        )),
+        Some(EngineResponse::Error(e)) => Err(e),
+        other => Err(format!("unexpected embedding response: {other:?}")),
+    }
 }
 
 /// The engine handle the server shares via `AppState`. Implemented by

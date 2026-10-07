@@ -56,10 +56,12 @@ impl FakeEmbedder {
                             }
                         }
                     }
-                    RequestKind::Embedding { input } => {
-                        worker_embed_calls.fetch_add(1, Ordering::SeqCst);
+                    RequestKind::Embedding { inputs } => {
+                        worker_embed_calls.fetch_add(inputs.len(), Ordering::SeqCst);
                         match dim {
-                            Some(dim) => EngineResponse::Embeddings(bag_of_words(input, dim)),
+                            Some(dim) => EngineResponse::Embeddings(
+                                inputs.iter().map(|t| bag_of_words(t, dim)).collect(),
+                            ),
                             None => {
                                 EngineResponse::Error(format!("model {} is not loaded", req.model))
                             }

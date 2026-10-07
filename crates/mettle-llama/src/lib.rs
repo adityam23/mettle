@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -42,7 +43,7 @@ use mettle_core::engine::{
 use mettle_core::model_registry::Pooling;
 
 use crate::scheduler::flash_policy;
-use crate::vram::RerankGeometry;
+use crate::vram::{ArchKeys, PackedShape, RerankContextCost, RerankGeometry};
 use mtp::{MtpLane, MtpParams};
 // Re-exported for integration tests (crash_repro drives the scheduler
 // directly instead of through the engine worker).
@@ -559,11 +560,7 @@ fn load_runtime(
 /// cross-encoder layout.
 fn gguf_rerank_template(path: &std::path::Path) -> Option<String> {
     let ctx = llama_cpp_2::gguf::GgufContext::from_file(path)?;
-    let idx = ctx.find_key("tokenizer.chat_template.rerank");
-    if idx < 0 {
-        return None;
-    }
-    ctx.val_str(idx).map(str::to_string)
+    vram::str_key(&ctx, "tokenizer.chat_template.rerank").map(str::to_string)
 }
 
 /// Architectures whose generation corrupts under n_seq_max > 1 in this
@@ -578,14 +575,11 @@ const HYBRID_SINGLE_SEQ_ARCHS: &[&str] = &[
     "nemotron_h_moe",
 ];
 
-/// Read a GGUF's `general.architecture` metadata value.
+/// Read a GGUF's architecture (see [`ArchKeys::arch`]). `None` when the
+/// file is unreadable.
 fn gguf_architecture(path: &std::path::Path) -> Option<String> {
     let ctx = llama_cpp_2::gguf::GgufContext::from_file(path)?;
-    let idx = ctx.find_key("general.architecture");
-    if idx < 0 {
-        return None;
-    }
-    ctx.val_str(idx).map(str::to_string)
+    Some(ArchKeys::new(&ctx).arch().to_owned())
 }
 
 fn load_one(backend: &LlamaBackend, spec: &ModelLoadSpec, cfg: &LlamaConfig) -> Result<LlamaModel> {
@@ -614,8 +608,13 @@ fn route_request(
         )));
         return;
     };
+    let inline = InlineModel {
+        backend,
+        model: &rt.model,
+        op_offload: rt.op_offload,
+    };
     match kind {
-        RequestKind::Embedding { input } => {
+        RequestKind::Embedding { inputs } => {
             let pooling = match rt.kind {
                 ModelKind::Embedding(p) => p,
                 _ => {
@@ -625,7 +624,7 @@ fn route_request(
                     return;
                 }
             };
-            match embed(backend, &rt.model, pooling, &input, rt.op_offload) {
+            match embed(&inline, pooling, &inputs) {
                 Ok(v) => {
                     let _ = response.blocking_send(EngineResponse::Embeddings(v));
                 }
@@ -642,15 +641,13 @@ fn route_request(
                 return;
             }
             match rerank(
-                backend,
-                &rt.model,
+                &inline,
                 rt.rerank_template.as_deref(),
                 &query,
                 &documents,
                 rt.rerank_micro_tokens,
                 rt.rerank_geometry,
                 cfg.vram_margin_bytes,
-                rt.op_offload,
             ) {
                 Ok(v) => {
                     let _ = response.blocking_send(EngineResponse::Scores(v));
@@ -689,42 +686,85 @@ fn route_request(
     }
 }
 
-/// Embed a single input on a fresh embedding context.
-fn embed(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
-    pooling: Pooling,
-    input: &str,
+/// A resident embedding/rerank model plus what its inline (per-call)
+/// contexts need.
+struct InlineModel<'a> {
+    backend: &'a LlamaBackend,
+    model: &'a LlamaModel,
+    /// See [`ModelRuntime::op_offload`].
     op_offload: bool,
-) -> Result<Vec<f32>> {
-    let tokens = model.str_to_token(input, AddBos::Always)?;
-    anyhow::ensure!(!tokens.is_empty(), "empty embedding input");
+}
 
-    // The context is sized to the model's training length. A longer input
-    // would trip llama.cpp's encoder assert (`n_ubatch >= n_tokens`) and
-    // abort the whole process — fail cleanly instead.
-    let limit = model.n_ctx_train() as usize;
-    anyhow::ensure!(
-        tokens.len() <= limit,
-        "embedding input too long: {} tokens > model context {}",
-        tokens.len(),
-        limit
-    );
+impl<'a> InlineModel<'a> {
+    /// A fresh pooled encoder context sized by `shape`.
+    fn new_context(&self, pooling: Pooling, shape: &PackedShape) -> Result<LlamaContext<'a>> {
+        let params = embed_ctx_params(pooling, shape, self.op_offload);
+        Ok(self.model.new_context(self.backend, params)?)
+    }
+}
 
-    let mut ctx = model.new_context(
-        backend,
-        embed_ctx_params(pooling, tokens.len(), tokens.len(), 1, op_offload),
-    )?;
-    let mut batch = LlamaBatch::new(tokens.len().max(8), 1);
-    for (i, tok) in tokens.iter().enumerate() {
-        batch.add(*tok, i as i32, &[0], false)?;
+/// Decode `seqs` as one batch (sequence `i` = seq id `i`) and return each
+/// sequence's pooled output, in order.
+fn decode_pooled(ctx: &mut LlamaContext, seqs: &[Vec<LlamaToken>]) -> Result<Vec<Vec<f32>>> {
+    let tokens: usize = seqs.iter().map(Vec::len).sum();
+    let mut batch = LlamaBatch::new(tokens.max(8), seqs.len() as i32);
+    for (seq_i, seq) in seqs.iter().enumerate() {
+        for (pos, tok) in seq.iter().enumerate() {
+            batch.add(*tok, pos as i32, &[seq_i as i32], false)?;
+        }
     }
     ctx.decode(&mut batch)?;
+    (0..seqs.len())
+        .map(|seq_i| {
+            ctx.embeddings_seq_ith(seq_i as i32)
+                .map(<[f32]>::to_vec)
+                .map_err(|e| anyhow::anyhow!("embeddings: {e}"))
+        })
+        .collect()
+}
 
-    let emb = ctx
-        .embeddings_seq_ith(0)
-        .map_err(|e| anyhow::anyhow!("embeddings: {e}"))?;
-    Ok(emb.to_vec())
+/// Embed `inputs` (one vector per input, request order).
+///
+/// All inputs share ONE context, sized for the longest input and cleared
+/// between inputs, so a batch costs one context build instead of one per
+/// input — context churn, not decode compute, is what batching saves (per-
+/// token decode cost is flat in sequence count, see [`embed_ctx_params`]).
+/// Each input is still decoded as its own single sequence: packing several
+/// sequences into one pass (the rerank micro-batch) is not exact for
+/// non-causal encoders (bge-m3 drifts to cosine ~0.999 vs. per-input) and
+/// aborts the process for embeddinggemma (`GGML_ASSERT(ggml_can_mul_mat)`
+/// when the packed token count is not a multiple of the sequence count).
+/// Peak memory equals the old one-context-per-input peak for the longest
+/// input, so no extra VRAM preflight is needed.
+fn embed(m: &InlineModel, pooling: Pooling, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    // The context is sized to the inputs. One longer than the training
+    // length would trip llama.cpp's encoder assert (`n_ubatch >= n_tokens`)
+    // and abort the whole process — fail cleanly instead.
+    let limit = m.model.n_ctx_train() as usize;
+    let seqs = inputs
+        .iter()
+        .map(|input| {
+            let tokens = m.model.str_to_token(input, AddBos::Always)?;
+            anyhow::ensure!(!tokens.is_empty(), "empty embedding input");
+            anyhow::ensure!(
+                tokens.len() <= limit,
+                "embedding input too long: {} tokens > model context {}",
+                tokens.len(),
+                limit
+            );
+            Ok(tokens)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some(max_len) = seqs.iter().map(Vec::len).max() else {
+        return Ok(Vec::new());
+    };
+    let mut ctx = m.new_context(pooling, &PackedShape::new(1, max_len, max_len))?;
+    let mut out = Vec::with_capacity(seqs.len());
+    for seq in &seqs {
+        ctx.clear_kv_cache();
+        out.extend(decode_pooled(&mut ctx, std::slice::from_ref(seq))?);
+    }
+    Ok(out)
 }
 
 /// Rerank micro-batch shape: at most this many sequences per context
@@ -748,31 +788,63 @@ fn inline_vram_budget(margin: u64) -> Option<u64> {
     Some(dev.memory()?.free_bytes.saturating_sub(margin))
 }
 
-/// Estimated cost of the context one rerank micro-batch of `chunk` needs.
-fn rerank_batch_cost(geo: &RerankGeometry, chunk: &[Vec<LlamaToken>]) -> vram::RerankContextCost {
-    let total: usize = chunk.iter().map(|s| s.len()).sum();
-    let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(1);
-    let kv_cells = max_len.div_ceil(256) * 256 * chunk.len();
-    geo.cost(kv_cells, total)
+fn shape_of(chunk: &[Vec<LlamaToken>]) -> PackedShape {
+    PackedShape::of(chunk.iter().map(Vec::len))
 }
 
-/// Shrink a greedy-filled batch (whole sequences only) until its estimated
-/// per-call context fits `budget`. Returns `(n, fits)`: the number of
-/// leading sequences to use and whether that batch fits. `budget = None`
-/// (no reachable accelerator) keeps the batch unchanged.
+/// Greedy fill: how many leading sequences one rerank context takes —
+/// whole sequences only, at most `max_seqs` and `max_tokens` packed tokens,
+/// but at least one even when it alone exceeds the token cap.
+fn greedy_fill(seqs: &[Vec<LlamaToken>], max_seqs: usize, max_tokens: usize) -> usize {
+    let mut n = 0usize;
+    let mut tokens = 0usize;
+    for seq in seqs {
+        if n > 0 && (n >= max_seqs || tokens + seq.len() > max_tokens) {
+            break;
+        }
+        n += 1;
+        tokens += seq.len();
+    }
+    n
+}
+
+/// A rerank batch whose estimated context does not fit even at one
+/// sequence (residency contract §1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverBudget {
+    shape: PackedShape,
+    cost: RerankContextCost,
+    budget: u64,
+}
+
+/// Shrink a greedy-filled batch (whole sequences, halving) until its
+/// estimated context fits `budget`. `Ok(n)`: use the leading `n`
+/// sequences. `Err`: not even one sequence fits. `budget = None` (no
+/// reachable accelerator) keeps the batch unchanged.
 fn fit_rerank_batch(
     geo: &RerankGeometry,
     chunk: &[Vec<LlamaToken>],
     budget: Option<u64>,
-) -> (usize, bool) {
-    let mut n = chunk.len();
+) -> Result<usize, OverBudget> {
     let Some(budget) = budget else {
-        return (n, true);
+        return Ok(chunk.len());
     };
-    while n > 1 && rerank_batch_cost(geo, &chunk[..n]).total() > budget {
+    let mut n = chunk.len();
+    loop {
+        let shape = shape_of(&chunk[..n]);
+        let cost = geo.cost(&shape);
+        if cost.total() <= budget {
+            return Ok(n);
+        }
+        if n <= 1 {
+            return Err(OverBudget {
+                shape,
+                cost,
+                budget,
+            });
+        }
         n = n.div_ceil(2);
     }
-    (n, rerank_batch_cost(geo, &chunk[..n]).total() <= budget)
 }
 
 /// Score (query, document) pairs with a cross-encoder reranker.
@@ -784,22 +856,21 @@ fn fit_rerank_batch(
 /// yields `n_cls_out` floats — score = first one (`P(yes)` for Qwen3's
 /// softmaxed yes/no head, the raw logit for bge-reranker).
 fn rerank(
-    backend: &LlamaBackend,
-    model: &LlamaModel,
+    m: &InlineModel,
     template: Option<&str>,
     query: &str,
     documents: &[String],
     micro_tokens: usize,
     geometry: Option<RerankGeometry>,
     vram_margin_bytes: u64,
-    op_offload: bool,
-) -> Result<Vec<f32>, mettle_core::engine::RerankError> {
+) -> Result<Vec<f32>, RerankError> {
+    const MIB: u64 = 1024 * 1024;
     // Everything that can fail is an ordinary engine error except the §1.1
     // preflight refusal, which returns `ContextVram`.
     fn other(e: impl std::fmt::Display) -> RerankError {
         RerankError::Other(e.to_string())
     }
-    let seqs = rerank_sequences(model, template, query, documents).map_err(other)?;
+    let seqs = rerank_sequences(m.model, template, query, documents).map_err(other)?;
     if seqs.is_empty() {
         return Ok(Vec::new());
     }
@@ -811,75 +882,45 @@ fn rerank(
     // reading could admit an over-committing batch.
     let vram_budget = geometry.and_then(|_| inline_vram_budget(vram_margin_bytes));
     let mut scores = Vec::with_capacity(seqs.len());
-    let mut batch_seqs: &[Vec<LlamaToken>] = &seqs;
-    while !batch_seqs.is_empty() {
-        // Greedy fill: take whole sequences while both caps hold (at least
-        // one sequence per context, even when it alone exceeds the token cap).
-        let mut n = 0usize;
-        let mut tokens = 0usize;
-        for seq in batch_seqs {
-            let len = seq.len();
-            if n > 0 && (n >= RERANK_MICRO_BATCH || tokens + len > micro_tokens) {
-                break;
-            }
-            n += 1;
-            tokens += len;
-        }
+    let mut rest: &[Vec<LlamaToken>] = &seqs;
+    while !rest.is_empty() {
+        let mut n = greedy_fill(rest, RERANK_MICRO_BATCH, micro_tokens);
         // §1.1 preflight: a ggml/CUDA allocation failure aborts the whole
         // process, so never attempt a context we cannot fit. Halve the
         // batch (whole sequences) until it fits; if even one sequence does
         // not, refuse with the structured reason and keep the process up.
         if let Some(geo) = geometry {
-            let (fit_n, fits) = fit_rerank_batch(&geo, &batch_seqs[..n], vram_budget);
-            n = fit_n;
-            if !fits {
-                let cost = rerank_batch_cost(&geo, &batch_seqs[..n]);
-                let budget = vram_budget.unwrap_or(0);
-                return Err(RerankError::ContextVram(format!(
+            n = fit_rerank_batch(&geo, &rest[..n], vram_budget).map_err(|o| {
+                RerankError::ContextVram(format!(
                     "rerank context needs ~{} MiB ({} tokens), {} MiB free after margin",
-                    cost.total() / (1024 * 1024),
-                    batch_seqs[..n].iter().map(|s| s.len()).sum::<usize>(),
-                    budget / (1024 * 1024)
-                )));
-            }
+                    o.cost.total() / MIB,
+                    o.shape.tokens,
+                    o.budget / MIB
+                ))
+            })?;
         }
-        let (chunk, rest) = batch_seqs.split_at(n);
-        batch_seqs = rest;
-        let total: usize = chunk.iter().map(|s| s.len()).sum();
-        let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(1);
-        let kv_cells = max_len.div_ceil(256) * 256 * chunk.len();
-        let params = embed_ctx_params(Pooling::Rank, kv_cells, total, chunk.len(), op_offload);
+        let (chunk, tail) = rest.split_at(n);
+        rest = tail;
+        let shape = shape_of(chunk);
         let t0 = std::time::Instant::now();
-        let mut ctx = model.new_context(backend, params).map_err(other)?;
+        let mut ctx = m.new_context(Pooling::Rank, &shape).map_err(other)?;
         let create_ms = t0.elapsed().as_millis();
-        let mut batch = LlamaBatch::new(total.max(8), chunk.len() as i32);
-        for (seq_i, seq) in chunk.iter().enumerate() {
-            for (pos, tok) in seq.iter().enumerate() {
-                batch
-                    .add(*tok, pos as i32, &[seq_i as i32], false)
-                    .map_err(other)?;
-            }
-        }
         let t1 = std::time::Instant::now();
-        ctx.decode(&mut batch).map_err(other)?;
+        let pooled = decode_pooled(&mut ctx, chunk).map_err(other)?;
         tracing::debug!(
             rerank_batch = %format!(
-                "n_seq={} tokens={total} ctx_create={create_ms}ms decode={}ms",
-                chunk.len(),
+                "n_seq={} tokens={} ctx_create={create_ms}ms decode={}ms",
+                shape.n_seqs,
+                shape.tokens,
                 t1.elapsed().as_millis()
             ),
             "rerank micro-batch"
         );
-        for seq_i in 0..chunk.len() {
-            let emb = ctx
-                .embeddings_seq_ith(seq_i as i32)
-                .map_err(|e| other(format!("rerank scores: {e}")))?;
-            if emb.is_empty() {
-                return Err(other(
-                    "model produced no rerank score (missing classifier head?)",
-                ));
-            }
-            scores.push(emb[0]);
+        for emb in pooled {
+            let score = emb.first().copied().ok_or_else(|| {
+                other("model produced no rerank score (missing classifier head?)")
+            })?;
+            scores.push(score);
         }
     }
     Ok(scores)
@@ -1112,19 +1153,13 @@ pub(crate) fn logprobs_for(
 // Context params
 // ---------------------------------------------------------------------------
 
-fn embed_ctx_params(
-    pooling: Pooling,
-    kv_cells: usize,
-    pp_tokens: usize,
-    n_seqs: usize,
-    op_offload: bool,
-) -> LlamaContextParams {
-    // `pp_tokens` sizes the prefill compute buffer (n_batch / n_ubatch must
-    // cover the whole pass — encoder contexts cannot split a sequence across
-    // ubatches, llama.cpp asserts `n_ubatch >= n_tokens`); `kv_cells` sizes
-    // the KV cache (with kv_unified=false, kv_cells/n_seq_max cells are
-    // reserved PER sequence, so multi-seq callers pass
-    // kv_cells = max_len * n_seqs). Measured on the bench GPU (2026-09-10,
+fn embed_ctx_params(pooling: Pooling, shape: &PackedShape, op_offload: bool) -> LlamaContextParams {
+    // `shape.tokens` sizes the prefill compute buffer (n_batch / n_ubatch
+    // must cover the whole pass — encoder contexts cannot split a sequence
+    // across ubatches, llama.cpp asserts `n_ubatch >= n_tokens`);
+    // `shape.kv_cells` sizes the KV cache (with kv_unified=false,
+    // kv_cells/n_seq_max cells are reserved PER sequence — see
+    // [`PackedShape`], which the VRAM preflight costs identically). Measured on the bench GPU (2026-09-10,
     // adoption contract §1.3): per-token decode cost is FLAT in sequence
     // count (~0.55 ms/token for the 0.6B reranker) under either buffer
     // layout, and SPLIT KV preserves score ordering better than unified
@@ -1135,11 +1170,11 @@ fn embed_ctx_params(
     // wanted a 2.5 GiB compute buffer).
     // Positions beyond the training length are out-of-distribution —
     // callers truncate first.
-    let n_ctx = (kv_cells.max(1)) as u32;
-    let n_pp = (pp_tokens.max(1)) as u32;
+    let n_ctx = (shape.kv_cells.max(1)) as u32;
+    let n_pp = (shape.tokens.max(1)) as u32;
     LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
-        .with_n_seq_max(n_seqs.max(1) as u32)
+        .with_n_seq_max(shape.n_seqs.max(1) as u32)
         .with_kv_unified(false)
         .with_n_batch(n_pp)
         .with_n_ubatch(n_pp)
@@ -1167,28 +1202,18 @@ fn embed_ctx_params(
 // GGUF inspection (for `mettled tune` partial-offload sizing)
 // ---------------------------------------------------------------------------
 
-/// Read the transformer layer count from a GGUF file header. `None` when
-/// the file is unreadable or lacks the key (e.g. embedding models).
+/// Read the transformer layer count (`{arch}.block_count`) from a GGUF file
+/// header. `None` when the file is unreadable or lacks the key.
 pub fn gguf_layer_count(path: &std::path::Path) -> Option<u32> {
-    let ctx = llama_cpp_2::gguf::GgufContext::from_file(path)?;
-    let idx = ctx.find_key("llama.block_count");
-    (idx >= 0).then(|| ctx.val_u32(idx))
+    vram::gguf_arch_u32(path, "block_count")
 }
+
 /// Read an embedding model's embedding dimension from a GGUF file header
 /// (`{arch}.embedding_length`). Used to size a turbovec collection to the
 /// actual model — no hardcoded 768. `None` when the file is unreadable or
-/// lacks the key. The arch prefix is resolved from `general.architecture`
-/// exactly as [`vram::estimate_vram`] does.
+/// lacks the key.
 pub fn gguf_embedding_dim(path: &std::path::Path) -> Option<u32> {
-    let ctx = llama_cpp_2::gguf::GgufContext::from_file(path)?;
-    let arch_idx = ctx.find_key("general.architecture");
-    let arch = (arch_idx >= 0)
-        .then(|| ctx.val_str(arch_idx))
-        .flatten()
-        .unwrap_or("llama")
-        .to_owned();
-    let idx = ctx.find_key(&format!("{arch}.embedding_length"));
-    (idx >= 0).then(|| ctx.val_u32(idx))
+    vram::gguf_arch_u32(path, "embedding_length")
 }
 
 #[cfg(test)]
@@ -1211,23 +1236,32 @@ mod tests {
         let batch = seqs(&[512, 512, 512, 512]);
 
         // Everything fits.
-        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(4096 * 1024));
-        assert_eq!((n, fits), (4, true));
+        assert_eq!(fit_rerank_batch(&geo, &batch, Some(4096 * 1024)), Ok(4));
 
         // 2 sequences (1024 tokens = 1 MiB) fit, 4 (2 MiB) do not.
-        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(1500 * 1024));
-        assert_eq!((n, fits), (2, true));
+        assert_eq!(fit_rerank_batch(&geo, &batch, Some(1500 * 1024)), Ok(2));
 
         // One sequence (512 tokens = 512 KiB) is the last rung that fits.
-        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(600 * 1024));
-        assert_eq!((n, fits), (1, true));
+        assert_eq!(fit_rerank_batch(&geo, &batch, Some(600 * 1024)), Ok(1));
 
-        // Below one sequence: refuse instead of allocating.
-        let (n, fits) = fit_rerank_batch(&geo, &batch, Some(100 * 1024));
-        assert_eq!((n, fits), (1, false));
+        // Below one sequence: refuse instead of allocating, reporting the
+        // one-sequence shape and its cost.
+        let over = fit_rerank_batch(&geo, &batch, Some(100 * 1024)).unwrap_err();
+        assert_eq!(over.shape, PackedShape::of([512]));
+        assert_eq!(over.cost.total(), 512 * 1024);
+        assert_eq!(over.budget, 100 * 1024);
 
         // No reachable accelerator: no preflight at all.
-        let (n, fits) = fit_rerank_batch(&geo, &batch, None);
-        assert_eq!((n, fits), (4, true));
+        assert_eq!(fit_rerank_batch(&geo, &batch, None), Ok(4));
+    }
+
+    #[test]
+    fn greedy_fill_respects_seq_and_token_caps() {
+        // Caps: 3 sequences, 100 tokens. Sequence cap.
+        assert_eq!(greedy_fill(&seqs(&[10, 10, 10, 10]), 3, 100), 3);
+        // Token cap: 40 + 50 fit, +20 would exceed 100.
+        assert_eq!(greedy_fill(&seqs(&[40, 50, 20]), 3, 100), 2);
+        // A lone oversized sequence still runs.
+        assert_eq!(greedy_fill(&seqs(&[500, 10]), 3, 100), 1);
     }
 }
