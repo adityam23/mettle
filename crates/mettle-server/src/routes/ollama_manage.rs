@@ -268,30 +268,25 @@ async fn download_model_files(
     entry: &RegistryEntry,
     progress: Option<tokio::sync::mpsc::UnboundedSender<PullProgress>>,
 ) -> Result<(), String> {
-    // Boot-path gate parity (`weights::ensure_weights`): refuse anything the
-    // boot path would refuse, before any network call. A `[[model]]` entry
-    // with no built-in alias has the bare alias as its "repo" (nothing to
-    // fetch), and a non-GGUF builtin names no quantised file — pulling it
-    // would fetch a full safetensors set the GGUF engine cannot load.
-    if !crate::weights::is_downloadable(entry) {
-        let reason = if entry.local_path.is_some() {
-            "it is configured from a local path"
-        } else {
-            "it names no quantised GGUF file in its Hugging Face repo"
-        };
-        return Err(format!("model '{}' cannot be pulled: {}", entry.alias, reason));
-    }
+    use crate::weights::{ProgressSink, WeightEvent};
 
-    let sink: Option<crate::weights::ProgressSink> = progress.map(|tx| {
-        std::sync::Arc::new(move |p: crate::weights::WeightProgress| {
-            let _ = tx.send(progress_bytes(
-                format!("downloading {}", p.filename),
-                p.bytes_total,
-                p.bytes_done,
-            ));
-        }) as crate::weights::ProgressSink
+    // `fetch_model_files` applies the boot path's gate (`WeightSource`): an
+    // entry with no Hugging Face file to fetch — a local path, or no named
+    // quantised GGUF — is refused before any network call.
+    let sink: Option<ProgressSink> = progress.map(|tx| {
+        Arc::new(move |event: WeightEvent| {
+            if let WeightEvent::Progress(p) = event {
+                let _ = tx.send(progress_bytes(
+                    format!("downloading {}", p.filename),
+                    p.bytes_total,
+                    p.bytes_done,
+                ));
+            }
+        }) as ProgressSink
     });
-    crate::weights::fetch_model_files(entry, sink).await
+    crate::weights::fetch_model_files(entry, sink)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Load a freshly pulled model into the running engine. The engine worker

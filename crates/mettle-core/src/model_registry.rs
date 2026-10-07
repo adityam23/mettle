@@ -83,6 +83,62 @@ pub struct RegistryEntry {
     pub embedding_dim: Option<usize>,
 }
 
+/// Where an entry's weight file comes from.
+///
+/// The single statement of the "local path / named HF file / any cached GGUF"
+/// rule: path resolution, first-run acquisition and `/api/pull` all match on
+/// this instead of re-deriving it from `local_path` / `hf_quant_filename`.
+/// Derived on demand from the entry's fields, so it can never disagree with
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightSource<'a> {
+    /// `[[model]] path`: operator-provided. Never downloaded — a missing
+    /// file is a config error.
+    Local(&'a std::path::Path),
+    /// A named GGUF in a Hugging Face repo: resolved from the HF cache and
+    /// downloadable. A named file resolves to THAT file only.
+    HfFile { repo: &'a str, file: &'a str },
+    /// No named file: whatever GGUF this repo already has in the HF cache.
+    /// Not downloadable. A `[[model]]` id that matches no built-in alias
+    /// lands here with the id itself as the repo id (a bare HF repo id such
+    /// as `org/model-GGUF` resolves from the cache this way).
+    HfAnyGguf { repo: &'a str },
+}
+
+impl WeightSource<'_> {
+    /// Can this source be fetched from Hugging Face?
+    pub fn is_downloadable(&self) -> bool {
+        matches!(self, WeightSource::HfFile { .. })
+    }
+}
+
+impl RegistryEntry {
+    /// Where this entry's weight file comes from (see [`WeightSource`]).
+    pub fn weight_source(&self) -> WeightSource<'_> {
+        match (&self.local_path, &self.hf_quant_filename) {
+            (Some(path), _) => WeightSource::Local(path),
+            (None, Some(file)) => WeightSource::HfFile {
+                repo: &self.hf_repo_id,
+                file,
+            },
+            (None, None) => WeightSource::HfAnyGguf {
+                repo: &self.hf_repo_id,
+            },
+        }
+    }
+
+    /// The vision projector's filename in `hf_repo_id`, for
+    /// [`LoaderKind::GgufVision`] entries.
+    pub fn mmproj_filename(&self) -> Option<&str> {
+        match &self.loader_kind {
+            LoaderKind::GgufVision {
+                mmproj_filename, ..
+            } => Some(mmproj_filename),
+            _ => None,
+        }
+    }
+}
+
 /// The model registry holds built-in aliases (Gemma 4 family) and
 /// user-supplied overrides. It resolves Ollama-style `model:tag` names
 /// to Hugging Face repos.
@@ -635,17 +691,67 @@ mod tests {
     fn user_override_default() {
         let mut reg = ModelRegistry::new();
         reg.apply_user_models(&[crate::config::ModelEntry {
-            id: "gemma4:e2b".into(),
             default: true,
-            path: None,
-            n_gpu_layers: None,
-            mmproj_path: None,
-            role: None,
-            min_ctx: None,
-            draft: None,
+            ..crate::config::ModelEntry::new("gemma4:e2b")
         }]);
         let def = reg.default();
         assert_eq!(def.alias, "gemma4:e2b");
+    }
+
+    #[test]
+    fn weight_source_is_derived_from_the_entry() {
+        let mut reg = ModelRegistry::new();
+        // A built-in naming its quant file: a downloadable HF file.
+        let e2b = reg.resolve("gemma4:e2b").unwrap().clone();
+        assert_eq!(
+            e2b.weight_source(),
+            WeightSource::HfFile {
+                repo: "ggml-org/gemma-4-E2B-it-GGUF",
+                file: "gemma-4-E2B-it-Q4_0.gguf",
+            }
+        );
+        assert!(e2b.weight_source().is_downloadable());
+        // A built-in with no quant file: any cached GGUF, not downloadable.
+        let qwen = reg.resolve("qwen3-reranker-0.6b").unwrap();
+        assert_eq!(
+            qwen.weight_source(),
+            WeightSource::HfAnyGguf {
+                repo: "Qwen/Qwen3-Reranker-0.6B"
+            }
+        );
+        assert!(!qwen.weight_source().is_downloadable());
+
+        // A configured path wins over the built-in's HF file, and an unknown
+        // id resolves from the cache under the id itself.
+        let local = std::path::PathBuf::from("/models/e2b.gguf");
+        reg.apply_user_models(&[
+            crate::config::ModelEntry {
+                path: Some(local.clone()),
+                ..crate::config::ModelEntry::new("gemma4:e2b")
+            },
+            crate::config::ModelEntry::new("org/custom-GGUF"),
+        ]);
+        let e2b = reg.resolve("gemma4:e2b").unwrap();
+        assert_eq!(e2b.weight_source(), WeightSource::Local(&local));
+        assert!(!e2b.weight_source().is_downloadable());
+        let custom = reg.resolve("org/custom-GGUF").unwrap();
+        assert_eq!(
+            custom.weight_source(),
+            WeightSource::HfAnyGguf {
+                repo: "org/custom-GGUF"
+            }
+        );
+        assert!(!custom.weight_source().is_downloadable());
+    }
+
+    #[test]
+    fn mmproj_filename_only_for_vision_entries() {
+        let reg = ModelRegistry::new();
+        assert_eq!(
+            reg.resolve("unlimited-ocr").unwrap().mmproj_filename(),
+            Some("mmproj-Unlimited-OCR-F16.gguf")
+        );
+        assert_eq!(reg.resolve("gemma4:e2b").unwrap().mmproj_filename(), None);
     }
 
     #[test]

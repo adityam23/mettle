@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use mettle_core::config::{RootConfig, SpeculativeSetting};
-use mettle_core::model_registry::ModelRegistry;
+use mettle_core::model_registry::{ModelRegistry, RegistryEntry, WeightSource};
 
 /// Headroom reserved for the KV cache, activations, and the mmproj
 /// projector on top of the summed model weights.
@@ -65,23 +65,25 @@ fn detect_vram_gb() -> Option<f32> {
     (max_mib > 0.0).then_some(max_mib / 1024.0)
 }
 
+/// The model's weight file as tuning sizes it: the configured path, or the
+/// named GGUF in the HF cache. An entry that names no file is estimated.
+fn weight_file(entry: &RegistryEntry) -> Option<PathBuf> {
+    match entry.weight_source() {
+        WeightSource::Local(path) => Some(path.to_path_buf()),
+        WeightSource::HfFile { repo, file } => crate::weights::cached_file(repo, file),
+        WeightSource::HfAnyGguf { .. } => None,
+    }
+}
+
 /// Size of one model in GB: the resolved GGUF's file size when present,
 /// else an estimate from parameter count and quantization.
 fn model_size_gb(alias: &str, registry: &ModelRegistry, is_vision: bool) -> f32 {
     let file_gb = registry
         .resolve(alias)
         .ok()
-        .and_then(|e| {
-            let p = if let Some(local) = &e.local_path {
-                local.clone()
-            } else {
-                let filename = e.hf_quant_filename.as_ref()?;
-                hf_hub::Cache::from_env()
-                    .model(e.hf_repo_id.clone())
-                    .get(filename)?
-            };
-            std::fs::metadata(&p).ok().map(|m| m.len() as f32 / 1e9)
-        })
+        .and_then(weight_file)
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() as f32 / 1e9)
         .unwrap_or(0.0);
     if file_gb > 0.0 {
         return file_gb + if is_vision { MMPROJ_GB } else { 0.0 };
@@ -108,15 +110,8 @@ fn layers_for(size_gb: f32, budget_gb: &mut f32, alias: &str, registry: &ModelRe
         let n_layers = registry
             .resolve(alias)
             .ok()
-            .and_then(|e| {
-                let p = e.local_path.clone().or_else(|| {
-                    let filename = e.hf_quant_filename.as_ref()?;
-                    hf_hub::Cache::from_env()
-                        .model(e.hf_repo_id.clone())
-                        .get(filename)
-                })?;
-                mettle_llama::gguf_layer_count(&p)
-            })
+            .and_then(weight_file)
+            .and_then(|p| mettle_llama::gguf_layer_count(&p))
             .unwrap_or(50);
         let layers = ((*budget_gb / size_gb) * n_layers as f32).ceil() as u32;
         *budget_gb = 0.0;
@@ -161,16 +156,7 @@ fn write_config(config: &RootConfig, output: Option<PathBuf>, vram_gb: f32) -> i
     let profile = mettle_core::config::RootConfig::default().profile.remove(0);
     for slot in &profile.slots {
         if !models.iter().any(|m| m.id == slot.id) {
-            models.push(mettle_core::config::ModelEntry {
-                id: slot.id.clone(),
-                default: false,
-                path: None,
-                n_gpu_layers: None,
-                mmproj_path: None,
-                role: None,
-                min_ctx: None,
-                draft: None,
-            });
+            models.push(mettle_core::config::ModelEntry::new(slot.id.clone()));
         }
     }
 

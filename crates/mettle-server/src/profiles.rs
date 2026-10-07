@@ -992,67 +992,60 @@ impl ProfileManager {
                 .filter_map(|slot| reg.resolve(&slot.id).ok().cloned())
                 .collect()
         };
+        use crate::weights::{WeightError, WeightEvent};
+
         let mut first_err: Option<(Option<String>, String)> = None;
         for entry in pinned {
-            if crate::weights::model_files_present(&entry) {
-                continue;
-            }
-            // A resolvable GGUF with only a projector missing is not a config
-            // error: it is repairable when the entry is downloadable, and a
-            // local-path entry must not be reported as "path does not exist".
-            if crate::llama_bridge::resolve_gguf_path(&entry).is_ok()
-                && !crate::weights::is_downloadable(&entry)
-            {
-                continue;
-            }
-            // Not downloadable: never a boot failure (other slots may cover
-            // the role), but never silent either - a slot pinned by the
-            // active profile that cannot be acquired is a config error and
-            // shows up as an unloaded slot in `/engine/status`.
-            if let Some(p) = &entry.local_path {
-                tracing::warn!(
-                    "profile '{name}': slot '{}' is not on disk and its configured local path '{}' does not exist",
-                    entry.alias,
-                    p.display()
-                );
-                continue;
-            }
-            if !crate::weights::is_downloadable(&entry) {
-                tracing::warn!(
-                    "profile '{name}': slot '{}' has no downloadable GGUF (repo '{}', no quant file); \
-                     skipping - configure a local path to serve it",
-                    entry.alias,
-                    entry.hf_repo_id
-                );
-                continue;
-            }
-            let model = entry.alias.clone();
-            self.set_phase(Phase::downloading(model.clone(), None));
+            let model: Arc<str> = Arc::from(entry.alias.as_str());
             let manager = Arc::clone(self);
-            let phase_model = model.clone();
-            let sink: crate::weights::ProgressSink =
-                Arc::new(move |p: crate::weights::WeightProgress| {
-                    manager.set_phase(Phase::downloading(
-                        phase_model.clone(),
-                        Some((p.bytes_done, p.bytes_total)),
-                    ));
-                });
-            if let Err(e) = crate::weights::ensure_weights(&entry, offline, Some(sink)).await {
-                let msg = format!("{e}");
-                // The consumer wants to know WHICH model failed, not which
-                // profile was booting.
-                self.set_phase(Phase::failed(
-                    Some(model.clone()),
-                    Some(UnavailableReason::NotResident),
-                    Some(msg.clone()),
-                ));
-                tracing::warn!("profile '{name}': acquiring '{model}' failed: {msg}");
-                if first_err.is_none() {
-                    first_err = Some((Some(model.clone()), msg));
+            let phase_model = Arc::clone(&model);
+            // Throttled upstream (about one event per percent), so a phase
+            // write per event is cheap.
+            let sink: crate::weights::ProgressSink = Arc::new(move |event: WeightEvent| {
+                let bytes = match event {
+                    WeightEvent::Fetching => None,
+                    WeightEvent::Progress(p) => Some((p.bytes_done, p.bytes_total)),
+                };
+                manager.set_phase(Phase::downloading(phase_model.to_string(), bytes));
+            });
+            match crate::weights::ensure_weights(&entry, offline, Some(sink)).await {
+                Ok(acquired) => {
+                    if acquired.downloaded {
+                        self.set_phase(Phase::loading(Some(model.to_string())));
+                    }
                 }
-                continue;
+                // Not acquirable: never a boot failure (other slots may cover
+                // the role), but never silent either - a slot pinned by the
+                // active profile that cannot be acquired is a config error
+                // and shows up as an unloaded slot in `/engine/status`.
+                Err(WeightError::LocalPathMissing { path, .. }) => {
+                    tracing::warn!(
+                        "profile '{name}': slot '{model}' is not on disk and its configured local path '{}' does not exist",
+                        path.display()
+                    );
+                }
+                Err(WeightError::NotDownloadable { .. }) => {
+                    tracing::warn!(
+                        "profile '{name}': slot '{model}' has no downloadable GGUF (repo '{}', no quant file); \
+                         skipping - configure a local path to serve it",
+                        entry.hf_repo_id
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    // The consumer wants to know WHICH model failed, not which
+                    // profile was booting.
+                    self.set_phase(Phase::failed(
+                        Some(model.to_string()),
+                        Some(UnavailableReason::NotResident),
+                        Some(msg.clone()),
+                    ));
+                    tracing::warn!("profile '{name}': acquiring '{model}' failed: {msg}");
+                    if first_err.is_none() {
+                        first_err = Some((Some(model.to_string()), msg));
+                    }
+                }
             }
-            self.set_phase(Phase::loading(Some(model)));
         }
         match first_err {
             Some(e) => Err(e),

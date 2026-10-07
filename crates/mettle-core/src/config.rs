@@ -238,6 +238,24 @@ pub struct ModelEntry {
     pub draft: Option<String>,
 }
 
+impl ModelEntry {
+    /// A catalog entry for `id` with every optional field unset: not the
+    /// default, HF-cache resolution, engine-wide offload, inferred role, no
+    /// drafter.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            default: false,
+            path: None,
+            n_gpu_layers: None,
+            mmproj_path: None,
+            role: None,
+            min_ctx: None,
+            draft: None,
+        }
+    }
+}
+
 fn default_models() -> Vec<ModelEntry> {
     // Adoption contract §1.4 (2026-09-10): the shipped default catalog is
     // the bench-proven qwen3 retrieval set plus the gemma4 chat model (chat
@@ -247,14 +265,8 @@ fn default_models() -> Vec<ModelEntry> {
     // checkouts resolve via config paths when a user pins them.
     fn entry(id: &str, default: bool) -> ModelEntry {
         ModelEntry {
-            id: id.into(),
             default,
-            path: None,
-            n_gpu_layers: None,
-            mmproj_path: None,
-            role: None,
-            min_ctx: None,
-            draft: None,
+            ..ModelEntry::new(id)
         }
     }
     vec![
