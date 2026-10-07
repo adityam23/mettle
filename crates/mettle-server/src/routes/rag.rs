@@ -1,16 +1,20 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use mettle_core::engine::{EngineRequest, EngineResponse, GenConstraint, RequestKind};
+use mettle_core::error::CoreError;
 use mettle_core::hooks::{Hit, RequestCtx};
+use mettle_core::model_registry::{DefaultRole, RegistryEntry};
 use mettle_core::retrieval::{
-    chunk_document, Citation, Document, DocumentSummary, RagChatRequest, RagChatResponse,
-    RagChatStreamChunk, SearchMode, SearchRequest,
+    chunk_document, Chunk, Citation, Collection, Document, RagChatRequest, RagChatResponse,
+    RagChatStreamChunk, ScoredChunk, SearchMode, SearchRequest,
 };
 use mettle_core::stream::{engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt};
 use mettle_core::timing::timestamp_iso8601;
@@ -20,9 +24,33 @@ use crate::llama_bridge::{convert_options, usage_to_timing};
 use crate::response_stream::NdJsonStream;
 use crate::state::AppState;
 
+/// A finished error response. Every helper and handler here returns its
+/// error this way, so `?` short-circuits straight to the client. Boxed so
+/// `Result<_, RouteError>` stays small (a bare `Response` error trips
+/// `clippy::result_large_err`).
+pub struct RouteError(Box<Response>);
+
+impl From<Response> for RouteError {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl IntoResponse for RouteError {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
+type RouteResult<T = Response> = Result<T, RouteError>;
+
+/// The standard `{"error": ...}` body as a [`RouteError`].
+fn route_error(status: StatusCode, msg: impl Into<String>) -> RouteError {
+    api_error(status, msg).into_response().into()
+}
+
 /// Map a CoreError to the HTTP status it should produce.
-fn core_error_status(e: &mettle_core::error::CoreError) -> StatusCode {
-    use mettle_core::error::CoreError;
+fn core_error_status(e: &CoreError) -> StatusCode {
     match e {
         CoreError::Conflict(_) => StatusCode::CONFLICT,
         CoreError::CollectionNotFound(_)
@@ -31,6 +59,54 @@ fn core_error_status(e: &mettle_core::error::CoreError) -> StatusCode {
         CoreError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// A CoreError as the error response its status maps to.
+fn core_error(e: CoreError) -> RouteError {
+    route_error(core_error_status(&e), e.to_string())
+}
+
+/// Lock a std mutex, mapping poisoning to the 500 every route returns.
+fn lock<T>(mutex: &Mutex<T>) -> RouteResult<MutexGuard<'_, T>> {
+    mutex
+        .lock()
+        .map_err(|_| route_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned"))
+}
+
+/// Run synchronous work (SQLite, index-file I/O, GGUF header reads) on the
+/// blocking pool so it never stalls an async executor thread. The closure
+/// owns everything it touches, so no `MutexGuard` can cross an `.await`.
+async fn run_blocking<R: Send + 'static>(
+    f: impl FnOnce() -> RouteResult<R> + Send + 'static,
+) -> RouteResult<R> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        route_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blocking task failed: {e}"),
+        )
+    })?
+}
+
+/// Run `f` against the locked collection on the blocking pool.
+async fn with_collection<R: Send + 'static>(
+    handle: &CollectionHandle,
+    f: impl FnOnce(&mut Collection) -> R + Send + 'static,
+) -> RouteResult<R> {
+    let handle = Arc::clone(handle);
+    run_blocking(move || Ok(f(&mut *lock(&handle)?))).await
+}
+
+/// The embedder alias a request names: empty or `"default"` selects the
+/// registry's default embedding model, anything else passes through.
+fn embedding_alias(state: &AppState, name: &str) -> RouteResult<String> {
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| route_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned"))?;
+    Ok(registry
+        .default_alias_for(name, DefaultRole::Embedding)
+        .unwrap_or(name)
+        .to_owned())
 }
 
 /// Embed `texts` with the collection's embedding model.
@@ -51,20 +127,8 @@ async fn embed_for_collection(
     collection: &str,
     dim: usize,
     texts: &[String],
-) -> Result<Vec<f32>, axum::response::Response> {
-    let alias = if embedding_model.is_empty() || embedding_model == "default" {
-        state
-            .registry
-            .read()
-            .map_err(|_| {
-                api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-            })?
-            .default_embedding()
-            .alias
-            .clone()
-    } else {
-        embedding_model.to_string()
-    };
+) -> RouteResult<Vec<f32>> {
+    let alias = embedding_alias(state, embedding_model)?;
 
     // The engine keys loaded models by their canonical registry alias, so the
     // request must carry it: a collection created with a short name
@@ -75,17 +139,16 @@ async fn embed_for_collection(
     let vectors = mettle_core::engine::embed_texts(engine.as_ref(), &alias, texts)
         .await
         .map_err(|e| {
-            api_error(
+            route_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("embedding via collection embedder '{alias}' failed: {e}"),
             )
-            .into_response()
         })?;
 
     let mut flat = Vec::with_capacity(texts.len() * dim);
     for v in vectors {
         if v.len() != dim {
-            return Err(api_error(
+            return Err(route_error(
                 StatusCode::CONFLICT,
                 format!(
                     "embedding model '{}' produces {}-d vectors but collection '{}' \
@@ -95,8 +158,7 @@ async fn embed_for_collection(
                     collection,
                     dim
                 ),
-            )
-            .into_response());
+            ));
         }
         flat.extend_from_slice(&v);
     }
@@ -120,96 +182,63 @@ pub struct CreateCollectionRequest {
 pub async fn create_collection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCollectionRequest>,
-) -> axum::response::Response {
-    let embedding_model = if req.embedding_model.is_empty() || req.embedding_model == "default" {
-        match state.registry.read() {
-            Ok(r) => r.default_embedding().alias.clone(),
-            Err(_) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
-                    .into_response()
-            }
-        }
-    } else {
-        req.embedding_model.clone()
-    };
-
+) -> RouteResult {
     // Canonicalise before storing. `resolve_model` is what applies the
     // `:latest` fallback, and the engine keys loaded models by that canonical
     // alias, so a collection created as "bge-m3" must be stored (and used) as
-    // "bge-m3:latest" - the same thing the "default" arm above already does.
-    let embedding_model = match state.resolve_model(&embedding_model) {
-        Ok(entry) => entry.alias,
-        Err(e) => return api_error(StatusCode::NOT_FOUND, e.to_string()).into_response(),
-    };
+    // "bge-m3:latest" - the same thing the default alias already is.
+    let entry = state
+        .resolve_model(&embedding_alias(&state, &req.embedding_model)?)
+        .map_err(|e| route_error(StatusCode::NOT_FOUND, e.to_string()))?;
 
-    // The collection's turbovec index is built at the embedding model's real
-    // dimension. Resolve it from the GGUF header when the model is on disk,
-    // else fall back to the registry's declared dim. Never hardcode 768 —
-    // bge-m3/qwen3-embedding are 1024.
-    let dim = match resolve_embedding_dim(&state, &embedding_model) {
-        Ok(d) => d,
-        Err((status, msg)) => return api_error(status, &msg).into_response(),
-    };
-
-    match state.collections.lock() {
-        Ok(mut store) => match store.create(&req.name, &embedding_model, dim) {
-            Ok(_) => StatusCode::CREATED.into_response(),
-            Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
-        },
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
-    }
+    // The GGUF header read and the collection's on-disk creation are both
+    // blocking I/O.
+    let store = Arc::clone(&state.collections);
+    run_blocking(move || {
+        let dim = resolve_embedding_dim(&entry)?;
+        lock(&store)?
+            .create(&req.name, &entry.alias, dim)
+            .map(|_| ())
+            .map_err(core_error)
+    })
+    .await?;
+    Ok(StatusCode::CREATED.into_response())
 }
 
 /// Resolve an embedding model's vector dimension for collection sizing.
 /// Prefers the GGUF header's `{arch}.embedding_length` (authoritative, works
 /// for any model), then falls back to the registry's declared dim for the
-/// built-in embedders. Errors when the model is unknown / not an embedder.
-fn resolve_embedding_dim(
-    state: &AppState,
-    embedding_model: &str,
-) -> Result<usize, (StatusCode, String)> {
-    let entry = state
-        .resolve_model(embedding_model)
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
-
-    // Is it an embedding model at all?
-    if !matches!(
-        entry.loader_kind,
-        mettle_core::model_registry::LoaderKind::Embedding { .. }
-    ) {
-        return Err((
+/// built-in embedders. Never hardcode 768 — bge-m3/qwen3-embedding are 1024.
+/// Errors when the model is not an embedder or its dim is unknowable.
+fn resolve_embedding_dim(entry: &RegistryEntry) -> RouteResult<usize> {
+    if !entry.is_embedding() {
+        return Err(route_error(
             StatusCode::BAD_REQUEST,
-            format!("model '{}' is not an embedding model", embedding_model),
+            format!("model '{}' is not an embedding model", entry.alias),
         ));
     }
 
     // GGUF header first (the model's real dim), if the file is resolvable.
-    if let Ok(path) = crate::llama_bridge::resolve_gguf_path(&entry) {
+    if let Ok(path) = crate::llama_bridge::resolve_gguf_path(entry) {
         if let Some(d) = mettle_llama::gguf_embedding_dim(&path) {
             return Ok(d as usize);
         }
     }
 
-    // Registry-declared fallback (built-in embedders: 768 / 1024 / 1024).
-    if let Some(d) = entry.embedding_dim {
-        return Ok(d);
-    }
-
-    Err((
-        StatusCode::BAD_REQUEST,
-        format!(
-            "cannot determine embedding dimension for '{}' (GGUF not cached and no declared dim)",
-            embedding_model
-        ),
-    ))
+    entry.declared_embedding_dim().ok_or_else(|| {
+        route_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "cannot determine embedding dimension for '{}' (GGUF not cached and no declared dim)",
+                entry.alias
+            ),
+        )
+    })
 }
 
 /// GET /v1/collections — list all collections.
-pub async fn list_collections(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    match state.collections.lock() {
-        Ok(store) => Json(store.list()).into_response(),
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
-    }
+pub async fn list_collections(State(state): State<Arc<AppState>>) -> RouteResult {
+    Ok(Json(lock(&state.collections)?.list()).into_response())
 }
 
 /// GET /v1/collections/:name — one collection's shape and whether its
@@ -218,30 +247,22 @@ pub async fn list_collections(State(state): State<Arc<AppState>>) -> axum::respo
 pub async fn get_collection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> axum::response::Response {
-    let handle = match collection_handle(&state, &name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, &msg).into_response(),
-    };
-    let collection = match handle.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-    let documents = match collection.list_documents() {
-        Ok(d) => d.len(),
-        Err(e) => return api_error(core_error_status(&e), e.to_string()).into_response(),
-    };
-    Json(serde_json::json!({
-        "name": name,
-        "dim": collection.dim,
-        "embedding_model": collection.embedding_model.clone(),
-        "documents": documents,
-        "chunks": collection.len(),
-        "needs_reindex": collection.needs_reindex(),
-    }))
-    .into_response()
+) -> RouteResult {
+    let handle = collection_handle(&state, &name)?;
+    let body = with_collection(&handle, move |collection| {
+        let documents = collection.list_documents()?.len();
+        Ok::<_, CoreError>(serde_json::json!({
+            "name": name,
+            "dim": collection.dim,
+            "embedding_model": collection.embedding_model.clone(),
+            "documents": documents,
+            "chunks": collection.len(),
+            "needs_reindex": collection.needs_reindex(),
+        }))
+    })
+    .await?
+    .map_err(core_error)?;
+    Ok(Json(body).into_response())
 }
 
 /// Texts embedded per engine call while reindexing. One call per slice
@@ -262,113 +283,70 @@ const REINDEX_EMBED_BATCH: usize = 64;
 pub async fn reindex_collection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> axum::response::Response {
-    let handle = match collection_handle(&state, &name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, &msg).into_response(),
-    };
-    let (embedding_model, dim) = {
-        let collection = match handle.lock() {
-            Ok(c) => c,
-            Err(_) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
-                    .into_response()
-            }
-        };
-        (collection.embedding_model.clone(), collection.dim)
-    };
+) -> RouteResult {
+    let handle = collection_handle(&state, &name)?;
+    let (dim, embedding_model) = collection_params(&handle)?;
 
     // Read the stored text in index order; this is the whole corpus, so it
     // must not hold a lock across the embedding awaits below.
-    let stored = {
-        let collection = match handle.lock() {
-            Ok(c) => c,
-            Err(_) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
-                    .into_response()
-            }
-        };
-        match collection.texts_for_reindex() {
-            Ok(t) => t,
-            Err(e) => return api_error(core_error_status(&e), e.to_string()).into_response(),
-        }
-    };
-    let int_ids: Vec<u64> = stored.iter().map(|(id, _)| *id).collect();
-    let texts: Vec<String> = stored.into_iter().map(|(_, text)| text).collect();
+    let stored = with_collection(&handle, |c| c.texts_for_reindex())
+        .await?
+        .map_err(core_error)?;
+    let (int_ids, texts): (Vec<u64>, Vec<String>) = stored.into_iter().unzip();
 
     let mut vectors: Vec<f32> = Vec::with_capacity(texts.len() * dim);
     for slice in texts.chunks(REINDEX_EMBED_BATCH) {
-        let flat = match embed_for_collection(&state, &embedding_model, &name, dim, slice).await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
-        vectors.extend(flat);
+        vectors.extend(embed_for_collection(&state, &embedding_model, &name, dim, slice).await?);
     }
 
-    let (chunks, documents) = {
-        let mut collection = match handle.lock() {
-            Ok(c) => c,
-            Err(_) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned")
-                    .into_response()
-            }
-        };
-        if let Err(e) = collection.rebuild_index(&vectors, &int_ids) {
-            return api_error(core_error_status(&e), e.to_string()).into_response();
-        }
-        let documents = match collection.list_documents() {
-            Ok(d) => d.len(),
-            Err(e) => return api_error(core_error_status(&e), e.to_string()).into_response(),
-        };
-        (collection.len(), documents)
-    };
+    let (chunks, documents) = with_collection(&handle, move |collection| {
+        collection.rebuild_index(&vectors, &int_ids)?;
+        let documents = collection.list_documents()?.len();
+        Ok::<_, CoreError>((collection.len(), documents))
+    })
+    .await?
+    .map_err(core_error)?;
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "collection": name,
         "documents": documents,
         "chunks": chunks,
         "reindexed": true,
     }))
-    .into_response()
+    .into_response())
 }
 
 /// DELETE /v1/collections/:name
 pub async fn delete_collection(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> axum::response::Response {
-    match state.collections.lock() {
-        Ok(mut store) => match store.delete(&name) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
-        },
-        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response(),
-    }
+) -> RouteResult {
+    let store = Arc::clone(&state.collections);
+    run_blocking(move || lock(&store)?.delete(&name).map_err(core_error)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ---------------------------------------------------------------------------
 // Documents
 // ---------------------------------------------------------------------------
 
-type CollectionHandle = Arc<std::sync::Mutex<mettle_core::retrieval::Collection>>;
+type CollectionHandle = Arc<Mutex<Collection>>;
 
 /// Fetch a collection handle without holding the store lock.
-fn collection_handle(
-    state: &AppState,
-    name: &str,
-) -> Result<CollectionHandle, (StatusCode, String)> {
-    let store = state.collections.lock().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "lock poisoned".to_string(),
-        )
-    })?;
-    store.get(name).cloned().ok_or_else(|| {
-        (
+fn collection_handle(state: &AppState, name: &str) -> RouteResult<CollectionHandle> {
+    lock(&state.collections)?.get(name).cloned().ok_or_else(|| {
+        route_error(
             StatusCode::NOT_FOUND,
             format!("collection '{}' not found", name),
         )
     })
+}
+
+/// A collection's `(dim, embedding_model)`, read under a brief lock so the
+/// caller can embed (await) without holding it.
+fn collection_params(handle: &CollectionHandle) -> RouteResult<(usize, String)> {
+    let collection = lock(handle)?;
+    Ok((collection.dim, collection.embedding_model.clone()))
 }
 
 /// Parse the ingest request body: JSON `Document`, or multipart with a file
@@ -466,82 +444,118 @@ async fn parse_ingest_request(
     }
 }
 
-/// POST /v1/collections/:name/documents — ingest a document (JSON or multipart).
+/// One ingested document: its id and the chunk ids written for it.
+struct IngestedDoc {
+    document_id: String,
+    chunk_ids: Vec<String>,
+}
+
+impl IngestedDoc {
+    /// The per-document JSON shared by the single and batch ingest responses.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "document_id": self.document_id,
+            "chunks": self.chunk_ids.len(),
+            "chunk_ids": self.chunk_ids,
+        })
+    }
+}
+
+/// The one ingest path: chunk every document, embed all chunks in ONE pass
+/// (1024 documents must not become 1024 forward passes), then insert them
+/// all-or-nothing with one turbovec insert, one SQLite transaction and one
+/// flush on the blocking pool. Results come back in `docs` order.
+async fn ingest_docs(
+    state: &AppState,
+    collection_name: &str,
+    docs: Vec<Document>,
+) -> RouteResult<Vec<IngestedDoc>> {
+    let handle = collection_handle(state, collection_name)?;
+    let (dim, embedding_model) = collection_params(&handle)?;
+
+    let (chunk_tokens, chunk_overlap) = (
+        state.config.retrieval.chunk_tokens,
+        state.config.retrieval.chunk_overlap,
+    );
+    let mut chunked: Vec<(Document, Vec<Chunk>)> = docs
+        .into_iter()
+        .map(|doc| {
+            let chunks = chunk_document(&doc, chunk_tokens, chunk_overlap);
+            (doc, chunks)
+        })
+        .collect();
+
+    // `embed_texts` takes `&[String]`: lend it the chunk texts by moving
+    // them out and back instead of cloning the whole corpus.
+    let texts: Vec<String> = chunked
+        .iter_mut()
+        .flat_map(|(_, chunks)| chunks.iter_mut())
+        .map(|chunk| std::mem::take(&mut chunk.text))
+        .collect();
+    let embeddings =
+        embed_for_collection(state, &embedding_model, collection_name, dim, &texts).await?;
+    for (chunk, text) in chunked
+        .iter_mut()
+        .flat_map(|(_, chunks)| chunks.iter_mut())
+        .zip(texts)
+    {
+        chunk.text = text;
+    }
+
+    let ingested = with_collection(&handle, move |collection| {
+        let per_doc = {
+            let refs: Vec<(&Document, &[Chunk])> = chunked
+                .iter()
+                .map(|(doc, chunks)| (doc, chunks.as_slice()))
+                .collect();
+            collection.add_documents_chunks(&refs, embeddings)?
+        };
+        let _ = collection.flush();
+        Ok::<_, CoreError>(
+            chunked
+                .into_iter()
+                .zip(per_doc)
+                .map(|((doc, _), chunk_ids)| IngestedDoc {
+                    document_id: doc.id,
+                    chunk_ids,
+                })
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await?
+    .map_err(core_error)?;
+
+    let total_chunks: usize = ingested.iter().map(|d| d.chunk_ids.len()).sum();
+    state
+        .metrics
+        .ingest_documents_total
+        .fetch_add(ingested.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .ingest_chunks_total
+        .fetch_add(total_chunks as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(ingested)
+}
+
+/// POST /v1/collections/:name/documents — ingest a document (JSON or
+/// multipart): a one-document [`ingest_docs`].
 pub async fn ingest_document(
     State(state): State<Arc<AppState>>,
     Path(collection_name): Path<String>,
     req: axum::extract::Request,
-) -> axum::response::Response {
-    let doc = match parse_ingest_request(req).await {
-        Ok(d) => d,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
-
-    let coll_handle = match collection_handle(&state, &collection_name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
-
-    // Read collection parameters without holding the lock across awaits.
-    let (dim, embedding_model) = match coll_handle.lock() {
-        Ok(c) => (c.dim, c.embedding_model.clone()),
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-
-    let chunks = chunk_document(
-        &doc,
-        state.config.retrieval.chunk_tokens,
-        state.config.retrieval.chunk_overlap,
-    );
-    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-
-    let embeddings = match embed_for_collection(
-        &state,
-        &embedding_model,
-        &collection_name,
-        dim,
-        &chunk_texts,
-    )
-    .await
-    {
-        Ok(e) => e,
-        Err(resp) => return resp,
-    };
-
-    let mut coll = match coll_handle.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-
-    match coll.add_document_chunks(&doc, &chunks, &embeddings) {
-        Ok(chunk_ids) => {
-            let _ = coll.flush();
-            state
-                .metrics
-                .ingest_documents_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            state
-                .metrics
-                .ingest_chunks_total
-                .fetch_add(chunk_ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Json(serde_json::json!({
-                "document_id": doc.id,
-                "chunks": chunk_ids.len(),
-                "chunk_ids": chunk_ids,
-            }))
-            .into_response()
-        }
-        Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
-    }
+) -> RouteResult {
+    let doc = parse_ingest_request(req)
+        .await
+        .map_err(|(status, msg)| route_error(status, msg))?;
+    let ingested = ingest_docs(&state, &collection_name, vec![doc]).await?;
+    let doc = ingested.first().expect("one result per ingested document");
+    Ok(Json(doc.to_json()).into_response())
 }
 
 /// Hard caps on one batch ingest request (docket M3). One filing is the
 /// atomic unit: a 10-K at 220-word chunks is ~700 documents / ~1 MB, so
-/// 1024 documents and 8 MiB keep a whole filing in one batch.
+/// 1024 documents and 8 MiB keep a whole filing in one batch. The byte cap
+/// is enforced by the route's `DefaultBodyLimit` (413 before the handler).
 const MAX_BATCH_DOCUMENTS: usize = 1024;
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
@@ -558,112 +572,33 @@ pub async fn ingest_documents_batch(
     State(state): State<Arc<AppState>>,
     Path(collection_name): Path<String>,
     body: axum::body::Bytes,
-) -> axum::response::Response {
-    if body.len() > MAX_BATCH_BYTES {
-        return api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "batch body is {} bytes; the limit is {} bytes",
-                body.len(),
-                MAX_BATCH_BYTES
-            ),
+) -> RouteResult {
+    let req: BatchIngestRequest = serde_json::from_slice(&body).map_err(|e| {
+        route_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid request body: {e}"),
         )
-        .into_response();
-    }
-    let req: BatchIngestRequest = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid request body: {e}"),
-            )
-            .into_response()
-        }
-    };
+    })?;
     if req.documents.len() > MAX_BATCH_DOCUMENTS {
-        return api_error(
+        return Err(route_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "batch has {} documents; the limit is {}",
                 req.documents.len(),
                 MAX_BATCH_DOCUMENTS
             ),
-        )
-        .into_response();
+        ));
     }
 
-    let coll_handle = match collection_handle(&state, &collection_name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
-    let (dim, embedding_model) = match coll_handle.lock() {
-        Ok(c) => (c.dim, c.embedding_model.clone()),
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-
-    // Chunk everything, then embed the whole batch in ONE pass: 1024
-    // documents must not become 1024 forward passes.
-    let (chunk_tokens, chunk_overlap) = (
-        state.config.retrieval.chunk_tokens,
-        state.config.retrieval.chunk_overlap,
-    );
-    let mut chunked: Vec<(Document, Vec<mettle_core::retrieval::Chunk>)> =
-        Vec::with_capacity(req.documents.len());
-    let mut all_texts: Vec<String> = Vec::new();
-    for doc in req.documents {
-        let chunks = chunk_document(&doc, chunk_tokens, chunk_overlap);
-        all_texts.extend(chunks.iter().map(|c| c.text.clone()));
-        chunked.push((doc, chunks));
-    }
-
-    let embeddings =
-        match embed_for_collection(&state, &embedding_model, &collection_name, dim, &all_texts)
-            .await
-        {
-            Ok(e) => e,
-            Err(resp) => return resp,
-        };
-
-    let mut coll = match coll_handle.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-    match coll.add_documents_chunks(&chunked, &embeddings) {
-        Ok(per_doc) => {
-            let _ = coll.flush();
-            let total_chunks: usize = per_doc.iter().map(|ids| ids.len()).sum();
-            state
-                .metrics
-                .ingest_documents_total
-                .fetch_add(chunked.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            state
-                .metrics
-                .ingest_chunks_total
-                .fetch_add(total_chunks as u64, std::sync::atomic::Ordering::Relaxed);
-            let results: Vec<serde_json::Value> = chunked
-                .iter()
-                .zip(per_doc)
-                .map(|((doc, _), chunk_ids)| {
-                    serde_json::json!({
-                        "document_id": doc.id,
-                        "chunks": chunk_ids.len(),
-                        "chunk_ids": chunk_ids,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({
-                "documents": results.len(),
-                "chunks": total_chunks,
-                "results": results,
-            }))
-            .into_response()
-        }
-        Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
-    }
+    let ingested = ingest_docs(&state, &collection_name, req.documents).await?;
+    let total_chunks: usize = ingested.iter().map(|d| d.chunk_ids.len()).sum();
+    let results: Vec<serde_json::Value> = ingested.iter().map(IngestedDoc::to_json).collect();
+    Ok(Json(serde_json::json!({
+        "documents": results.len(),
+        "chunks": total_chunks,
+        "results": results,
+    }))
+    .into_response())
 }
 
 /// GET /v1/collections/:name/documents — every stored document with its
@@ -671,52 +606,61 @@ pub async fn ingest_documents_batch(
 pub async fn list_documents(
     State(state): State<Arc<AppState>>,
     Path(collection_name): Path<String>,
-) -> axum::response::Response {
-    let coll_handle = match collection_handle(&state, &collection_name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
-    let coll = match coll_handle.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-    match coll.list_documents() {
-        Ok(docs) => Json::<Vec<DocumentSummary>>(docs).into_response(),
-        Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
-    }
+) -> RouteResult {
+    let handle = collection_handle(&state, &collection_name)?;
+    let docs = with_collection(&handle, |c| c.list_documents())
+        .await?
+        .map_err(core_error)?;
+    Ok(Json(docs).into_response())
 }
 
 /// DELETE /v1/collections/:name/documents/:id
 pub async fn delete_document(
     State(state): State<Arc<AppState>>,
     Path((collection_name, doc_id)): Path<(String, String)>,
-) -> axum::response::Response {
-    let coll_handle = match collection_handle(&state, &collection_name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
-
-    let mut coll = match coll_handle.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-
-    match coll.delete_document(&doc_id) {
-        Ok(()) => {
-            let _ = coll.flush();
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => api_error(StatusCode::NOT_FOUND, e.to_string()).into_response(),
-    }
+) -> RouteResult {
+    let handle = collection_handle(&state, &collection_name)?;
+    with_collection(&handle, move |collection| {
+        collection.delete_document(&doc_id)?;
+        let _ = collection.flush();
+        Ok(())
+    })
+    .await?
+    .map_err(|e: CoreError| route_error(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
+
+/// Search one collection on the blocking pool and record the search latency
+/// metric. The inner result is the collection's own verdict, left for the
+/// caller to map (the search route and RAG chat map it differently).
+async fn timed_search(
+    state: &AppState,
+    handle: &CollectionHandle,
+    query_embedding: impl AsRef<[f32]> + Send + 'static,
+    query: String,
+    k: usize,
+    mode: SearchMode,
+    allowlist: Option<Vec<String>>,
+) -> RouteResult<Result<Vec<ScoredChunk>, CoreError>> {
+    let (searched, elapsed): (_, Duration) = with_collection(handle, move |collection| {
+        let started = std::time::Instant::now();
+        let searched = collection.search(
+            query_embedding.as_ref(),
+            &query,
+            k,
+            mode,
+            allowlist.as_deref(),
+        );
+        (searched, started.elapsed())
+    })
+    .await?;
+    state.metrics.observe_search(elapsed);
+    Ok(searched)
+}
 
 /// POST /v1/collections/:name/search
 pub async fn search_collection(
@@ -724,63 +668,39 @@ pub async fn search_collection(
     Extension(ctx): Extension<RequestCtx>,
     Path(collection_name): Path<String>,
     Json(req): Json<SearchRequest>,
-) -> axum::response::Response {
-    let coll_handle = match collection_handle(&state, &collection_name) {
-        Ok(h) => h,
-        Err((status, msg)) => return api_error(status, msg).into_response(),
-    };
-
-    let (dim, embedding_model) = match coll_handle.lock() {
-        Ok(c) => (c.dim, c.embedding_model.clone()),
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
+) -> RouteResult {
+    let handle = collection_handle(&state, &collection_name)?;
+    let (dim, embedding_model) = collection_params(&handle)?;
 
     // Keyword mode never uses the query embedding (pure FTS5/bm25) — skip
     // the forward pass and any embedder failure entirely (Q13a).
     let query_embedding = if req.mode == SearchMode::Keyword {
         Vec::new()
     } else {
-        match embed_for_collection(
+        embed_for_collection(
             &state,
             &embedding_model,
             &collection_name,
             dim,
             std::slice::from_ref(&req.query),
         )
-        .await
-        {
-            Ok(e) => e,
-            Err(resp) => return resp,
-        }
+        .await?
     };
 
-    let coll = match coll_handle.lock() {
-        Ok(c) => c,
-        Err(_) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned").into_response()
-        }
-    };
-
-    let started = std::time::Instant::now();
-    let searched = coll.search(
-        &query_embedding,
-        &req.query,
+    let mut results = timed_search(
+        &state,
+        &handle,
+        query_embedding,
+        req.query,
         req.k,
         req.mode,
-        req.allowlist.as_deref(),
-    );
-    state.metrics.observe_search(started.elapsed());
-
-    match searched {
-        Ok(mut results) => {
-            // Hooks may filter or re-rank the hits (`Hit` == `ScoredChunk`).
-            state.hooks.on_retrieval(&ctx, &mut results);
-            Json(results).into_response()
-        }
-        Err(e) => api_error(core_error_status(&e), e.to_string()).into_response(),
-    }
+        req.allowlist,
+    )
+    .await?
+    .map_err(core_error)?;
+    // Hooks may filter or re-rank the hits (`Hit` == `ScoredChunk`).
+    state.hooks.on_retrieval(&ctx, &mut results);
+    Ok(Json(results).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -796,7 +716,7 @@ pub async fn rag_chat_handler(
     // 1. Search every requested collection (hybrid mode, server-side).
     let mut hits = match search_collections(&state, &req).await {
         Ok(h) => h,
-        Err(resp) => return resp,
+        Err(resp) => return resp.into_response(),
     };
 
     // 2. Run on_retrieval hooks.
@@ -917,50 +837,48 @@ fn rag_response(model: String, citations: Vec<Citation>, acc: Accumulated) -> Ra
 }
 
 /// Search all requested collections with the last user message as the query.
-/// Embeds the query per collection (each may use a different model).
-async fn search_collections(
-    state: &AppState,
-    req: &RagChatRequest,
-) -> Result<Vec<Hit>, axum::response::Response> {
-    let fail = |status: StatusCode, msg: String| api_error(status, msg).into_response();
+/// Each collection may use a different embedder, so the query is embedded
+/// once per distinct `(embedding model, dim)` within the request and reused
+/// for every collection that shares it.
+async fn search_collections(state: &AppState, req: &RagChatRequest) -> RouteResult<Vec<Hit>> {
     let query = req
         .messages
         .last()
         .map(|m| m.content.clone())
         .unwrap_or_default();
 
+    let mut query_embeddings: HashMap<(String, usize), Arc<[f32]>> = HashMap::new();
     let mut all_hits = Vec::new();
     for name in &req.collections {
-        let handle = collection_handle(state, name).map_err(|(s, m)| fail(s, m))?;
-
-        let (dim, embedding_model) = {
-            let coll = handle
-                .lock()
-                .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-            (coll.dim, coll.embedding_model.clone())
-        };
+        let handle = collection_handle(state, name)?;
+        let (dim, embedding_model) = collection_params(&handle)?;
 
         // RAG chat always searches dense/hybrid (server-side default mode),
         // so the query embedding is required.
-        let query_embedding = embed_for_collection(
+        let key = (embedding_model, dim);
+        let query_embedding = match query_embeddings.get(&key) {
+            Some(embedding) => Arc::clone(embedding),
+            None => {
+                let embedding: Arc<[f32]> =
+                    embed_for_collection(state, &key.0, name, dim, std::slice::from_ref(&query))
+                        .await?
+                        .into();
+                query_embeddings.insert(key, Arc::clone(&embedding));
+                embedding
+            }
+        };
+
+        let results = timed_search(
             state,
-            &embedding_model,
-            name,
-            dim,
-            std::slice::from_ref(&query),
+            &handle,
+            query_embedding,
+            query.clone(),
+            req.k,
+            SearchMode::default(),
+            None,
         )
-        .await?;
-
-        let coll = handle
-            .lock()
-            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned".into()))?;
-
-        let started = std::time::Instant::now();
-        let results = coll
-            .search(&query_embedding, &query, req.k, Default::default(), None)
-            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        state.metrics.observe_search(started.elapsed());
-        drop(coll);
+        .await?
+        .map_err(|e| route_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         all_hits.extend(results);
     }

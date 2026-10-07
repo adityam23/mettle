@@ -594,6 +594,42 @@ async fn rag_chat_without_model_returns_503() {
     assert!(body["error"].is_string());
 }
 
+/// RAG chat embeds the query once per distinct embedder in a request, not
+/// once per collection.
+#[tokio::test]
+async fn rag_chat_embeds_query_once_per_embedder() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (state, embedder) = test_state_with_embedder(tmp.path());
+    let router = build_router(state);
+
+    for name in ["kb1", "kb2"] {
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/collections",
+            Some(serde_json::json!({"name": name, "embedding_model": "embed-gemma:latest"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let before = embedder.embed_calls();
+    // Retrieval runs (and succeeds) before the chat model's 503.
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/rag/chat",
+        Some(serde_json::json!({
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "collections": ["kb1", "kb2"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(embedder.embed_calls() - before, 1);
+}
+
 #[tokio::test]
 async fn copy_and_delete_models() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1239,6 +1275,24 @@ async fn batch_ingest_is_atomic_and_list_documents_reports_stored_state() {
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    // Caps: a body over the route's 8 MiB byte limit -> 413 from the
+    // `DefaultBodyLimit` layer, nothing written.
+    let oversized: String = "quartz zebra ".repeat(700_000); // ~8.7 MiB
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/v1/collections/docs/documents:batch",
+        Some(serde_json::json!({"documents": [{"id": "over#1", "content": oversized}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (_, body) = send(&router, "GET", "/v1/collections/docs/documents", None).await;
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        2,
+        "oversized batch leaked: {body}"
+    );
 
     // A batch well over axum's default 2 MiB body limit still lands (the
     // route carries its own 8 MiB limit), so a whole filing fits.
