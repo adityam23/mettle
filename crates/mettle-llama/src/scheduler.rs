@@ -125,7 +125,8 @@ struct Slot {
 }
 
 /// Side of the blank warmup image: larger than any projector's pixel cap,
-/// so preprocessing downscales it to exactly the cap.
+/// so preprocessing downscales it to exactly the cap
+/// ([`crate::vram::OCR_MAX_IMAGE_TOKENS`]).
 const ENCODER_WARMUP_SIDE: u32 = 4096;
 
 /// Encode one blank image at the projector's maximum token count so the
@@ -216,7 +217,7 @@ impl Scheduler {
                     media_marker: std::ffi::CString::new(llama_cpp_2::mtmd::mtmd_default_marker())
                         .expect("marker has no NUL"),
                     image_min_tokens: -1,
-                    image_max_tokens: -1,
+                    image_max_tokens: crate::vram::OCR_MAX_IMAGE_TOKENS as i32,
                 };
                 let mtmd = llama_cpp_2::mtmd::MtmdContext::init_from_file(path, model, &p)
                     .map_err(|e| anyhow!("mtmd init: {e}"))?;
