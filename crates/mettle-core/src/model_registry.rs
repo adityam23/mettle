@@ -859,9 +859,7 @@ mod tests {
         assert_eq!(list.len(), 10);
         assert_eq!(list.iter().filter(|e| e.alias == "gemma4:e2b").count(), 1);
         assert_eq!(
-            list.iter()
-                .filter(|e| e.alias == "glm-ocr:latest")
-                .count(),
+            list.iter().filter(|e| e.alias == "glm-ocr:latest").count(),
             1
         );
     }

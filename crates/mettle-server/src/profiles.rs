@@ -471,7 +471,10 @@ impl SlotGeometry {
             return Some(self.resident);
         }
         Some(SlotCost {
-            anchor_bytes: self.flat.anchor_bytes.saturating_add(self.per_call(rerank_cap)?),
+            anchor_bytes: self
+                .flat
+                .anchor_bytes
+                .saturating_add(self.per_call(rerank_cap)?),
             ..self.flat
         })
     }
@@ -1746,7 +1749,8 @@ impl ProfileManager {
         let budget = self.gpu_budget(mem.free_bytes, id);
 
         let rerank_cap = self.rerank_cap(&reg_entry);
-        let unreadable = || SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into());
+        let unreadable =
+            || SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into());
         let geometry = self
             .slot_geometry_blocking(&reg_entry)
             .await
@@ -2727,18 +2731,28 @@ mod tests {
         let rerank = m.slot_geometry(&entry("r1")).unwrap();
         let rerank_cost = rerank.cost(Some(2048)).unwrap().at(full);
         let per_call = rerank.per_call(Some(2048)).unwrap();
-        let m2_cost = m.slot_geometry(&entry("m2")).unwrap().cost(None).unwrap().at(full);
+        let m2_cost = m
+            .slot_geometry(&entry("m2"))
+            .unwrap()
+            .cost(None)
+            .unwrap()
+            .at(full);
         // The fake device never consumes memory: each slot alone fits the
         // free reading, but m2 does not fit once r1's context is held back.
         let room = rerank_cost.max(m2_cost);
-        assert!(room - per_call < m2_cost, "fixture must make the reserve decisive");
-        fx.free.store(room + m.margin_bytes(), AtomicOrdering::SeqCst);
+        assert!(
+            room - per_call < m2_cost,
+            "fixture must make the reserve decisive"
+        );
+        fx.free
+            .store(room + m.margin_bytes(), AtomicOrdering::SeqCst);
 
         m.clone().activate("p".into()).await.unwrap();
 
         let ops = fx.engine.op_log();
         assert!(
-            ops.iter().any(|o| o.starts_with("load:r1") && o.contains("cap=Some(2048)")),
+            ops.iter()
+                .any(|o| o.starts_with("load:r1") && o.contains("cap=Some(2048)")),
             "{ops:?}"
         );
         assert!(!ops.iter().any(|o| o.starts_with("load:m2")), "{ops:?}");
