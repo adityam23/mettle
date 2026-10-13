@@ -124,6 +124,38 @@ struct Slot {
     prompt_ns: u64,
 }
 
+/// Side of the blank warmup image: larger than any projector's pixel cap,
+/// so preprocessing downscales it to exactly the cap.
+const ENCODER_WARMUP_SIDE: u32 = 4096;
+
+/// Encode one blank image at the projector's maximum token count so the
+/// GPU encoder's compute buffer is allocated at its worst case during load.
+/// llama.cpp's own warmup is smaller than the cap (GLM4V warms at 2116 of
+/// 4096 tokens to avoid OOM), so a full page would otherwise grow VRAM
+/// after the slot's load-time measurement — outside the planner's budget.
+fn warm_encoder_at_max(mtmd: &MtmdContext) -> Result<()> {
+    let side = ENCODER_WARMUP_SIDE;
+    let pixels = vec![255u8; (side * side * 3) as usize];
+    let bitmap = MtmdBitmap::from_image_data(side, side, &pixels)
+        .map_err(|e| anyhow!("encoder warmup bitmap: {e}"))?;
+    let text = llama_cpp_2::mtmd::MtmdInputText {
+        text: llama_cpp_2::mtmd::mtmd_default_marker().to_string(),
+        add_special: false,
+        parse_special: true,
+    };
+    let chunks = mtmd
+        .tokenize(text, &[&bitmap])
+        .map_err(|e| anyhow!("encoder warmup tokenize: {e}"))?;
+    for i in 0..chunks.len() {
+        let chunk = chunks.get(i).expect("index in range");
+        if chunk.chunk_type() == llama_cpp_2::mtmd::MtmdInputChunkType::Image {
+            mtmd.encode_chunk(&chunk)
+                .map_err(|e| anyhow!("encoder warmup encode: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// The per-model scheduler.
 pub struct Scheduler {
     ctx: LlamaContext<'static>,
@@ -176,7 +208,9 @@ impl Scheduler {
         let mtmd = match mmproj {
             Some(path) => {
                 let p = llama_cpp_2::mtmd::MtmdContextParams {
-                    use_gpu: false,
+                    // The encoder follows the slot's placement: on a GPU slot
+                    // a page encodes in well under a second, on CPU ~50 s.
+                    use_gpu: params.op_offload,
                     print_timings: false,
                     n_threads: params.n_threads.max(1),
                     media_marker: std::ffi::CString::new(llama_cpp_2::mtmd::mtmd_default_marker())
@@ -184,10 +218,12 @@ impl Scheduler {
                     image_min_tokens: -1,
                     image_max_tokens: -1,
                 };
-                Some(
-                    llama_cpp_2::mtmd::MtmdContext::init_from_file(path, model, &p)
-                        .map_err(|e| anyhow!("mtmd init: {e}"))?,
-                )
+                let mtmd = llama_cpp_2::mtmd::MtmdContext::init_from_file(path, model, &p)
+                    .map_err(|e| anyhow!("mtmd init: {e}"))?;
+                if params.op_offload {
+                    warm_encoder_at_max(&mtmd)?;
+                }
+                Some(mtmd)
             }
             None => None,
         };
@@ -553,9 +589,14 @@ impl Scheduler {
                     .as_ref()
                     .ok_or_else(|| anyhow!("model has no vision projector"))?;
                 let bitmap = prompt::image_bitmap(mtmd, &image)?;
-                let chunks = prompt::ocr_input_chunks(mtmd, &instruction, &bitmap)?;
-                let tokens =
-                    model.str_to_token(&prompt::ocr_input_text(&instruction), AddBos::Always)?;
+                let ocr_prompt = prompt::ocr_prompt(model, &instruction)?;
+                let chunks = prompt::ocr_input_chunks(mtmd, &ocr_prompt, &bitmap)?;
+                let add_bos = if ocr_prompt.add_special {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                };
+                let tokens = model.str_to_token(&ocr_prompt.text, add_bos)?;
                 (
                     tokens,
                     None,

@@ -1,6 +1,6 @@
 //! `POST /v1/ocr` — image in, text out. The consumer rasterizes PDF pages
 //! itself and posts base64-encoded images; the engine OCRs them with the
-//! registered vision model (Baidu Unlimited-OCR / DeepSeek-OCR arch).
+//! active profile's OCR slot, else the registry's default OCR model.
 
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use axum::{
     Json,
 };
 use base64::Engine as _;
+use mettle_core::config::ModelRole;
 use mettle_core::engine::{EngineRequest, EngineResponse, RequestKind, SamplingParams};
 use mettle_core::hooks::RequestCtx;
 use mettle_core::ocr_types::{OcrRequest, OcrResponse, DEFAULT_OCR_INSTRUCTION};
@@ -42,20 +43,20 @@ pub async fn ocr_handler(
         }
     };
 
-    // The OCR model is the registry's vision entry; not client-selectable.
-    let ocr_alias = match state.registry.read() {
-        Ok(r) => r.ocr_alias(),
-        Err(_) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                String::from("lock poisoned"),
-            )
-            .into_response()
-        }
-    };
-    let Some(ocr_alias) = ocr_alias else {
-        return api_error(StatusCode::NOT_FOUND, "no OCR model configured".to_string())
-            .into_response();
+    // Not client-selectable: the active profile's highest-priority OCR slot,
+    // else the registry default (503 `not_resident` unless it is loaded).
+    let ocr_alias = match state.profiles.role_slot(ModelRole::Ocr) {
+        Some(id) => id,
+        None => match state.registry.read() {
+            Ok(r) => r.default_ocr().alias.clone(),
+            Err(_) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    String::from("lock poisoned"),
+                )
+                .into_response()
+            }
+        },
     };
     let (entry, sender) = match state.v1_sender_for(&ocr_alias) {
         Ok(v) => v,

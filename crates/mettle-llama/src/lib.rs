@@ -493,6 +493,14 @@ fn load_runtime(
             sched_params.n_seq_max = 1;
         }
     }
+    // Vision (OCR) models run one sequence: the KV cache is split per
+    // sequence, so with n_seq_max = 4 a request gets n_ctx / 4 = 2048
+    // cells, while one page is up to the projector's 4096 image tokens plus
+    // its text. A single sequence gets all of n_ctx; pages are OCR'd one at
+    // a time, which is how ingest submits them anyway.
+    if spec.mmproj_path.is_some() {
+        sched_params.n_seq_max = 1;
+    }
 
     // Same-model MTP drafter takes precedence over a standard draft model.
     // Slot-level wiring (profile/JIT loads) wins over boot-time config wiring.

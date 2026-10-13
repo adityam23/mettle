@@ -1795,15 +1795,14 @@ impl ProfileManager {
         let Some(role) = parse_role(role_name) else {
             return name.to_string();
         };
-        self.resolve_role_slot(role)
-            .unwrap_or_else(|| name.to_string())
+        self.role_slot(role).unwrap_or_else(|| name.to_string())
     }
 
     /// Highest-priority resident-slot candidate for `role`: same ordering
     /// semantics as activation (priority first, declaration order breaking
     /// ties). Membership in the ACTIVE profile is what counts — residency
     /// is checked separately by availability.
-    fn resolve_role_slot(&self, role: ModelRole) -> Option<String> {
+    pub fn role_slot(&self, role: ModelRole) -> Option<String> {
         let active = self.inner.lock().ok()?.active.clone()?;
         let profile = self.profile(&active)?;
         by_priority(&profile)
@@ -3005,6 +3004,20 @@ mod tests {
         assert_eq!(fx.manager.resolve_alias("role:chat"), "m2");
         assert_eq!(fx.manager.resolve_alias("role:nope"), "role:nope");
         assert_eq!(fx.manager.resolve_alias("gemma4:e2b"), "gemma4:e2b");
+    }
+
+    #[test]
+    fn configured_mmproj_makes_the_ocr_role_slot() {
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m2", "m1"])], 8 * GIB, |cfg| {
+            cfg.model[0].mmproj_path = Some("/models/mmproj-m1.gguf".into());
+        });
+        assert_eq!(fx.manager.role_slot(ModelRole::Ocr), None);
+
+        fx.manager.inner.lock().unwrap().active = Some("p".into());
+        // m1's projector makes it a vision entry, inferred as the OCR role
+        // (what `/v1/ocr` targets); m2 stays the chat slot.
+        assert_eq!(fx.manager.role_slot(ModelRole::Ocr).as_deref(), Some("m1"));
+        assert_eq!(fx.manager.role_slot(ModelRole::Chat).as_deref(), Some("m2"));
     }
 
     #[test]

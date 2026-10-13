@@ -48,7 +48,7 @@ fn cpu_model_context_reserves_cuda() {
     // Then the CPU model + context (op_offload=false like the engine).
     let model = LlamaModel::load_from_file(
         &backend,
-        gguf("unlimited-ocr/Unlimited-OCR-Q4_K_M.gguf"),
+        gguf("glm-ocr/GLM-OCR-Q8_0.gguf"),
         &LlamaModelParams::default().with_n_gpu_layers(0),
     )
     .expect("load OCR model with 0 GPU layers");
