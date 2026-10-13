@@ -29,3 +29,9 @@ CLAUDE.md
 
 # Benchmark runtime state (served collections; rebuildable)
 benchmarks/**/.state/
+
+# Session / working docs (kept local, not published)
+QUESTIONS*.md
+portfolio/
+benchmarks/**/BEST_CONFIG_CONTRACT.md
+benchmarks/**/*_state.json
