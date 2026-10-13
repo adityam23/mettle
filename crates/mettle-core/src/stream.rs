@@ -12,14 +12,14 @@
 //! [`engine_stream`] maps `EngineResponse` events to wire chunks via two
 //! closures (token chunks, final chunk); [`engine_accumulate`] maps the
 //! whole response to one wire object. Hook helpers (`token_info`,
-//! `fire_tokens_from_logprobs`, `response_ctx`, `fire_on_response`) live
+//! `fire_tokens_from_trace`, `response_ctx`, `fire_on_response`) live
 //! here so routes and tests share one definition.
 
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::engine::{EngineResponse, TokenLogprob};
+use crate::engine::{EngineResponse, TokenLogprob, TracedToken};
 use crate::hooks::{HookRegistry, RequestCtx, ResponseCtx, TokenInfo, UsageInfo};
 
 // ---------------------------------------------------------------------------
@@ -35,15 +35,14 @@ pub fn token_info(token: &str, logprob: Option<&TokenLogprob>) -> TokenInfo {
     }
 }
 
-/// Fire `on_token` for every token in a non-streaming response's logprob
-/// trace (spec §7 guarantee 3).
-pub fn fire_tokens_from_logprobs(
-    hooks: &HookRegistry,
-    ctx: &RequestCtx,
-    logprobs: &[TokenLogprob],
-) {
-    for lp in logprobs {
-        hooks.on_token(ctx, &token_info(&lp.token, Some(lp)));
+/// Fire `on_token` for every sampled token in a non-streaming response's
+/// trace (spec §7 guarantee 3), with the same text a streaming chunk would
+/// carry. Spans no token produced (no logprob) are not tokens.
+pub fn fire_tokens_from_trace(hooks: &HookRegistry, ctx: &RequestCtx, trace: &[TracedToken]) {
+    for t in trace {
+        if let Some(lp) = &t.logprob {
+            hooks.on_token(ctx, &token_info(&t.text, Some(lp)));
+        }
     }
 }
 
@@ -176,9 +175,9 @@ pub struct Accumulated {
     pub content: String,
     pub finish_reason: String,
     pub usage: UsageInfo,
-    /// Full per-token logprob trace from the engine (may be empty if the
-    /// backend did not produce one).
-    pub logprobs: Vec<TokenLogprob>,
+    /// The engine's token trace (see [`TracedToken`]); empty when the
+    /// response arrived as streamed chunks.
+    pub trace: Vec<TracedToken>,
 }
 
 /// Consume an [`EngineResponse`] channel and produce one wire object.
@@ -196,7 +195,7 @@ pub async fn engine_accumulate<T>(
     let mut full_content = String::new();
     let mut usage = UsageInfo::default();
     let mut finish_reason = String::from("stop");
-    let mut trace: Vec<TokenLogprob> = Vec::new();
+    let mut trace: Vec<TracedToken> = Vec::new();
 
     let mut rx = rx;
     while let Some(response) = rx.recv().await {
@@ -205,12 +204,12 @@ pub async fn engine_accumulate<T>(
                 content,
                 finish_reason: reason,
                 usage: u,
-                logprobs,
+                trace: t,
             } => {
                 usage = u;
                 full_content.push_str(&content);
-                fire_tokens_from_logprobs(&hooks, &ctx, &logprobs);
-                trace = logprobs;
+                fire_tokens_from_trace(&hooks, &ctx, &t);
+                trace = t;
                 finish_reason = reason;
             }
             EngineResponse::Chunk {
@@ -244,7 +243,7 @@ pub async fn engine_accumulate<T>(
         content: resp_ctx.content,
         finish_reason: resp_ctx.finish_reason,
         usage,
-        logprobs: trace,
+        trace,
     })
 }
 
@@ -462,7 +461,7 @@ mod tests {
             content: " there".into(),
             finish_reason: "length".into(),
             usage: usage(),
-            logprobs: Vec::new(),
+            trace: Vec::new(),
         })
         .await
         .unwrap();
@@ -510,7 +509,7 @@ mod tests {
             content: "x".into(),
             finish_reason: "stop".into(),
             usage: usage(),
-            logprobs: Vec::new(),
+            trace: Vec::new(),
         })
         .await
         .unwrap();

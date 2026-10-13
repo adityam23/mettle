@@ -778,9 +778,6 @@ impl Scheduler {
         let piece = model
             .token_to_piece(final_tok, &mut slot.gs.decoder, false, None)
             .unwrap_or_default();
-        if let Some(lp) = &final_logprob {
-            slot.gs.logprobs.push(lp.clone());
-        }
         let emit = slot.gs.emit(&piece, final_logprob.as_ref());
 
         if outcome.accepted < k {

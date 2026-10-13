@@ -291,9 +291,6 @@ impl MtpLane {
         let piece = model
             .token_to_piece(final_tok, &mut active.gs.decoder, false, None)
             .unwrap_or_default();
-        if let Some(lp) = &final_logprob {
-            active.gs.logprobs.push(lp.clone());
-        }
         let emit = active.gs.emit(&piece, final_logprob.as_ref());
 
         if outcome.accepted < k {

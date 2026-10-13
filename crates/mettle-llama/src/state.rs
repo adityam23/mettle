@@ -15,7 +15,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use tokio::sync::mpsc;
 
-use mettle_core::engine::{EngineResponse, TokenLogprob};
+use mettle_core::engine::{EngineResponse, TokenLogprob, TracedToken};
 use mettle_core::hooks::UsageInfo;
 
 /// Outcome of emitting one generated token.
@@ -44,7 +44,9 @@ pub(crate) struct GenState {
     pub n_decoded: usize,
     pub max_tokens: usize,
     pub stop: Vec<String>,
-    pub logprobs: Vec<TokenLogprob>,
+    /// Every emitted piece with its token's logprob (the non-streaming
+    /// `Done` trace).
+    pub trace: Vec<TracedToken>,
     /// The sampled token waiting to be decoded next.
     pub pending: Option<LlamaToken>,
     pub finished: bool,
@@ -66,7 +68,7 @@ impl GenState {
             n_decoded: 0,
             max_tokens,
             stop,
-            logprobs: Vec::new(),
+            trace: Vec::new(),
             pending: None,
             finished: false,
             t_eval: Some(Instant::now()),
@@ -77,6 +79,12 @@ impl GenState {
     pub fn emit(&mut self, piece: &str, logprob: Option<&TokenLogprob>) -> Emit {
         self.full.push_str(piece);
         self.n_decoded += 1;
+        if !self.streaming {
+            self.trace.push(TracedToken {
+                text: piece.to_string(),
+                logprob: logprob.cloned(),
+            });
+        }
 
         if self.streaming && !piece.is_empty() {
             if self
@@ -113,6 +121,12 @@ impl GenState {
     pub fn seed_reasoning_opener(&mut self, tag: &str) {
         let opener = format!("<{tag}>");
         self.full.push_str(&opener);
+        if !self.streaming {
+            self.trace.push(TracedToken {
+                text: opener.clone(),
+                logprob: None,
+            });
+        }
         if self.streaming {
             let _ = self.response.blocking_send(EngineResponse::Chunk {
                 content: opener,
@@ -154,7 +168,7 @@ impl GenState {
                 content: std::mem::take(&mut self.full),
                 finish_reason: reason.to_string(),
                 usage,
-                logprobs: std::mem::take(&mut self.logprobs),
+                trace: std::mem::take(&mut self.trace),
             });
         }
     }
@@ -231,9 +245,6 @@ pub(crate) fn verify_draft(
             stop_reason = Some("stop");
             break;
         }
-        if let Some(lp) = &logprob {
-            gs.logprobs.push(lp.clone());
-        }
         match gs.emit(&piece, logprob.as_ref()) {
             Emit::Continue => {}
             Emit::Stop(r) => {
@@ -280,9 +291,6 @@ pub(crate) fn sample_one(
         .unwrap_or_default();
     if piece.contains("<end_of_turn>") || piece.contains("<start_of_turn>") {
         return SampleOutcome::Stop("stop");
-    }
-    if let Some(lp) = &logprob {
-        gs.logprobs.push(lp.clone());
     }
     match gs.emit(&piece, logprob.as_ref()) {
         Emit::Continue => {

@@ -9,7 +9,10 @@
 //! This module is the single splitter used by both the streaming and
 //! non-streaming chat paths. It is deliberately tag-driven and text-based:
 //! it runs on whatever the sampler produced, independent of how the prompt
-//! was framed.
+//! was framed. It also owns the one rule for which tokens' logprobs belong
+//! to the answer channel ([`ReasoningFilter::push_token`]).
+
+use crate::engine::{TokenLogprob, TracedToken};
 
 /// Result of splitting a complete generation into reasoning + answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +166,7 @@ impl ReasoningFilter {
             Phase::Answer { .. } => {
                 self.buf.push_str(delta);
                 let prev_emitted = self.emitted;
-                let out = self.answer_text(prev_buf_len);
+                let out = self.answer_text();
                 // Exact offsets: the emission includes bytes buffered by an
                 // earlier push iff it started before this push's bytes began.
                 if !out.is_empty() && prev_emitted < prev_buf_len {
@@ -179,6 +182,18 @@ impl ReasoningFilter {
     /// pushes. Such a chunk spans several tokens; attach no per-token logprob.
     pub fn last_push_was_merged(&self) -> bool {
         self.merged_last
+    }
+
+    /// Feed one token's text. Returns the answer-side text to emit now and
+    /// whether that text is exactly this token, whole — the only case in
+    /// which the token's logprob belongs to the answer channel. A token
+    /// straddling a channel boundary (`</think>Hello`), a token inside the
+    /// thinking block, and an emission merging bytes held from earlier
+    /// tokens all carry no answer logprob: a gap, never a wrong pairing.
+    pub fn push_token(&mut self, text: &str) -> (String, bool) {
+        let out = self.push(text);
+        let whole = !out.is_empty() && !self.merged_last && out == text;
+        (out, whole)
     }
 
     /// End of stream: flush whatever legitimately remains. An unclosed
@@ -265,7 +280,7 @@ impl ReasoningFilter {
                 spent: false,
             };
             self.emitted = 0;
-            let out = self.answer_text(prev_buf_len);
+            let out = self.answer_text();
             if !out.is_empty() && prev_buf_len > 0 {
                 // The <answer> opener may span pushes; be conservative.
                 self.merged_last = true;
@@ -282,7 +297,7 @@ impl ReasoningFilter {
         std::mem::take(&mut self.buf)
     }
 
-    fn answer_text(&mut self, prev_buf_len: usize) -> String {
+    fn answer_text(&mut self) -> String {
         let Phase::Answer { closer, .. } = self.phase else {
             unreachable!("answer_text outside Answer phase");
         };
@@ -319,6 +334,42 @@ impl ReasoningFilter {
     }
 }
 
+/// Logprobs of the tokens that make up `answer` — the answer channel of a
+/// non-streaming generation — replayed from the engine's token trace through
+/// the same [`ReasoningFilter`] the streaming path uses, so both surfaces
+/// attribute tokens identically.
+///
+/// Tokens are kept in order while the replayed answer text still matches
+/// `answer`; a token that is not whole answer text is skipped (a gap, see
+/// [`ReasoningFilter::push_token`]). Replay past the end of `answer` (a stop
+/// sequence trimmed from the content) is ignored. `None` when the replay
+/// does not reproduce `answer` (e.g. a hook rewrote the content): the trace
+/// cannot be aligned, so no pairing is offered at all.
+pub fn answer_logprobs(trace: &[TracedToken], answer: &str) -> Option<Vec<TokenLogprob>> {
+    let mut filter = ReasoningFilter::new();
+    let mut replayed = String::new();
+    let mut logprobs = Vec::new();
+    for token in trace {
+        let (out, whole) = filter.push_token(&token.text);
+        if out.is_empty() {
+            continue;
+        }
+        let start = replayed.len();
+        replayed.push_str(&out);
+        // Keep only tokens lying wholly inside the answer.
+        if whole && replayed.len() <= answer.len() {
+            if let Some(lp) = &token.logprob {
+                logprobs.push(lp.clone());
+            }
+        }
+        if start >= answer.len() {
+            break;
+        }
+    }
+    replayed.push_str(&filter.finish());
+    replayed.starts_with(answer).then_some(logprobs)
+}
+
 /// Largest char boundary ≤ `i` (`str::floor_char_boundary` is nightly-only;
 /// MSRV here is stable 1.80).
 fn floor_boundary(s: &str, mut i: usize) -> usize {
@@ -331,6 +382,112 @@ fn floor_boundary(s: &str, mut i: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trace entry with a logprob whose value encodes its position.
+    fn tok(text: &str, lp: f64) -> TracedToken {
+        TracedToken {
+            text: text.into(),
+            logprob: Some(TokenLogprob {
+                token: text.into(),
+                logprob: lp,
+                top: Vec::new(),
+            }),
+        }
+    }
+
+    /// Text no sampled token produced (a seeded reasoning opener).
+    fn seed(text: &str) -> TracedToken {
+        TracedToken {
+            text: text.into(),
+            logprob: None,
+        }
+    }
+
+    fn values(lps: &[TokenLogprob]) -> Vec<f64> {
+        lps.iter().map(|l| l.logprob).collect()
+    }
+
+    fn content_of(trace: &[TracedToken]) -> String {
+        trace.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    #[test]
+    fn answer_logprobs_skip_reasoning_and_seeded_opener() {
+        // Qwen3.5 shape: the template seeds `<think>`, the model reasons,
+        // closes the block on its own token, then answers.
+        let trace = [
+            seed("<think>"),
+            tok("\nweigh", -1.0),
+            tok(" it", -2.0),
+            tok("</think>", -3.0),
+            tok("\n\n", -4.0),
+            tok("Paris", -5.0),
+            tok(".", -6.0),
+        ];
+        let answer = split_reasoning(&content_of(&trace)).content;
+        assert_eq!(answer, "\n\nParis.");
+        let lps = answer_logprobs(&trace, &answer).unwrap();
+        assert_eq!(values(&lps), vec![-4.0, -5.0, -6.0]);
+    }
+
+    #[test]
+    fn answer_logprobs_omit_a_token_straddling_the_boundary() {
+        let trace = [
+            tok("<think>x", -1.0),
+            tok("</think>Hi", -2.0),
+            tok(" there", -3.0),
+        ];
+        let answer = split_reasoning(&content_of(&trace)).content;
+        assert_eq!(answer, "Hi there");
+        // `</think>Hi` is part reasoning tag, part answer: a gap, not a pair.
+        assert_eq!(
+            values(&answer_logprobs(&trace, &answer).unwrap()),
+            vec![-3.0]
+        );
+    }
+
+    #[test]
+    fn answer_logprobs_keep_every_token_without_reasoning() {
+        // `€` split across two tokens: the streaming decoder lands it whole
+        // on the second, the first contributes no text.
+        let trace = [
+            tok("Cost", -1.0),
+            tok(" ", -2.0),
+            tok("", -3.0),
+            tok("€5", -4.0),
+        ];
+        let answer = split_reasoning(&content_of(&trace)).content;
+        assert_eq!(
+            values(&answer_logprobs(&trace, &answer).unwrap()),
+            vec![-1.0, -2.0, -4.0]
+        );
+    }
+
+    #[test]
+    fn answer_logprobs_stop_at_a_trimmed_stop_sequence() {
+        // `END` was a stop sequence: it is in the trace, not in the content.
+        let trace = [
+            tok("<think>t</think>", -1.0),
+            tok("ok", -2.0),
+            tok("END", -3.0),
+        ];
+        assert_eq!(values(&answer_logprobs(&trace, "ok").unwrap()), vec![-2.0]);
+    }
+
+    #[test]
+    fn answer_logprobs_refuse_an_unalignable_trace() {
+        // A hook rewrote the content: the trace no longer reproduces it.
+        let trace = [tok("Hello", -1.0)];
+        assert!(answer_logprobs(&trace, "Goodbye").is_none());
+    }
+
+    #[test]
+    fn answer_logprobs_empty_for_an_unclosed_think() {
+        let trace = [seed("<think>"), tok("still thinking", -1.0)];
+        let answer = split_reasoning(&content_of(&trace)).content;
+        assert_eq!(answer, "");
+        assert!(answer_logprobs(&trace, &answer).unwrap().is_empty());
+    }
 
     #[test]
     fn plain_answer_untouched() {
