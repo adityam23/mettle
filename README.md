@@ -1,101 +1,111 @@
-# mettle
+# Mettle
 
-Local inference engine for GGUF models. Rust around an embedded llama.cpp core (`llama-cpp-2` FFI). One daemon serves chat, completions, embeddings, reranking and vision-OCR over OpenAI-, Ollama- and Anthropic-compatible HTTP APIs, and schedules models against a fixed VRAM budget instead of dying on it.
+**Run a chat model, an embedder and a reranker side by side on one small GPU.**
 
-Built for small GPUs: a 6 GB card runs a chat generator plus an embedding model plus an OCR model concurrently, because the profile manager treats VRAM as a scheduled resource.
+Mettle is a local model server written in Rust around llama.cpp. You point it at GGUF models and it serves them over the APIs your tools already speak: OpenAI, Ollama and Anthropic, plus reranking, document search (RAG) and OCR. It all runs in one process on one port.
 
-## Install
+What makes it different is how it treats GPU memory. Most local servers load a model and then crash with an out-of-memory error when the next one doesn't fit. Mettle checks every model against the free VRAM before loading it. If a model doesn't fit, Mettle gives it a smaller context or moves it to the CPU, and tells you what it did. It was built on, and for, a 6 GB laptop GPU.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/adityam23/mettle/main/scripts/install.sh | sh
-```
+![A real session: search, rerank, a profile switch and a chat answer, all from one mettled process on a 6 GB RTX 3060 laptop](docs/images/demo.png)
 
-Installs `mettle` (CLI) and `mettled` (daemon) into `~/.local/bin`, creating `~/.config/mettle` and `~/.local/share/mettle` on first use. `METTLE_VARIANT=cuda` selects the CUDA-enabled Linux build. Uninstall: `scripts/uninstall.sh` (add `--purge` to delete config/state).
+## What you get
 
-From source:
-
-```sh
-cargo build --release                    # CPU build
-cargo build --release --features cuda    # Linux + NVIDIA toolchain
-# binaries: target/release/mettle, target/release/mettled
-```
-
-## Quickstart
-
-```sh
-mettle tune              # detect GPU, write a tuned config.toml
-mettle serve             # execs mettled in the foreground
-mettle pull gemma4:e2b   # fetch a registry model from Hugging Face
-```
-
-```sh
-curl -s http://127.0.0.1:11434/v1/chat/completions -d '{
-  "model": "gemma4:e2b",
-  "messages": [{"role": "user", "content": "Why is the sky blue?"}],
-  "logprobs": true,
-  "stream": true
-}'
-```
-
-OpenAI-compatible `/v1/*` is the primary surface and includes per-token logprobs and streaming deltas. Native reasoning-model output lands in `message.reasoning_content` (chat template applied from the GGUF's embedded jinja).
-
-## Configuration
-
-`~/.config/mettle/config.toml` (override: `METTLE_CONFIG`). Zero-config first run works; everything below has defaults.
-
-| Section | Key | Default | Notes |
-|---|---|---|---|
-| `[server]` | `host` / `port` | `127.0.0.1` / `11434` | |
-| | `api_keys` | `[]` | Bearer auth when non-empty |
-| | `offline` | `false` | Refuse network fetches |
-| `[engine]` | `max_concurrent_seqs` | `16` | |
-| | `kv_cache` | `fp8` | `fp8` or `fp16` |
-| | `prefix_cache` | `true` | |
-| | `speculative` | `auto` | `auto` \| `off` \| drafter alias |
-| | `n_gpu_layers` | auto | Layers offloaded; `mettle tune` writes this |
-| | `n_batch` | `512` | Lower shrinks compute-buffer reservations |
-| | `n_ctx` | `8192` | KV ≈ 35 KB/token (gemma4 q8_0); 64K ≈ 4.8 GB |
-| | `vram_margin_bytes` | `536870912` | Safety margin subtracted before admitting slots |
-| `[[model]]` | `id` | — | Registry alias or HF repo id |
-| | `path` / `mmproj_path` | — | Local GGUF overrides HF resolution |
-| | `n_gpu_layers` / `min_ctx` / `draft` / `role` | inferred | Per-model overrides |
-| `[[profile]]` | `name`, `slots` | — | Named model groups; one active at a time |
-| `[retrieval]` | `data_dir` | XDG data dir | Vector stores |
-| | `chunk_tokens` / `chunk_overlap` / `default_bit_width` | `512` / `64` / `4` | |
-
-Environment: `METTLE_CONFIG` (config path), `METTLE_STATE` (state file), `RUST_LOG` (tracing filter).
+- **Drop-in APIs.** OpenAI `/v1/chat/completions`, `/v1/embeddings` and `/v1/completions`, Ollama `/api/*`, Anthropic `/v1/messages`, Cohere-style `/v1/rerank`, and `/v1/ocr` for images.
+- **Built-in document search.** Create a collection, upload text or PDFs, and search it by meaning, by keyword, or both.
+- **Reasoning models handled for you.** The model's thinking goes into `reasoning_content`, so `content` holds only the answer.
+- **Profiles.** Group models into named sets, such as "retrieval" and "chat", and switch between them with one request.
+- **Downloads its own weights.** On first run, Mettle fetches any missing model from Hugging Face, and the download resumes if interrupted.
 
 ## How it works
 
-- **Slots, not processes.** `mettled` embeds llama.cpp behind a channel-driven worker (`LlamaEngine`). Models are slots loaded/unloaded atomically by alias.
-- **Profiles with a degradation ladder.** A profile declares ordered slots with roles (chat/embed/rerank/ocr). Admission compares header-derived cost against free VRAM minus the safety margin; under pressure the ladder retries smaller context rungs down to each slot's `min_ctx`, then drops the slot. Measured post-load footprints persist in `~/.local/share/mettle/state.json` (invalidated by binary version or GGUF mtime) so second activations fit precisely.
-- **Chunked prefill.** Long prompts decode incrementally across bounded batches instead of reserving for worst case.
-- **Events.** Profile activation is async: `PUT /engine/profiles/active` answers `202`; completion arrives on the SSE bus at `/engine/events` (last 100 events replayed on connect).
+![Mettle architecture: clients talk to one mettled process; a profile manager admits each model against free VRAM before the llama.cpp worker loads it](docs/images/architecture.svg)
 
-## API surface
+All models live in one llama.cpp worker as "slots". Before a slot loads, the profile manager compares the model's size against the free VRAM. If it doesn't fit, the manager steps down in a fixed order: a smaller context, then the CPU (for slots marked `placement = "auto"`), and if nothing works, it skips the slot. `GET /engine/status` always shows what is loaded, where, and why anything is missing. `GET /engine/ready` returns 200 only when the active profile is fully serving.
 
-| Prefix | Style |
-|---|---|
-| `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` | OpenAI |
-| `/api/generate`, `/api/chat`, `/api/embeddings`, `/api/pull`, tags/copy/delete/show, `/api/metrics` | Ollama |
-| `/v1/messages` | Anthropic |
-| `/v1/rerank` | Cohere-style reranking |
-| `/v1/ocr` | Vision-OCR (image in, text out) |
-| `/engine/profiles`, `/engine/status`, `/engine/device`, `/engine/slots/{id}/load\|unload`, `/engine/events` | native profile control |
+## Install
 
-## Benchmarks
+Linux and macOS (Apple Silicon):
 
-No published numbers — they are meaningless without your model and GPU. The CLI ships the harness: `mettle bench` drives streaming chat (TTFT, aggregate tokens/s) and optional collection search latency (p50/p95), emitting JSON.
+```sh
+curl -fsSL https://raw.githubusercontent.com/adityam23/mettle/main/scripts/install.sh | sh
+# NVIDIA GPU on Linux:
+curl -fsSL https://raw.githubusercontent.com/adityam23/mettle/main/scripts/install.sh | METTLE_VARIANT=cuda sh
+```
 
-## Backends
+This installs `mettle` (the CLI) and `mettled` (the server) into `~/.local/bin`. The published binaries are older than `main`, so build from source to get the latest changes:
 
-| Feature flag | Status |
-|---|---|
-| CPU | Default; always built |
-| `cuda` | Release artifacts bundle CUDA runtime libs; arches 80/86/89 |
-| `metal` | Enabled in the macOS arm64 release artifact |
-| `vulkan`, `rocm` | Passthrough flags exist; not exercised in CI |
+```sh
+cargo build --release                                  # CPU build of mettle + mettled
+cargo build --release -p mettle-server --features cuda # NVIDIA build of mettled
+```
+
+You need Rust 1.80+, a C/C++ toolchain, and OpenBLAS (`dnf install openblas-devel` or `apt install libopenblas-dev`).
+
+## Quick start
+
+**1. Describe your models** in `~/.config/mettle/config.toml`. Use any instruct GGUF you like for chat. The Qwen3 embedder and reranker are built in and download automatically.
+
+```toml
+[[model]]
+id = "my-chat"
+path = "/models/my-chat-model.Q4_K_M.gguf"
+role = "chat"
+default = true
+
+[[model]]
+id = "qwen3-embedding-0.6b:latest"
+
+[[model]]
+id = "qwen3-reranker-0.6b:latest"
+
+[[profile]]
+name = "everyday"
+default = true
+
+[[profile.slots]]
+id = "my-chat"
+
+[[profile.slots]]
+id = "qwen3-embedding-0.6b:latest"
+
+[[profile.slots]]
+id = "qwen3-reranker-0.6b:latest"
+placement = "auto"   # fall back to the CPU if the GPU is full
+```
+
+`mettle tune` writes a starting config sized to your GPU, if you'd rather begin from that.
+
+**2. Start the server:**
+
+```sh
+mettle serve
+```
+
+**3. Talk to it** with any OpenAI client, or with curl:
+
+```sh
+curl -s localhost:11434/v1/chat/completions -H content-type:application/json -d '{
+  "model": "my-chat",
+  "messages": [{"role": "user", "content": "Why is the sky blue?"}]
+}'
+```
+
+**4. Search your own documents:**
+
+```sh
+curl -s -X POST localhost:11434/v1/collections -H content-type:application/json -d '{"name": "notes"}'
+mettle ingest -c notes -f handbook.md
+mettle search -c notes -q "how do refunds work?"
+```
+
+PDFs go through the HTTP API as a file upload: `curl -F file=@handbook.pdf localhost:11434/v1/collections/notes/documents`.
+
+## Good to know
+
+- Reasoning models spend tokens thinking before they answer. If `content` comes back empty with `finish_reason: "length"`, raise `max_tokens`.
+- On a 6 GB card, a 4B chat model and a full-context reranker won't both fit on the GPU. Either set `placement = "auto"` on the reranker, or put them in separate profiles and switch with `PUT /engine/profiles/active`.
+- Release builds are published for CPU, CUDA (Linux) and Metal (macOS). The Vulkan and ROCm build flags exist but are untested.
 
 ## License
 
-GPL-3.0-or-later — see [LICENSE](LICENSE). Links llama.cpp (MIT) via [llama-cpp-2](https://crates.io/crates/llama-cpp-2).
+GPL-3.0-or-later. See [LICENSE](LICENSE). Mettle embeds llama.cpp (MIT) through [llama-cpp-2](https://crates.io/crates/llama-cpp-2).
