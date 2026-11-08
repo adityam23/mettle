@@ -335,21 +335,22 @@ impl ModelRegistry {
                     "Q8_0",
                 ),
             ),
-            // No upstream GGUF: converted from the official safetensors with
-            // llama.cpp's convert_hf_to_gguf.py so cls.output.weight (yes/no)
-            // is present; resolved via config-local path.
+            // Qwen's own repo is safetensors-only; ggml-org publishes the Q8_0
+            // GGUF. Verified to carry the classification head
+            // (`cls.output.weight`, arch qwen3, 311 tensors) that RANK pooling
+            // needs — a community GGUF converted without it scores garbage.
             (
                 "qwen3-reranker-0.6b:latest".to_string(),
                 builtin(
                     "qwen3-reranker-0.6b:latest",
-                    "Qwen/Qwen3-Reranker-0.6B",
+                    "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
                     Rerank {
-                        quant_filename: None,
+                        quant_filename: Some("qwen3-reranker-0.6b-q8_0.gguf".into()),
                     },
                     false,
                     "qwen3",
                     "600M",
-                    "F16",
+                    "Q8_0",
                 ),
             ),
             (
@@ -805,15 +806,17 @@ mod tests {
             }
         );
         assert!(e2b.weight_source().is_downloadable());
-        // A built-in with no quant file: any cached GGUF, not downloadable.
-        let qwen = reg.resolve("qwen3-reranker-0.6b").unwrap();
+        // The reranker names the ggml-org file, so first run can download it
+        // (the head is present; verified — see the entry's comment).
+        let rerank = reg.resolve("qwen3-reranker-0.6b").unwrap();
         assert_eq!(
-            qwen.weight_source(),
-            WeightSource::HfAnyGguf {
-                repo: "Qwen/Qwen3-Reranker-0.6B"
+            rerank.weight_source(),
+            WeightSource::HfFile {
+                repo: "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
+                file: "qwen3-reranker-0.6b-q8_0.gguf",
             }
         );
-        assert!(!qwen.weight_source().is_downloadable());
+        assert!(rerank.weight_source().is_downloadable());
 
         // A configured path wins over the built-in's HF file, and an unknown
         // id resolves from the cache under the id itself.
