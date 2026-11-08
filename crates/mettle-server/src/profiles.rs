@@ -683,7 +683,7 @@ impl ProfileManager {
         if let Some(draft_id) = self.catalog_entry(&reg_entry.alias).and_then(|m| m.draft) {
             let reg = self.deps.registry.read().ok()?;
             if let Ok(drafter) = reg.resolve(&draft_id) {
-                return llama_bridge::load_spec_for_route(&drafter).ok();
+                return llama_bridge::load_spec_for_route(drafter).ok();
             }
             return None;
         }
@@ -1235,10 +1235,8 @@ impl ProfileManager {
             }
             match inner.slots.get(&slot.id) {
                 Some(SlotState::Loading) => return false,
-                Some(SlotState::Loaded(_)) => {
-                    if !loaded_roles.contains(&role) {
-                        loaded_roles.push(role);
-                    }
+                Some(SlotState::Loaded(_)) if !loaded_roles.contains(&role) => {
+                    loaded_roles.push(role);
                 }
                 _ => {}
             }

@@ -349,9 +349,9 @@ impl Scheduler {
                 model,
                 logits_idx,
             );
-            slot.t_prefill.take().map(|t| {
+            if let Some(t) = slot.t_prefill.take() {
                 slot.prompt_ns = t.elapsed().as_nanos() as u64;
-            });
+            }
             Self::apply_outcome(&mut slot, outcome);
             if slot.gs.finished {
                 finished.push(seq_id);
@@ -414,7 +414,7 @@ impl Scheduler {
             if slot.prefill.is_empty() {
                 // Continuation: decode the pending token.
                 if let Some(tok) = slot.gs.pending.take() {
-                    let idx = batch.n_tokens() as i32;
+                    let idx = batch.n_tokens();
                     batch.add(tok, slot.n_past, &[slot.seq_id], true)?;
                     slot.tokens.push(tok);
                     slot.n_past += 1;
@@ -436,7 +436,7 @@ impl Scheduler {
                 let completes_prefill = slot.prefill.is_empty();
                 let last = chunk.len() - 1;
                 for (i, tok) in chunk.iter().enumerate() {
-                    let idx = batch.n_tokens() as i32;
+                    let idx = batch.n_tokens();
                     let want_logits = completes_prefill && i == last;
                     batch.add(*tok, slot.n_past, &[slot.seq_id], want_logits)?;
                     slot.tokens.push(*tok);
@@ -448,19 +448,19 @@ impl Scheduler {
                 if completes_prefill {
                     // Prefill complete: first sample comes from the last
                     // prompt token's logits.
-                    slot.t_prefill.take().map(|t| {
+                    if let Some(t) = slot.t_prefill.take() {
                         slot.prompt_ns = t.elapsed().as_nanos() as u64;
-                    });
+                    }
                 }
             }
 
             // Speculative drafts follow the anchor in the same batch.
             if spec && anchor_idx.is_some() {
                 if let Some(s) = slot.spec.as_mut() {
-                    if s.armed && budget >= 1 + s.draft.len() {
+                    if s.armed && budget > s.draft.len() {
                         s.verify_idx.clear();
                         for tok in &s.draft {
-                            let idx = batch.n_tokens() as i32;
+                            let idx = batch.n_tokens();
                             batch.add(*tok, slot.n_past, &[slot.seq_id], true)?;
                             slot.tokens.push(*tok);
                             slot.n_past += 1;

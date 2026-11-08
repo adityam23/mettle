@@ -116,7 +116,7 @@ pub async fn chat_completions_handler(
     let model_id = state.profiles.resolve_alias(&req.model);
     let (entry, sender) = match state.v1_sender_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let alias = entry.alias.clone();
     let messages: Vec<ChatMessage> = req
@@ -307,7 +307,7 @@ pub async fn completions_handler(
     let model_id = state.profiles.resolve_alias(&req.model);
     let (entry, sender) = match state.v1_sender_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let alias = entry.alias.clone();
     let params = openai_params(
@@ -488,7 +488,7 @@ pub async fn rerank_handler(
 
     let (_entry, engine) = match state.v1_engine_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match rerank_texts(engine.as_ref(), &entry.alias, &req.query, &req.documents).await {
@@ -574,7 +574,7 @@ pub async fn embeddings_handler(
 
     let (_entry, engine) = match state.v1_engine_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let inputs = req.input.into_vec();

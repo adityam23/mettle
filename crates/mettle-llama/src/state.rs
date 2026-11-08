@@ -86,8 +86,9 @@ impl GenState {
             });
         }
 
-        if self.streaming && !piece.is_empty() {
-            if self
+        if self.streaming
+            && !piece.is_empty()
+            && self
                 .response
                 .blocking_send(EngineResponse::Chunk {
                     content: piece.to_string(),
@@ -96,9 +97,8 @@ impl GenState {
                     usage: None,
                 })
                 .is_err()
-            {
-                return Emit::Aborted;
-            }
+        {
+            return Emit::Aborted;
         }
 
         if let Some(s) = self.stop.iter().find(|s| self.full.ends_with(s.as_str())) {

@@ -150,7 +150,7 @@ impl ReasoningFilter {
     pub fn push(&mut self, delta: &str) -> String {
         let prev_buf_len = self.buf.len();
         self.merged_last = false;
-        let out = match self.phase {
+        match self.phase {
             Phase::Detect => {
                 self.buf.push_str(delta);
                 self.detect(prev_buf_len)
@@ -174,8 +174,7 @@ impl ReasoningFilter {
                 }
                 out
             }
-        };
-        out
+        }
     }
 
     /// Whether the last [`Self::push`] emitted text accumulated from earlier

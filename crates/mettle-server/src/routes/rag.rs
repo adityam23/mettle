@@ -134,7 +134,7 @@ async fn embed_for_collection(
     // request must carry it: a collection created with a short name
     // (`bge-m3`, resolving to `bge-m3:latest`) would otherwise fail with
     // "model 'bge-m3' is not loaded" on every ingest and dense search.
-    let (entry, engine) = state.v1_engine_for(&alias)?;
+    let (entry, engine) = state.v1_engine_for(&alias).map_err(|e| *e)?;
     let alias = entry.alias.clone();
     let vectors = mettle_core::engine::embed_texts(engine.as_ref(), &alias, texts)
         .await

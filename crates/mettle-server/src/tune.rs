@@ -187,6 +187,7 @@ fn write_config(config: &RootConfig, output: Option<PathBuf>, vram_gb: f32) -> i
             layers,
             if layers == 999 { " (all)" } else { "" }
         );
+        let layers_line = format!("n_gpu_layers = {layers}");
         lines.push(format!(
             "[[model]]\nid = \"{}\"\ndefault = {}\n{}\n{}",
             m.id,
@@ -195,7 +196,7 @@ fn write_config(config: &RootConfig, output: Option<PathBuf>, vram_gb: f32) -> i
                 .as_ref()
                 .map(|p| format!("path = \"{}\"", p.display()))
                 .unwrap_or_default(),
-            format!("n_gpu_layers = {layers}"),
+            layers_line,
         ));
     }
 

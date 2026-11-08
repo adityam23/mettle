@@ -60,7 +60,7 @@ pub async fn ocr_handler(
     };
     let (entry, sender) = match state.v1_sender_for(&ocr_alias) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let alias = entry.alias.clone();
     let model_name = alias.clone();
