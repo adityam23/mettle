@@ -212,11 +212,11 @@ pub async fn events_handler(
 
     let stream = async_stream::stream! {
         for json in replay {
-            yield Ok(Event::default().data(json.to_string()));
+            yield Ok(Event::default().data(json.as_ref()));
         }
         loop {
             match rx.recv().await {
-                Ok(json) => yield Ok(Event::default().data(json.to_string())),
+                Ok(json) => yield Ok(Event::default().data(json.as_ref())),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!("event subscriber lagged, skipped {skipped}");
                 }

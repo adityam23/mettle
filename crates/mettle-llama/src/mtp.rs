@@ -235,11 +235,11 @@ impl MtpLane {
         let k = active.draft.len();
         let base_pos = active.n_past; // position of the anchor
         let mut b = LlamaBatch::new(1 + k, 1);
-        let anchor_idx = b.n_tokens() as i32;
+        let anchor_idx = b.n_tokens();
         b.add(pending, active.n_past, &[0], true)?;
         active.draft_idx.clear();
         for (i, tok) in active.draft.iter().enumerate() {
-            let idx = b.n_tokens() as i32;
+            let idx = b.n_tokens();
             b.add(*tok, active.n_past + 1 + i as i32, &[0], true)?;
             active.draft_idx.push(idx);
         }
@@ -291,9 +291,6 @@ impl MtpLane {
         let piece = model
             .token_to_piece(final_tok, &mut active.gs.decoder, false, None)
             .unwrap_or_default();
-        if let Some(lp) = &final_logprob {
-            active.gs.logprobs.push(lp.clone());
-        }
         let emit = active.gs.emit(&piece, final_logprob.as_ref());
 
         if outcome.accepted < k {
@@ -405,9 +402,9 @@ impl MtpLane {
         }
         active.n_past = n as i32;
         active.prefill_done = true;
-        active.t_prefill.take().map(|t| {
+        if let Some(t) = active.t_prefill.take() {
             active.prompt_ns = t.elapsed().as_nanos() as u64;
-        });
+        }
 
         let outcome = state::sample_one(
             &mut active.gs,

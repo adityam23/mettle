@@ -26,7 +26,7 @@ pub enum LoaderKind {
     /// GGUF quantised checkpoint — single file with embedded quant format.
     GGUF { quant_filename: String },
     /// Vision-language model: a text GGUF plus a multimodal projector
-    /// (`mmproj`) file for image input (e.g. Unlimited-OCR).
+    /// (`mmproj`) file for image input (e.g. GLM-OCR).
     GgufVision {
         quant_filename: String,
         mmproj_filename: String,
@@ -165,6 +165,7 @@ pub struct ModelRegistry {
     default_id: String,
     default_embedding_id: String,
     default_rerank_id: String,
+    default_ocr_id: String,
 }
 
 impl Default for ModelRegistry {
@@ -215,7 +216,7 @@ fn builtin(
 
 impl ModelRegistry {
     /// Build the registry pre-populated with the GGUF-backed built-in
-    /// aliases. Project scope: Gemma 4 E2B/E4B, embeddinggemma, Unlimited-OCR.
+    /// aliases. Project scope: Gemma 4 E2B/E4B, embeddinggemma, GLM-OCR.
     pub fn new() -> Self {
         use LoaderKind::*;
 
@@ -268,20 +269,22 @@ impl ModelRegistry {
                     "Q8_0",
                 ),
             ),
-            // OCR: Baidu Unlimited-OCR (DeepSeek-OCR arch) via GGUF + mmproj.
+            // OCR: Z.ai GLM-OCR (0.9B, GLM4V projector) via GGUF + mmproj.
+            // The one supported OCR model: Q8 + Q8 mmproj (~1.4 GB) shares a
+            // 6 GB card with the qwen3 embedder and reranker.
             (
-                "unlimited-ocr:latest".to_string(),
+                "glm-ocr:latest".to_string(),
                 builtin(
-                    "unlimited-ocr:latest",
-                    "sahilchachra/Unlimited-OCR-GGUF",
+                    "glm-ocr:latest",
+                    "ggml-org/GLM-OCR-GGUF",
                     GgufVision {
-                        quant_filename: "Unlimited-OCR-Q4_K_M.gguf".into(),
-                        mmproj_filename: "mmproj-Unlimited-OCR-F16.gguf".into(),
+                        quant_filename: "GLM-OCR-Q8_0.gguf".into(),
+                        mmproj_filename: "mmproj-GLM-OCR-Q8_0.gguf".into(),
                     },
                     false,
-                    "unlimited-ocr",
-                    "3B",
-                    "Q4_K_M",
+                    "glm-ocr",
+                    "0.9B",
+                    "Q8_0",
                 ),
             ),
             // MTP drafters (Phase 6): same-model drafter GGUFs paired with
@@ -332,21 +335,22 @@ impl ModelRegistry {
                     "Q8_0",
                 ),
             ),
-            // No upstream GGUF: converted from the official safetensors with
-            // llama.cpp's convert_hf_to_gguf.py so cls.output.weight (yes/no)
-            // is present; resolved via config-local path.
+            // Qwen's own repo is safetensors-only; ggml-org publishes the Q8_0
+            // GGUF. Verified to carry the classification head
+            // (`cls.output.weight`, arch qwen3, 311 tensors) that RANK pooling
+            // needs — a community GGUF converted without it scores garbage.
             (
                 "qwen3-reranker-0.6b:latest".to_string(),
                 builtin(
                     "qwen3-reranker-0.6b:latest",
-                    "Qwen/Qwen3-Reranker-0.6B",
+                    "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
                     Rerank {
-                        quant_filename: None,
+                        quant_filename: Some("qwen3-reranker-0.6b-q8_0.gguf".into()),
                     },
                     false,
                     "qwen3",
                     "600M",
-                    "F16",
+                    "Q8_0",
                 ),
             ),
             (
@@ -398,6 +402,7 @@ impl ModelRegistry {
             // stay registered as comparison/secondary models.
             default_embedding_id: "qwen3-embedding-0.6b:latest".into(),
             default_rerank_id: "qwen3-reranker-0.6b:latest".into(),
+            default_ocr_id: "glm-ocr:latest".into(),
             entries,
         }
     }
@@ -461,6 +466,13 @@ impl ModelRegistry {
         self.entries
             .get(&self.default_rerank_id)
             .expect("default rerank model must be in registry")
+    }
+    /// Return the default OCR model entry: what `/v1/ocr` serves when the
+    /// active profile declares no OCR slot.
+    pub fn default_ocr(&self) -> &RegistryEntry {
+        self.entries
+            .get(&self.default_ocr_id)
+            .expect("default OCR model must be in registry")
     }
     /// Return the default embedding model entry (spec resolved decision #3).
     pub fn default_embedding(&self) -> &RegistryEntry {
@@ -536,6 +548,21 @@ impl ModelRegistry {
             entry.local_path = m.path.clone();
             entry.n_gpu_layers = m.n_gpu_layers;
             entry.mmproj_path = m.mmproj_path.clone();
+            // A configured projector makes the entry a vision model: without
+            // this a user-defined `mmproj_path` was silently dropped and the
+            // model loaded text-only.
+            if let (Some(mmproj), LoaderKind::GGUF { quant_filename }) =
+                (&m.mmproj_path, &entry.loader_kind)
+            {
+                let mmproj_filename = mmproj
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                entry.loader_kind = LoaderKind::GgufVision {
+                    quant_filename: quant_filename.clone(),
+                    mmproj_filename,
+                };
+            }
             if m.default {
                 self.default_id = m.id.clone();
             }
@@ -561,16 +588,6 @@ impl ModelRegistry {
     /// True when no entries are registered.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// Alias of the OCR-capable model (the first vision entry), if any.
-    /// `/v1/ocr` targets this model; user configs can override it by
-    /// registering their own `GgufVision` entry (or none).
-    pub fn ocr_alias(&self) -> Option<String> {
-        self.entries
-            .values()
-            .find(|e| matches!(e.loader_kind, LoaderKind::GgufVision { .. }))
-            .map(|e| e.alias.clone())
     }
 
     /// The registry default alias for `role` when `name` asks for it: an
@@ -659,11 +676,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ocr_vision_entry() {
+    fn default_ocr_is_the_glm_ocr_vision_entry() {
         let reg = ModelRegistry::new();
-        let entry = reg.resolve("unlimited-ocr").unwrap();
+        let entry = reg.default_ocr();
+        assert_eq!(entry.alias, "glm-ocr:latest");
         assert!(matches!(entry.loader_kind, LoaderKind::GgufVision { .. }));
-        assert_eq!(entry.hf_repo_id, "sahilchachra/Unlimited-OCR-GGUF");
+        assert_eq!(entry.hf_repo_id, "ggml-org/GLM-OCR-GGUF");
+        assert_eq!(reg.resolve("glm-ocr").unwrap().alias, "glm-ocr:latest");
+    }
+
+    #[test]
+    fn configured_mmproj_makes_a_vision_entry() {
+        let mut reg = ModelRegistry::new();
+        let mut m = crate::config::ModelEntry::new("org/vision-GGUF");
+        m.path = Some("/models/vision.gguf".into());
+        m.mmproj_path = Some("/models/mmproj-vision.gguf".into());
+        reg.apply_user_models(&[m, crate::config::ModelEntry::new("org/text-GGUF")]);
+
+        let vision = reg.resolve("org/vision-GGUF").unwrap();
+        assert!(matches!(vision.loader_kind, LoaderKind::GgufVision { .. }));
+        assert_eq!(vision.mmproj_filename(), Some("mmproj-vision.gguf"));
+        let text = reg.resolve("org/text-GGUF").unwrap();
+        assert!(matches!(text.loader_kind, LoaderKind::GGUF { .. }));
     }
 
     #[test]
@@ -772,15 +806,17 @@ mod tests {
             }
         );
         assert!(e2b.weight_source().is_downloadable());
-        // A built-in with no quant file: any cached GGUF, not downloadable.
-        let qwen = reg.resolve("qwen3-reranker-0.6b").unwrap();
+        // The reranker names the ggml-org file, so first run can download it
+        // (the head is present; verified — see the entry's comment).
+        let rerank = reg.resolve("qwen3-reranker-0.6b").unwrap();
         assert_eq!(
-            qwen.weight_source(),
-            WeightSource::HfAnyGguf {
-                repo: "Qwen/Qwen3-Reranker-0.6B"
+            rerank.weight_source(),
+            WeightSource::HfFile {
+                repo: "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
+                file: "qwen3-reranker-0.6b-q8_0.gguf",
             }
         );
-        assert!(!qwen.weight_source().is_downloadable());
+        assert!(rerank.weight_source().is_downloadable());
 
         // A configured path wins over the built-in's HF file, and an unknown
         // id resolves from the cache under the id itself.
@@ -809,8 +845,8 @@ mod tests {
     fn mmproj_filename_only_for_vision_entries() {
         let reg = ModelRegistry::new();
         assert_eq!(
-            reg.resolve("unlimited-ocr").unwrap().mmproj_filename(),
-            Some("mmproj-Unlimited-OCR-F16.gguf")
+            reg.resolve("glm-ocr").unwrap().mmproj_filename(),
+            Some("mmproj-GLM-OCR-Q8_0.gguf")
         );
         assert_eq!(reg.resolve("gemma4:e2b").unwrap().mmproj_filename(), None);
     }
@@ -820,15 +856,13 @@ mod tests {
         let reg = ModelRegistry::new();
         let list = reg.list();
         // Deduplicated by alias: e2b (once, despite 3 lookup keys), e4b,
-        // embed-gemma, unlimited-ocr, e2b-mtp, e4b-mtp, plus the rerank
+        // embed-gemma, glm-ocr, e2b-mtp, e4b-mtp, plus the rerank
         // contract's bge-reranker-v2-m3, qwen3-reranker-0.6b, bge-m3,
         // qwen3-embedding-0.6b.
         assert_eq!(list.len(), 10);
         assert_eq!(list.iter().filter(|e| e.alias == "gemma4:e2b").count(), 1);
         assert_eq!(
-            list.iter()
-                .filter(|e| e.alias == "unlimited-ocr:latest")
-                .count(),
+            list.iter().filter(|e| e.alias == "glm-ocr:latest").count(),
             1
         );
     }
