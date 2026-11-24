@@ -217,6 +217,30 @@ pub fn estimate_vram(
 /// scaled by `{arch}.embedding_length / 1024`.
 const RERANK_COMPUTE_BYTES_PER_TOKEN_AT_1024: u64 = 768 * 1024;
 
+/// Image tokens one OCR image may expand to. Passed to mtmd as
+/// `image_max_tokens` (projectors that size images by pixel budget, like
+/// GLM4V, downscale anything larger), used for the load-time warmup encode,
+/// and priced by [`vision_encoder_bytes`] — one value, so the estimate, the
+/// warmup and the real cap cannot drift. 4096 is GLM4V's native cap; a
+/// 200 dpi letter page reaches it.
+pub const OCR_MAX_IMAGE_TOKENS: u32 = 4096;
+
+/// Measured GPU vision-encoder cost per image token at encoder width 1024
+/// (2026-10-13, GLM-OCR Q8 on the 6 GB card: the slot measured 2496 MiB, of
+/// which 1036 MiB is neither LM weights, KV, LM compute nor mmproj weights,
+/// at 4096 image tokens ⇒ ~259 KiB/token). Encoder activations scale ~linearly
+/// with the width, so this is scaled by `clip.vision.embedding_length / 1024`.
+const ENCODER_COMPUTE_BYTES_PER_TOKEN_AT_1024: u64 = 259 * 1024;
+
+/// Estimated GPU compute buffer of a vision encoder at
+/// [`OCR_MAX_IMAGE_TOKENS`], read from its mmproj header. `None` when the
+/// header is unreadable or has no `clip.vision.embedding_length`.
+pub fn vision_encoder_bytes(mmproj: &Path) -> Option<u64> {
+    // An mmproj's architecture is `clip`: this reads `clip.vision.embedding_length`.
+    let width = u64::from(gguf_arch_u32(mmproj, "vision.embedding_length")?);
+    Some(ENCODER_COMPUTE_BYTES_PER_TOKEN_AT_1024 * u64::from(OCR_MAX_IMAGE_TOKENS) * width / 1024)
+}
+
 /// llama.cpp sizes split-KV caches in 256-cell steps per sequence.
 const KV_CELL_ALIGN: usize = 256;
 
@@ -338,8 +362,8 @@ mod tests {
     use super::*;
 
     /// Write a minimal metadata-only GGUF (v3): magic, version, zero
-    /// tensors, then string/u32 KV pairs.
-    fn write_synthetic_gguf(path: &Path, arch: &str) {
+    /// tensors, `general.architecture`, then `{arch}.{key}` u32 pairs.
+    fn write_gguf(path: &Path, arch: &str, keys: &[(&str, u32)]) {
         use std::io::Write;
         const TYPE_STRING: u32 = 8;
         const TYPE_UINT32: u32 = 4;
@@ -348,37 +372,63 @@ mod tests {
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes()); // tensor count
-        buf.extend_from_slice(&8u64.to_le_bytes()); // kv count
+        buf.extend_from_slice(&(keys.len() as u64 + 1).to_le_bytes()); // kv count
 
         let put_str = |buf: &mut Vec<u8>, s: &str| {
             buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         };
-        let put_kv_str = |buf: &mut Vec<u8>, k: &str, v: &str| {
-            put_str(buf, k);
-            buf.extend_from_slice(&TYPE_STRING.to_le_bytes());
-            put_str(buf, v);
-        };
-        let put_kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
-            put_str(buf, k);
+        put_str(&mut buf, "general.architecture");
+        buf.extend_from_slice(&TYPE_STRING.to_le_bytes());
+        put_str(&mut buf, arch);
+        for (key, value) in keys {
+            put_str(&mut buf, &format!("{arch}.{key}"));
             buf.extend_from_slice(&TYPE_UINT32.to_le_bytes());
-            buf.extend_from_slice(&v.to_le_bytes());
-        };
-
-        put_kv_str(&mut buf, "general.architecture", arch);
-        put_kv_u32(&mut buf, &format!("{arch}.block_count"), 36);
-        put_kv_u32(&mut buf, &format!("{arch}.embedding_length"), 2560);
-        put_kv_u32(&mut buf, &format!("{arch}.attention.head_count"), 32);
-        put_kv_u32(&mut buf, &format!("{arch}.attention.head_count_kv"), 8);
-        put_kv_u32(&mut buf, &format!("{arch}.attention.key_length"), 128);
-        put_kv_u32(&mut buf, &format!("{arch}.attention.value_length"), 128);
-        put_kv_u32(&mut buf, &format!("{arch}.vocab_size"), 151_936);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
 
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&buf).unwrap();
         // Pad so weights (file size) is non-trivially distinct.
         f.write_all(&vec![0u8; 1_000_000]).unwrap();
         f.sync_all().unwrap();
+    }
+
+    /// A Qwen3-4B-shaped text model header.
+    fn write_synthetic_gguf(path: &Path, arch: &str) {
+        write_gguf(
+            path,
+            arch,
+            &[
+                ("block_count", 36),
+                ("embedding_length", 2560),
+                ("attention.head_count", 32),
+                ("attention.head_count_kv", 8),
+                ("attention.key_length", 128),
+                ("attention.value_length", 128),
+                ("vocab_size", 151_936),
+            ],
+        );
+    }
+
+    #[test]
+    fn vision_encoder_cost_scales_with_the_encoder_width() {
+        let dir = std::env::temp_dir().join("mettle-vram-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synthetic-mmproj.gguf");
+
+        // GLM-OCR's encoder (width 1024) is the calibration point: about
+        // 1036 MiB at the 4096-token cap.
+        write_gguf(&path, "clip", &[("vision.embedding_length", 1024)]);
+        let at_1024 = vision_encoder_bytes(&path).unwrap();
+        assert_eq!(at_1024 / (1024 * 1024), 1036);
+
+        write_gguf(&path, "clip", &[("vision.embedding_length", 1536)]);
+        assert_eq!(vision_encoder_bytes(&path).unwrap(), at_1024 * 3 / 2);
+
+        // A text model header has no encoder.
+        write_synthetic_gguf(&path, "qwen3");
+        assert_eq!(vision_encoder_bytes(&path), None);
     }
 
     #[test]

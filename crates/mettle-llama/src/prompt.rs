@@ -102,6 +102,22 @@ fn build_minijinja_chat_tokens(
     model: &LlamaModel,
     messages: &[ChatMessage],
 ) -> Result<Option<ChatPrompt>> {
+    let Some(rendered) = render_chat_template(model, messages)? else {
+        return Ok(None);
+    };
+    let tokens = model.str_to_token(&rendered, AddBos::Never)?;
+    Ok(Some(ChatPrompt {
+        tokens,
+        opens_reasoning: detect_reasoning_prefill(&rendered),
+    }))
+}
+
+/// The model's embedded jinja chat template rendered over `messages` with a
+/// generation prompt. `None` when there is no template, no non-empty
+/// message, or the render is empty. The rendered text owns the template's
+/// special tokens (BOS, turn markers), so it is tokenized without an extra
+/// BOS. Shared by chat and OCR prompts.
+fn render_chat_template(model: &LlamaModel, messages: &[ChatMessage]) -> Result<Option<String>> {
     let Ok(tmpl) = model.chat_template(None) else {
         return Ok(None);
     };
@@ -133,14 +149,7 @@ fn build_minijinja_chat_tokens(
     };
 
     let rendered = env.template_from_str(src)?.render(ctx)?;
-    if rendered.is_empty() {
-        return Ok(None);
-    }
-    let tokens = model.str_to_token(&rendered, AddBos::Never)?;
-    Ok(Some(ChatPrompt {
-        tokens,
-        opens_reasoning: detect_reasoning_prefill(&rendered),
-    }))
+    Ok((!rendered.is_empty()).then_some(rendered))
 }
 
 /// `Some(tag)` when the rendered generation prompt ends inside an unclosed
@@ -226,23 +235,51 @@ pub fn image_bitmap(mtmd: &MtmdContext, bytes: &[u8]) -> Result<MtmdBitmap> {
     MtmdBitmap::from_buffer(mtmd, bytes, false).map_err(|e| anyhow::anyhow!("image decode: {e}"))
 }
 
-/// Build the mtmd tokenization input for an OCR request: the instruction
-/// followed by the media marker (image-first, matching DeepSeek-OCR's
-/// canonical `<image>\nConvert the document to markdown...` prompt shape).
-pub fn ocr_input_text(instruction: &str) -> String {
-    format!("{}\n{}", mtmd_default_marker(), instruction)
+/// An OCR prompt's text (holding the mtmd media marker) and whether mtmd
+/// must add the model's special tokens itself.
+pub struct OcrPrompt {
+    pub text: String,
+    /// False when the chat template rendered the prompt: the template
+    /// already owns BOS and the turn markers.
+    pub add_special: bool,
 }
 
-/// Tokenize OCR text + bitmap via mtmd. The returned chunks evaluate the
-/// image embeddings and prompt into the target context.
+/// The OCR prompt: one user turn holding the image then the instruction,
+/// rendered through the model's own chat template (OCR models are trained
+/// on their template's role framing). The parts are joined with no
+/// separator, as the template renders a `[image, text]` content list. A
+/// model without a renderable template gets the bare `marker\ninstruction`
+/// with mtmd adding the special tokens.
+pub fn ocr_prompt(model: &LlamaModel, instruction: &str) -> Result<OcrPrompt> {
+    let marker = mtmd_default_marker();
+    let turn = ChatMessage {
+        role: "user".into(),
+        content: format!("{marker}{instruction}"),
+        images: None,
+        tool_calls: None,
+    };
+    Ok(match render_chat_template(model, &[turn])? {
+        Some(text) => OcrPrompt {
+            text,
+            add_special: false,
+        },
+        None => OcrPrompt {
+            text: format!("{marker}\n{instruction}"),
+            add_special: true,
+        },
+    })
+}
+
+/// Tokenize an OCR prompt + bitmap via mtmd. The returned chunks evaluate
+/// the image embeddings and prompt into the target context.
 pub fn ocr_input_chunks(
     mtmd: &MtmdContext,
-    instruction: &str,
+    prompt: &OcrPrompt,
     bitmap: &MtmdBitmap,
 ) -> Result<llama_cpp_2::mtmd::MtmdInputChunks> {
     let text = MtmdInputText {
-        text: ocr_input_text(instruction),
-        add_special: true,
+        text: prompt.text.clone(),
+        add_special: prompt.add_special,
         parse_special: true,
     };
     mtmd.tokenize(text, &[bitmap])

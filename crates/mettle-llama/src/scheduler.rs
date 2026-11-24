@@ -124,6 +124,39 @@ struct Slot {
     prompt_ns: u64,
 }
 
+/// Side of the blank warmup image: larger than any projector's pixel cap,
+/// so preprocessing downscales it to exactly the cap
+/// ([`crate::vram::OCR_MAX_IMAGE_TOKENS`]).
+const ENCODER_WARMUP_SIDE: u32 = 4096;
+
+/// Encode one blank image at the projector's maximum token count so the
+/// GPU encoder's compute buffer is allocated at its worst case during load.
+/// llama.cpp's own warmup is smaller than the cap (GLM4V warms at 2116 of
+/// 4096 tokens to avoid OOM), so a full page would otherwise grow VRAM
+/// after the slot's load-time measurement — outside the planner's budget.
+fn warm_encoder_at_max(mtmd: &MtmdContext) -> Result<()> {
+    let side = ENCODER_WARMUP_SIDE;
+    let pixels = vec![255u8; (side * side * 3) as usize];
+    let bitmap = MtmdBitmap::from_image_data(side, side, &pixels)
+        .map_err(|e| anyhow!("encoder warmup bitmap: {e}"))?;
+    let text = llama_cpp_2::mtmd::MtmdInputText {
+        text: llama_cpp_2::mtmd::mtmd_default_marker().to_string(),
+        add_special: false,
+        parse_special: true,
+    };
+    let chunks = mtmd
+        .tokenize(text, &[&bitmap])
+        .map_err(|e| anyhow!("encoder warmup tokenize: {e}"))?;
+    for i in 0..chunks.len() {
+        let chunk = chunks.get(i).expect("index in range");
+        if chunk.chunk_type() == llama_cpp_2::mtmd::MtmdInputChunkType::Image {
+            mtmd.encode_chunk(&chunk)
+                .map_err(|e| anyhow!("encoder warmup encode: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// The per-model scheduler.
 pub struct Scheduler {
     ctx: LlamaContext<'static>,
@@ -176,18 +209,22 @@ impl Scheduler {
         let mtmd = match mmproj {
             Some(path) => {
                 let p = llama_cpp_2::mtmd::MtmdContextParams {
-                    use_gpu: false,
+                    // The encoder follows the slot's placement: on a GPU slot
+                    // a page encodes in well under a second, on CPU ~50 s.
+                    use_gpu: params.op_offload,
                     print_timings: false,
                     n_threads: params.n_threads.max(1),
                     media_marker: std::ffi::CString::new(llama_cpp_2::mtmd::mtmd_default_marker())
                         .expect("marker has no NUL"),
                     image_min_tokens: -1,
-                    image_max_tokens: -1,
+                    image_max_tokens: crate::vram::OCR_MAX_IMAGE_TOKENS as i32,
                 };
-                Some(
-                    llama_cpp_2::mtmd::MtmdContext::init_from_file(path, model, &p)
-                        .map_err(|e| anyhow!("mtmd init: {e}"))?,
-                )
+                let mtmd = llama_cpp_2::mtmd::MtmdContext::init_from_file(path, model, &p)
+                    .map_err(|e| anyhow!("mtmd init: {e}"))?;
+                if params.op_offload {
+                    warm_encoder_at_max(&mtmd)?;
+                }
+                Some(mtmd)
             }
             None => None,
         };
@@ -312,9 +349,9 @@ impl Scheduler {
                 model,
                 logits_idx,
             );
-            slot.t_prefill.take().map(|t| {
+            if let Some(t) = slot.t_prefill.take() {
                 slot.prompt_ns = t.elapsed().as_nanos() as u64;
-            });
+            }
             Self::apply_outcome(&mut slot, outcome);
             if slot.gs.finished {
                 finished.push(seq_id);
@@ -377,7 +414,7 @@ impl Scheduler {
             if slot.prefill.is_empty() {
                 // Continuation: decode the pending token.
                 if let Some(tok) = slot.gs.pending.take() {
-                    let idx = batch.n_tokens() as i32;
+                    let idx = batch.n_tokens();
                     batch.add(tok, slot.n_past, &[slot.seq_id], true)?;
                     slot.tokens.push(tok);
                     slot.n_past += 1;
@@ -399,7 +436,7 @@ impl Scheduler {
                 let completes_prefill = slot.prefill.is_empty();
                 let last = chunk.len() - 1;
                 for (i, tok) in chunk.iter().enumerate() {
-                    let idx = batch.n_tokens() as i32;
+                    let idx = batch.n_tokens();
                     let want_logits = completes_prefill && i == last;
                     batch.add(*tok, slot.n_past, &[slot.seq_id], want_logits)?;
                     slot.tokens.push(*tok);
@@ -411,19 +448,19 @@ impl Scheduler {
                 if completes_prefill {
                     // Prefill complete: first sample comes from the last
                     // prompt token's logits.
-                    slot.t_prefill.take().map(|t| {
+                    if let Some(t) = slot.t_prefill.take() {
                         slot.prompt_ns = t.elapsed().as_nanos() as u64;
-                    });
+                    }
                 }
             }
 
             // Speculative drafts follow the anchor in the same batch.
             if spec && anchor_idx.is_some() {
                 if let Some(s) = slot.spec.as_mut() {
-                    if s.armed && budget >= 1 + s.draft.len() {
+                    if s.armed && budget > s.draft.len() {
                         s.verify_idx.clear();
                         for tok in &s.draft {
-                            let idx = batch.n_tokens() as i32;
+                            let idx = batch.n_tokens();
                             batch.add(*tok, slot.n_past, &[slot.seq_id], true)?;
                             slot.tokens.push(*tok);
                             slot.n_past += 1;
@@ -553,9 +590,14 @@ impl Scheduler {
                     .as_ref()
                     .ok_or_else(|| anyhow!("model has no vision projector"))?;
                 let bitmap = prompt::image_bitmap(mtmd, &image)?;
-                let chunks = prompt::ocr_input_chunks(mtmd, &instruction, &bitmap)?;
-                let tokens =
-                    model.str_to_token(&prompt::ocr_input_text(&instruction), AddBos::Always)?;
+                let ocr_prompt = prompt::ocr_prompt(model, &instruction)?;
+                let chunks = prompt::ocr_input_chunks(mtmd, &ocr_prompt, &bitmap)?;
+                let add_bos = if ocr_prompt.add_special {
+                    AddBos::Always
+                } else {
+                    AddBos::Never
+                };
+                let tokens = model.str_to_token(&ocr_prompt.text, add_bos)?;
                 (
                     tokens,
                     None,
@@ -736,9 +778,6 @@ impl Scheduler {
         let piece = model
             .token_to_piece(final_tok, &mut slot.gs.decoder, false, None)
             .unwrap_or_default();
-        if let Some(lp) = &final_logprob {
-            slot.gs.logprobs.push(lp.clone());
-        }
         let emit = slot.gs.emit(&piece, final_logprob.as_ref());
 
         if outcome.accepted < k {

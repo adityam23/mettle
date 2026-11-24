@@ -47,6 +47,19 @@ pub struct TokenLogprob {
     pub top: Vec<(String, f64)>,
 }
 
+/// One span of generated text in the order it was appended to `content`:
+/// the exact text (as decoded by the generation's streaming UTF-8 decoder,
+/// so a character split across tokens lands whole on the token completing
+/// it) and the logprob of the token that produced it. `logprob` is `None`
+/// for text no sampled token produced (a seeded reasoning opener) or when
+/// no logprob was computed. Concatenating every `text` reproduces the
+/// generation up to any stop-sequence truncation.
+#[derive(Debug, Clone)]
+pub struct TracedToken {
+    pub text: String,
+    pub logprob: Option<TokenLogprob>,
+}
+
 /// What kind of generation the request wants.
 #[derive(Debug)]
 pub enum RequestKind {
@@ -108,13 +121,14 @@ pub enum EngineResponse {
         finish_reason: Option<String>,
         usage: Option<UsageInfo>,
     },
-    /// Non-streaming completion: the whole content, final usage, and the full
-    /// per-token logprob trace (so per-token hooks can still fire — §7 g.3).
+    /// Non-streaming completion: the whole content, final usage, and the
+    /// full token trace (so per-token hooks can still fire — §7 g.3, and the
+    /// answer channel's logprobs can be attributed after a reasoning split).
     Done {
         content: String,
         finish_reason: String,
         usage: UsageInfo,
-        logprobs: Vec<TokenLogprob>,
+        trace: Vec<TracedToken>,
     },
     /// One embedding vector per input of a `RequestKind::Embedding`, in
     /// request order.

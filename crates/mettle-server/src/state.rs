@@ -158,13 +158,15 @@ impl AppState {
     /// a structured 503 response instead of a generic message. `id` must be
     /// the resolved model id ([`crate::profiles::ProfileManager::
     /// resolve_alias`] already applied by the caller).
-    pub fn v1_engine_for(&self, id: &str) -> Result<(RegistryEntry, SharedEngine), Response> {
-        let entry = self
-            .resolve_model(id)
-            .map_err(|e| api_error(StatusCode::NOT_FOUND, e.to_string()).into_response())?;
-        let engine = self.engine().ok_or_else(|| self.unavailable_response(id))?;
+    pub fn v1_engine_for(&self, id: &str) -> Result<(RegistryEntry, SharedEngine), Box<Response>> {
+        let entry = self.resolve_model(id).map_err(|e| {
+            Box::new(api_error(StatusCode::NOT_FOUND, e.to_string()).into_response())
+        })?;
+        let engine = self
+            .engine()
+            .ok_or_else(|| Box::new(self.unavailable_response(id)))?;
         if !engine.loaded().iter().any(|a| a == &entry.alias) {
-            return Err(self.unavailable_response(id));
+            return Err(Box::new(self.unavailable_response(id)));
         }
         // Single touch point for the JIT TTL sweeper.
         self.profiles.touch(&entry.alias);
@@ -175,7 +177,7 @@ impl AppState {
     pub fn v1_sender_for(
         &self,
         id: &str,
-    ) -> Result<(RegistryEntry, tokio::sync::mpsc::Sender<EngineRequest>), Response> {
+    ) -> Result<(RegistryEntry, tokio::sync::mpsc::Sender<EngineRequest>), Box<Response>> {
         let (entry, engine) = self.v1_engine_for(id)?;
         Ok((entry, engine.sender()))
     }

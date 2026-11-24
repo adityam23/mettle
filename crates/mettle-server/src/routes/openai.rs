@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use mettle_core::engine::TokenLogprob;
 use mettle_core::engine::{
     embed_texts, rerank_texts, EngineRequest, EngineResponse, GenConstraint, RequestKind,
     RerankError, SamplingParams,
@@ -24,7 +25,7 @@ use mettle_core::openai_types::{
     EmbeddingResponse, LogprobContent, ModelInfo, ModelsResponse, RerankRequest, RerankResponse,
     RerankResult, ResponseMessage, TopLogprob, Usage,
 };
-use mettle_core::reasoning::{split_reasoning, ReasoningFilter};
+use mettle_core::reasoning::{answer_logprobs, split_reasoning, ReasoningFilter};
 use mettle_core::stream::{engine_accumulate, engine_stream, Accumulated, FinishEvt, TokenEvt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -71,21 +72,26 @@ fn convert_response_format(v: Option<&serde_json::Value>) -> GenConstraint {
     }
 }
 
+/// One token's wire `logprobs` entry.
+fn logprob_content(lp: &TokenLogprob) -> LogprobContent {
+    LogprobContent {
+        token: lp.token.clone(),
+        logprob: lp.logprob,
+        top_logprobs: lp
+            .top
+            .iter()
+            .map(|(t, p)| TopLogprob {
+                token: t.clone(),
+                logprob: *p,
+            })
+            .collect(),
+    }
+}
+
 /// Build the per-token `logprobs` payload for one streamed token.
-fn evt_logprobs(token: &str, lp: Option<&mettle_core::engine::TokenLogprob>) -> ChatLogprobs {
+fn evt_logprobs(token: &str, lp: Option<&TokenLogprob>) -> ChatLogprobs {
     let entry = match lp {
-        Some(lp) => LogprobContent {
-            token: lp.token.clone(),
-            logprob: lp.logprob,
-            top_logprobs: lp
-                .top
-                .iter()
-                .map(|(t, p)| TopLogprob {
-                    token: t.clone(),
-                    logprob: *p,
-                })
-                .collect(),
-        },
+        Some(lp) => logprob_content(lp),
         None => LogprobContent {
             token: token.to_string(),
             logprob: 0.0,
@@ -110,7 +116,7 @@ pub async fn chat_completions_handler(
     let model_id = state.profiles.resolve_alias(&req.model);
     let (entry, sender) = match state.v1_sender_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let alias = entry.alias.clone();
     let messages: Vec<ChatMessage> = req
@@ -169,17 +175,12 @@ pub async fn chat_completions_handler(
                 let id = id.clone();
                 let filter = filter.clone();
                 move |evt: TokenEvt<'_>| {
-                    let (out, merged) = {
-                        let mut f = filter.lock().unwrap();
-                        let out = f.push(evt.content);
-                        (out, f.last_push_was_merged())
-                    };
+                    let (out, whole) = filter.lock().unwrap().push_token(evt.content);
                     if out.is_empty() {
                         None
                     } else {
-                        // A chunk that merges bytes held across pushes spans
-                        // several tokens; attaching one token's logprob would
-                        // fabricate a pairing, so we omit it instead.
+                        // Only a chunk that is exactly this token's text gets
+                        // its logprob (the shared rule, see `push_token`).
                         Some(ChatCompletionChunk {
                             id: id.clone(),
                             object: "chat.completion.chunk",
@@ -193,7 +194,7 @@ pub async fn chat_completions_handler(
                                     reasoning_content: None,
                                 },
                                 finish_reason: None,
-                                logprobs: (want_logprobs && !merged)
+                                logprobs: (want_logprobs && whole)
                                     .then(|| evt_logprobs(evt.content, evt.logprob)),
                             }],
                         })
@@ -244,11 +245,15 @@ pub async fn chat_completions_handler(
                 // channel moves to `message.reasoning_content` (contract:
                 // agent-docs/downstream-consumers.md).
                 let split = split_reasoning(&acc.content);
-                // Non-streaming splits text after the fact, so the engine's
-                // per-token logprob trace (still reasoning-token-aligned) no
-                // longer matches `content`. Suppress it rather than pair it
-                // wrongly — the consumer degrades a missing block to 'unknown'.
-                let has_reasoning = split.reasoning.is_some();
+                // The answer channel's tokens only, attributed by replaying
+                // the engine's token trace through the streaming filter;
+                // omitted when the trace cannot be aligned with `content`.
+                let logprobs = want_logprobs
+                    .then(|| answer_logprobs(&acc.trace, &split.content))
+                    .flatten()
+                    .map(|lps| ChatLogprobs {
+                        content: lps.iter().map(logprob_content).collect(),
+                    });
                 Ok(ChatCompletionResponse {
                     id: id.clone(),
                     object: "chat.completion",
@@ -262,24 +267,7 @@ pub async fn chat_completions_handler(
                             reasoning_content: split.reasoning,
                         },
                         finish_reason: acc.finish_reason,
-                        logprobs: (want_logprobs && !has_reasoning).then(|| ChatLogprobs {
-                            content: acc
-                                .logprobs
-                                .iter()
-                                .map(|lp| LogprobContent {
-                                    token: lp.token.clone(),
-                                    logprob: lp.logprob,
-                                    top_logprobs: lp
-                                        .top
-                                        .iter()
-                                        .map(|(t, p)| TopLogprob {
-                                            token: t.clone(),
-                                            logprob: *p,
-                                        })
-                                        .collect(),
-                                })
-                                .collect(),
-                        }),
+                        logprobs,
                     }],
                     usage: Usage::from_usage(&acc.usage),
                 })
@@ -319,7 +307,7 @@ pub async fn completions_handler(
     let model_id = state.profiles.resolve_alias(&req.model);
     let (entry, sender) = match state.v1_sender_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let alias = entry.alias.clone();
     let params = openai_params(
@@ -500,7 +488,7 @@ pub async fn rerank_handler(
 
     let (_entry, engine) = match state.v1_engine_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match rerank_texts(engine.as_ref(), &entry.alias, &req.query, &req.documents).await {
@@ -586,7 +574,7 @@ pub async fn embeddings_handler(
 
     let (_entry, engine) = match state.v1_engine_for(&model_id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let inputs = req.input.into_vec();

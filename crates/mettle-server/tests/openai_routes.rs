@@ -65,7 +65,7 @@ async fn models_lists_registered_aliases() {
         .collect();
     assert!(ids.contains(&"gemma4:e2b".to_string()));
     assert!(ids.contains(&"embed-gemma:latest".to_string()));
-    assert!(ids.contains(&"unlimited-ocr:latest".to_string()));
+    assert!(ids.contains(&"glm-ocr:latest".to_string()));
     for m in json["data"].as_array().unwrap() {
         assert_eq!(m["object"], "model");
         assert!(m["id"].is_string());
@@ -245,6 +245,8 @@ async fn ocr_without_engine_returns_503() {
     let (status, json) = send(&router, "POST", "/v1/ocr", Some(body)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(json["error"]["code"], "slot_unavailable");
+    // No profile declares an OCR slot: the registry default is the target.
+    assert_eq!(json["error"]["missing"][0], "glm-ocr:latest", "{json}");
 }
 
 // ---------------------------------------------------------------------------
@@ -463,9 +465,9 @@ fn anthropic_stream_events_serialize_with_type_tag() {
 fn ocr_response_shape() {
     let resp = mettle_core::ocr_types::OcrResponse {
         text: "page text".into(),
-        model: "unlimited-ocr:latest".into(),
+        model: "glm-ocr:latest".into(),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["text"], "page text");
-    assert_eq!(v["model"], "unlimited-ocr:latest");
+    assert_eq!(v["model"], "glm-ocr:latest");
 }

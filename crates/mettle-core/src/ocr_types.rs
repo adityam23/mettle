@@ -5,11 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Default OCR instruction used when the request omits one. MUST match the
-/// checkpoint's SFT phrasing: this model (Unlimited-OCR, a DeepSeek-OCR
-/// fine-tune) emits EOS for any other instruction — verified against every
-/// plausible variant ("…the image.", "Extract all text…", markdown formats).
-pub const DEFAULT_OCR_INSTRUCTION: &str = "Read all text in this image";
+/// Default OCR instruction used when the request omits one. It is the
+/// supported OCR model's (GLM-OCR) trained prompt for plain text; the model
+/// also knows `Table Recognition:` and `Formula Recognition:`, which a
+/// request can pass as its `instruction`.
+pub const DEFAULT_OCR_INSTRUCTION: &str = "Text Recognition:";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OcrRequest {

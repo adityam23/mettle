@@ -83,6 +83,7 @@ where
 /// Server-sent-events response. Each item becomes one frame:
 /// * `events: true` (Anthropic style) — `event: <"type" field>\ndata: <json>`;
 /// * `events: false` (OpenAI style) — `data: <json>`.
+///
 /// A final `data: <done>` frame is appended when `done_marker` is set
 /// (OpenAI's `[DONE]`).
 pub struct SseStream<S> {

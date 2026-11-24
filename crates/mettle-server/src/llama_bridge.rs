@@ -1,7 +1,7 @@
 //! Bridge between wire types and the engine-agnostic `mettle_core::engine`
 //! contract, plus construction of the llama.cpp-backed engine.
 //!
-//! Hook helpers (`token_info`, `fire_tokens_from_logprobs`,
+//! Hook helpers (`token_info`, `fire_tokens_from_trace`,
 //! `fire_on_response`, ...) and the shared response consumers live in
 //! `mettle_core::stream`; embedding plumbing in `mettle_core::engine`.
 //! This module keeps only the Ollama-flavoured conversions and engine
@@ -160,7 +160,7 @@ pub fn build_llama_config(config: &RootConfig) -> LlamaConfig {
             SpeculativeSetting::Auto => target_is_gemma4 && entry.alias != "gemma4:e2b",
         };
         if drafting {
-            if let Some(drafter) = registry.resolve("gemma4:e2b").ok() {
+            if let Ok(drafter) = registry.resolve("gemma4:e2b") {
                 if let Some(spec) = load_spec_for(drafter) {
                     cfg.speculative.draft.push((entry.alias.clone(), spec));
                 }

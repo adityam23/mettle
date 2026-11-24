@@ -53,9 +53,12 @@ use crate::unavailable::{Unavailable, UnavailableReason};
 /// single-user box.
 const DEFAULT_VRAM_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 
-/// `state.json` schema version marker — bump when the meaning of a stored
-/// byte count changes. Entries carrying a different version are discarded.
-const STATE_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// `state.json` schema version marker — bump the `+rN` revision when the
+/// meaning of a stored byte count changes. Entries carrying a different
+/// version are discarded.
+/// - r2 (2026-10-13): a GPU vision slot's measurement includes its encoder
+///   (mmproj weights + the max-size warmup buffer), no longer CPU-only.
+const STATE_ENGINE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+r2");
 
 /// Idle time before an unpinned JIT slot is unloaded again (handoff §5;
 /// per-request TTL extension deliberately deferred).
@@ -123,6 +126,11 @@ pub struct Residency {
     /// the ladder admitted, which may be below the configured cap);
     /// `None` for every other kind (residency contract §1.1).
     pub micro_tokens: Option<usize>,
+    /// VRAM the slot claims beyond what it holds resident: a rerank slot's
+    /// per-call context at `micro_tokens`. It is allocated only during a
+    /// call, so a free-memory reading between calls does not show it;
+    /// later admissions subtract it from their budget instead of taking it.
+    pub reserved_bytes: u64,
     /// Effective placement: true when the weights live in system RAM —
     /// forced by `placement = "cpu"` or reached by demoting an `auto` slot.
     pub on_cpu: bool,
@@ -399,6 +407,9 @@ impl FitInputs {
                 let mut slope = est.kv_bytes_per_token;
                 if let Some(mmproj) = &self.mmproj {
                     anchor += std::fs::metadata(mmproj).map(|m| m.len()).unwrap_or(0);
+                    // The encoder's compute buffer at the image-token cap: a
+                    // GPU vision slot allocates it during load (warmup).
+                    anchor += mettle_llama::vram::vision_encoder_bytes(mmproj).unwrap_or(0);
                 }
                 if let Some((draft_gguf, mtp)) = &self.drafter {
                     if let Some(d_est) =
@@ -456,17 +467,30 @@ impl SlotGeometry {
     /// slope on top (that double-charged the qwen3 reranker by ~900 MiB).
     /// `None` when a cap is asked for but the rerank geometry is unknown.
     fn cost(&self, rerank_cap: Option<usize>) -> Option<SlotCost> {
-        let Some(cap) = rerank_cap else {
+        if rerank_cap.is_none() {
             return Some(self.resident);
-        };
-        let per_call = self
-            .rerank?
-            .cap_cost(cap, mettle_llama::RERANK_MICRO_BATCH)
-            .total();
+        }
         Some(SlotCost {
-            anchor_bytes: self.flat.anchor_bytes.saturating_add(per_call),
+            anchor_bytes: self
+                .flat
+                .anchor_bytes
+                .saturating_add(self.per_call(rerank_cap)?),
             ..self.flat
         })
+    }
+
+    /// Bytes a call allocates on top of the resident cost: one rerank
+    /// context at `rerank_cap` (0 without a cap). `None` when a cap is
+    /// asked for but the rerank geometry is unknown.
+    fn per_call(&self, rerank_cap: Option<usize>) -> Option<u64> {
+        let Some(cap) = rerank_cap else {
+            return Some(0);
+        };
+        Some(
+            self.rerank?
+                .cap_cost(cap, mettle_llama::RERANK_MICRO_BATCH)
+                .total(),
+        )
     }
 }
 
@@ -587,6 +611,30 @@ impl ProfileManager {
             .unwrap_or(DEFAULT_VRAM_MARGIN_BYTES)
     }
 
+    /// VRAM a GPU load of `id` may use: free memory less the margin and
+    /// less every other GPU resident's reserved per-call claim (a rerank
+    /// slot's context is not allocated between calls, so `free_bytes`
+    /// alone would hand it to the next slot and squeeze the reranker).
+    fn gpu_budget(&self, free_bytes: u64, id: &str) -> u64 {
+        let reserved: u64 = self
+            .inner
+            .lock()
+            .map(|i| {
+                i.slots
+                    .iter()
+                    .filter(|(other, _)| other.as_str() != id)
+                    .filter_map(|(_, state)| match state {
+                        SlotState::Loaded(r) if !r.on_cpu => Some(r.reserved_bytes),
+                        _ => None,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        free_bytes
+            .saturating_sub(self.margin_bytes())
+            .saturating_sub(reserved)
+    }
+
     fn kv_q8(&self) -> bool {
         matches!(
             self.config.engine.kv_cache,
@@ -635,7 +683,7 @@ impl ProfileManager {
         if let Some(draft_id) = self.catalog_entry(&reg_entry.alias).and_then(|m| m.draft) {
             let reg = self.deps.registry.read().ok()?;
             if let Ok(drafter) = reg.resolve(&draft_id) {
-                return llama_bridge::load_spec_for_route(&drafter).ok();
+                return llama_bridge::load_spec_for_route(drafter).ok();
             }
             return None;
         }
@@ -1187,10 +1235,8 @@ impl ProfileManager {
             }
             match inner.slots.get(&slot.id) {
                 Some(SlotState::Loading) => return false,
-                Some(SlotState::Loaded(_)) => {
-                    if !loaded_roles.contains(&role) {
-                        loaded_roles.push(role);
-                    }
+                Some(SlotState::Loaded(_)) if !loaded_roles.contains(&role) => {
+                    loaded_roles.push(role);
                 }
                 _ => {}
             }
@@ -1482,7 +1528,7 @@ impl ProfileManager {
             let reason = "accelerator unreachable".to_string();
             return LadderOutcome::Dropped(FailCause::Load, reason);
         };
-        let budget = mem_before.free_bytes.saturating_sub(self.margin_bytes());
+        let budget = self.gpu_budget(mem_before.free_bytes, id);
 
         // Rung plan: ctx halving, crossed with the packed-token cap for a
         // rerank slot (§1.1 — its per-call context, not its resident ctx,
@@ -1548,6 +1594,7 @@ impl ProfileManager {
                 estimated_bytes: Some(projected),
                 shrunk,
                 micro_tokens: *cap,
+                reserved_bytes: geometry.per_call(*cap).unwrap_or(0),
                 ..Default::default()
             };
             let spec = match self.slot_spec(reg_entry, Placement::Gpu, Some(ctx), *cap) {
@@ -1697,16 +1744,17 @@ impl ProfileManager {
         let mem = device
             .memory()
             .ok_or_else(|| SlotOpError::Vram("accelerator unreachable".into()))?;
-        let budget = mem.free_bytes.saturating_sub(self.margin_bytes());
+        let budget = self.gpu_budget(mem.free_bytes, id);
 
         let rerank_cap = self.rerank_cap(&reg_entry);
-        let cost = self
+        let unreadable =
+            || SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into());
+        let geometry = self
             .slot_geometry_blocking(&reg_entry)
             .await
-            .and_then(|g| g.cost(rerank_cap))
-            .ok_or_else(|| {
-                SlotOpError::Vram("cannot estimate fit (unreadable GGUF header)".into())
-            })?;
+            .ok_or_else(unreadable)?;
+        let cost = geometry.cost(rerank_cap).ok_or_else(unreadable)?;
+        let reserved_bytes = geometry.per_call(rerank_cap).ok_or_else(unreadable)?;
         let full = self.full_ctx();
         let needed = cost.at(full);
         if needed > budget {
@@ -1729,6 +1777,7 @@ impl ProfileManager {
                         measured_bytes: None,
                         shrunk: false,
                         micro_tokens: rerank_cap,
+                        reserved_bytes,
                         on_cpu: false,
                     },
                 );
@@ -1795,15 +1844,14 @@ impl ProfileManager {
         let Some(role) = parse_role(role_name) else {
             return name.to_string();
         };
-        self.resolve_role_slot(role)
-            .unwrap_or_else(|| name.to_string())
+        self.role_slot(role).unwrap_or_else(|| name.to_string())
     }
 
     /// Highest-priority resident-slot candidate for `role`: same ordering
     /// semantics as activation (priority first, declaration order breaking
     /// ties). Membership in the ACTIVE profile is what counts — residency
     /// is checked separately by availability.
-    fn resolve_role_slot(&self, role: ModelRole) -> Option<String> {
+    pub fn role_slot(&self, role: ModelRole) -> Option<String> {
         let active = self.inner.lock().ok()?.active.clone()?;
         let profile = self.profile(&active)?;
         by_priority(&profile)
@@ -2664,6 +2712,51 @@ mod tests {
         assert_eq!(status["slots"][0]["micro_tokens"], 256, "{status}");
     }
 
+    /// A resident reranker's per-call context is not allocated between
+    /// calls, so free memory alone would hand it to the next slot. A slot
+    /// admitted after the reranker must leave that context free.
+    #[tokio::test]
+    async fn later_slot_cannot_take_a_rerankers_per_call_context() {
+        let fx = Fixture::build_fiddled(&["r1", "m2"], &[("p", &["r1", "m2"])], 8 * GIB, |cfg| {
+            cfg.model[0].role = Some(mettle_core::config::ModelRole::Rerank);
+            cfg.engine.rerank_micro_tokens = Some(2048);
+            cfg.profile[0].slots[0].priority = Some(1);
+            cfg.profile[0].slots[1].priority = Some(2);
+        });
+        let m = fx.manager.clone();
+        let entry = |id: &str| m.deps.registry.read().unwrap().resolve(id).unwrap().clone();
+        let full = m.full_ctx();
+        let rerank = m.slot_geometry(&entry("r1")).unwrap();
+        let rerank_cost = rerank.cost(Some(2048)).unwrap().at(full);
+        let per_call = rerank.per_call(Some(2048)).unwrap();
+        let m2_cost = m
+            .slot_geometry(&entry("m2"))
+            .unwrap()
+            .cost(None)
+            .unwrap()
+            .at(full);
+        // The fake device never consumes memory: each slot alone fits the
+        // free reading, but m2 does not fit once r1's context is held back.
+        let room = rerank_cost.max(m2_cost);
+        assert!(
+            room - per_call < m2_cost,
+            "fixture must make the reserve decisive"
+        );
+        fx.free
+            .store(room + m.margin_bytes(), AtomicOrdering::SeqCst);
+
+        m.clone().activate("p".into()).await.unwrap();
+
+        let ops = fx.engine.op_log();
+        assert!(
+            ops.iter()
+                .any(|o| o.starts_with("load:r1") && o.contains("cap=Some(2048)")),
+            "{ops:?}"
+        );
+        assert!(!ops.iter().any(|o| o.starts_with("load:m2")), "{ops:?}");
+        assert!(degradation(&m).dropped.iter().any(|s| s == "m2"));
+    }
+
     // -- activation --------------------------------------------------------------
 
     #[tokio::test]
@@ -3005,6 +3098,20 @@ mod tests {
         assert_eq!(fx.manager.resolve_alias("role:chat"), "m2");
         assert_eq!(fx.manager.resolve_alias("role:nope"), "role:nope");
         assert_eq!(fx.manager.resolve_alias("gemma4:e2b"), "gemma4:e2b");
+    }
+
+    #[test]
+    fn configured_mmproj_makes_the_ocr_role_slot() {
+        let fx = Fixture::build_fiddled(&["m1", "m2"], &[("p", &["m2", "m1"])], 8 * GIB, |cfg| {
+            cfg.model[0].mmproj_path = Some("/models/mmproj-m1.gguf".into());
+        });
+        assert_eq!(fx.manager.role_slot(ModelRole::Ocr), None);
+
+        fx.manager.inner.lock().unwrap().active = Some("p".into());
+        // m1's projector makes it a vision entry, inferred as the OCR role
+        // (what `/v1/ocr` targets); m2 stays the chat slot.
+        assert_eq!(fx.manager.role_slot(ModelRole::Ocr).as_deref(), Some("m1"));
+        assert_eq!(fx.manager.role_slot(ModelRole::Chat).as_deref(), Some("m2"));
     }
 
     #[test]

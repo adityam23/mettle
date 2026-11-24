@@ -91,13 +91,10 @@ mod tests {
 
     #[test]
     fn cuda_memory_snapshot_is_consistent_when_present() {
-        match CudaDevice.memory() {
-            Some(m) => {
-                assert!(m.total_bytes > 0);
-                assert!(m.free_bytes <= m.total_bytes);
-            }
-            // No GPU / no driver on this host: the probe must fail soft.
-            None => {}
+        if let Some(m) = CudaDevice.memory() {
+            assert!(m.total_bytes > 0);
+            assert!(m.free_bytes <= m.total_bytes);
         }
+        // No GPU / no driver on this host: the probe must fail soft.
     }
 }

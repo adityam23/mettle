@@ -482,16 +482,22 @@ fn load_runtime(
     // correctly. Single-slot also matches how these models are consumed
     // (`/v1` is single-user). Gemma4 is unaffected (its MTP lane is
     // sequence-0-only anyway).
-    if gguf_architecture(&spec.gguf_path)
-        .is_some_and(|arch| HYBRID_SINGLE_SEQ_ARCHS.contains(&arch.as_str()))
-    {
-        if sched_params.n_seq_max > 1 {
-            tracing::warn!(
-                alias = %spec.alias,
-                "hybrid-recurrent architecture: clamping scheduler to 1 concurrent sequence (multi-seq KV corrupts generation)"
-            );
-            sched_params.n_seq_max = 1;
-        }
+    let hybrid_recurrent = gguf_architecture(&spec.gguf_path)
+        .is_some_and(|arch| HYBRID_SINGLE_SEQ_ARCHS.contains(&arch.as_str()));
+    if hybrid_recurrent && sched_params.n_seq_max > 1 {
+        tracing::warn!(
+            alias = %spec.alias,
+            "hybrid-recurrent architecture: clamping scheduler to 1 concurrent sequence (multi-seq KV corrupts generation)"
+        );
+        sched_params.n_seq_max = 1;
+    }
+    // Vision (OCR) models run one sequence: the KV cache is split per
+    // sequence, so with n_seq_max = 4 a request gets n_ctx / 4 = 2048
+    // cells, while one page is up to the projector's 4096 image tokens plus
+    // its text. A single sequence gets all of n_ctx; pages are OCR'd one at
+    // a time, which is how ingest submits them anyway.
+    if spec.mmproj_path.is_some() {
+        sched_params.n_seq_max = 1;
     }
 
     // Same-model MTP drafter takes precedence over a standard draft model.

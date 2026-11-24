@@ -102,7 +102,6 @@ pub async fn messages_handler(
             ctx,
             model_name.clone(),
             {
-                let start_block = start_block;
                 let mut started = false;
                 move |evt: TokenEvt<'_>| {
                     let mut events = Vec::new();

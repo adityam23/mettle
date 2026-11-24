@@ -519,10 +519,10 @@ mod tests {
         assert_eq!(repo, "Qwen/Qwen3-Embedding-0.6B-GGUF");
         assert_eq!(files, vec!["Qwen3-Embedding-0.6B-Q8_0.gguf"]);
         // A vision entry fetches its projector too.
-        let ocr = entry("unlimited-ocr:latest");
+        let ocr = entry("glm-ocr:latest");
         assert_eq!(
             download_set(&ocr).unwrap().1,
-            vec!["Unlimited-OCR-Q4_K_M.gguf", "mmproj-Unlimited-OCR-F16.gguf"]
+            vec!["GLM-OCR-Q8_0.gguf", "mmproj-GLM-OCR-Q8_0.gguf"]
         );
         // A configured local path is never downloaded around.
         let mut local = entry("gemma4:e2b");
@@ -661,7 +661,7 @@ mod tests {
         let mmproj = dir.path().join("mmproj.gguf");
         std::fs::write(&mmproj, b"MMPROJ").unwrap();
 
-        let mut e = entry("unlimited-ocr:latest");
+        let mut e = entry("glm-ocr:latest");
         assert!(matches!(e.loader_kind, LoaderKind::GgufVision { .. }));
         // A repo that cannot exist in the local HF cache, so presence depends
         // only on the two paths above.

@@ -1419,7 +1419,7 @@ mod tests {
                 } else {
                     0.1f32
                 };
-                out.extend(std::iter::repeat(v).take(16));
+                out.extend([v; 16]);
             }
             Ok(out)
         };
