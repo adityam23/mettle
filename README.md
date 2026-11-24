@@ -108,4 +108,4 @@ PDFs go through the HTTP API as a file upload: `curl -F file=@handbook.pdf local
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE). Mettle embeds llama.cpp (MIT) through [llama-cpp-2](https://crates.io/crates/llama-cpp-2).
+AGPL-3.0-or-later. See [LICENSE](LICENSE). Mettle embeds llama.cpp (MIT) through [llama-cpp-2](https://crates.io/crates/llama-cpp-2).
