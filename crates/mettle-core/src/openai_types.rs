@@ -1,5 +1,6 @@
 //! OpenAI-compatible wire types (`/v1/*`), matching the shapes agentic
-//! clients (including agent-assistant's `openai_compat.py`) expect.
+//! clients (including docket's — formerly agent-assistant —
+//! `openai_compat.py`) expect.
 //!
 //! Request types deliberately do NOT use `deny_unknown_fields`: drop-in
 //! clients send extra fields (tools, seed, logprobs, ...) that we accept and

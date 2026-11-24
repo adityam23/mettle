@@ -317,10 +317,11 @@ impl ModelRegistry {
                     "Q8_0",
                 ),
             ),
-            // Retrieval-track models for agent-assistant (rerank contract
-            // 2026-08-22): two cross-encoder rerankers on /v1/rerank and two
-            // candidate embedders on /v1/embeddings. Serving one at a time
-            // is fine — the consumer swaps via config between runs.
+            // Retrieval-track models for docket (formerly agent-assistant;
+            // rerank contract 2026-08-22): two cross-encoder rerankers on
+            // /v1/rerank and two candidate embedders on /v1/embeddings.
+            // Serving one at a time is fine — the consumer swaps via config
+            // between runs.
             (
                 "bge-reranker-v2-m3:latest".to_string(),
                 builtin(

@@ -1,7 +1,8 @@
 //! OCR endpoint wire types (`POST /v1/ocr`).
 //!
-//! Contract: image in, text out. The consumer (agent-assistant) rasterizes
-//! PDF pages itself and posts encoded images; mettle never touches PDFs.
+//! Contract: image in, text out. The consumer (docket, formerly
+//! agent-assistant) rasterizes PDF pages itself and posts encoded images;
+//! mettle never touches PDFs.
 
 use serde::{Deserialize, Serialize};
 

@@ -123,7 +123,8 @@ fn qwen_distill_long_grounded_prompt_keeps_reasoning_prefill() {
     let path = qwen_gguf();
     let model = llama_model(&path);
 
-    // Multi-chunk grounded context in the shape agent-assistant sends
+    // Multi-chunk grounded context in the shape docket (formerly
+    // agent-assistant) sends
     // (well past 2000 prompt tokens).
     let chunk = "3M's capital expenditures for fiscal year 2023 were $1,577 million, \
 primarily directed toward manufacturing capacity and R&D facilities. \

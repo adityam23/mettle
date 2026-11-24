@@ -318,7 +318,7 @@ fn chat_completion_response_shape() {
 
 #[test]
 fn chat_completion_response_logprobs_shape() {
-    // agent-assistant's trust layer parses choices[].logprobs.content[].logprob;
+    // docket's (formerly agent-assistant) trust layer parses choices[].logprobs.content[].logprob;
     // the field must serialize when requested and be absent otherwise.
     use mettle_core::openai_types as t;
     let with = t::ChatChoice {

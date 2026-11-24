@@ -4,9 +4,10 @@
 //!
 //! The wrapper binds speculative state to sequence 0, so the lane serves one
 //! request at a time (a queue absorbs the rest). This matches the
-//! single-consumer deployment (agent-assistant) and is the fastest decode
-//! path: each verification round decodes `[anchor, draft[0..k])` in ONE
-//! target pass; the MTP heads produced the drafts in the drafter's own pass.
+//! single-consumer deployment (docket, formerly agent-assistant) and is the
+//! fastest decode path: each verification round decodes
+//! `[anchor, draft[0..k])` in ONE target pass; the MTP heads produced the
+//! drafts in the drafter's own pass.
 //!
 //! Protocol (per wrapper contract):
 //!   1. `begin(prompt)` at admission,
