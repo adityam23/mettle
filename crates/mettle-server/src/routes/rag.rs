@@ -626,6 +626,18 @@ pub async fn list_documents(
     Ok(Json(docs).into_response())
 }
 
+/// GET /v1/collections/:name/documents/:id
+pub async fn get_document(
+    State(state): State<Arc<AppState>>,
+    Path((collection_name, doc_id)): Path<(String, String)>,
+) -> RouteResult {
+    let handle = collection_handle(&state, &collection_name)?;
+    let doc = with_collection(&handle, move |c| c.get_document(&doc_id))
+        .await?
+        .map_err(core_error)?;
+    Ok(Json(doc).into_response())
+}
+
 /// DELETE /v1/collections/:name/documents/:id
 pub async fn delete_document(
     State(state): State<Arc<AppState>>,

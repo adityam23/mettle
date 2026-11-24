@@ -250,12 +250,26 @@ async fn collection_crud_ingest_search_delete() {
         "/v1/collections/docs/documents",
         Some(serde_json::json!({
             "id": "doc1",
-            "content": "machine learning is a subset of artificial intelligence"
+            "content": "machine learning is a subset of artificial intelligence",
+            "metadata": {"doc_id": "filing-7", "page": "3"}
         })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["chunks"].as_u64().unwrap() >= 1);
+    let chunks = body["chunks"].as_u64().unwrap();
+
+    // Per-id reconciliation read: one request settles whether a batch
+    // committed for this id, without listing the whole collection.
+    let (status, body) = send(&router, "GET", "/v1/collections/docs/documents/doc1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], "doc1");
+    assert_eq!(body["chunk_count"].as_u64().unwrap(), chunks);
+    assert_eq!(body["metadata"]["doc_id"], "filing-7");
+    assert_eq!(body["metadata"]["page"], "3");
+
+    let (status, _) = send(&router, "GET", "/v1/collections/docs/documents/nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Duplicate document → 409.
     let (status, _) = send(
@@ -1354,6 +1368,9 @@ async fn document_ids_round_trip_percent_encoded() {
         .await;
         assert_eq!(status, StatusCode::OK);
         let uri = format!("/v1/collections/docs/documents/{encoded}");
+        let (status, body) = send(&router, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+        assert_eq!(body["id"], id);
         let (status, body) = send(&router, "DELETE", &uri, None).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{id}: {body}");
     }

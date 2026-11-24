@@ -85,7 +85,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v1/collections/{name}/documents/{id}",
-            delete(crate::routes::rag::delete_document),
+            get(crate::routes::rag::get_document).delete(crate::routes::rag::delete_document),
         )
         .route(
             "/v1/collections/{name}/search",

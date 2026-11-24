@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use turbovec::IdMapIndex;
 
@@ -722,6 +723,39 @@ impl Collection {
             });
         }
         Ok(out)
+    }
+
+    /// One stored document, or [`CoreError::DocumentNotFound`]. This is the
+    /// per-id reconciliation read: cheaper than listing a whole collection to
+    /// settle whether a partly-delivered batch committed.
+    pub fn get_document(&self, doc_id: &str) -> Result<DocumentSummary, CoreError> {
+        let db_path = self.data_dir.join("metadata.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| CoreError::Retrieval(format!("failed to open sqlite db: {}", e)))?;
+        let row = conn
+            .query_row(
+                "SELECT d.id, d.metadata_json, \
+                 (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) \
+                 FROM documents d WHERE d.id = ?1",
+                [doc_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| CoreError::Retrieval(format!("sqlite query: {}", e)))?;
+        let Some((id, metadata_json, chunk_count)) = row else {
+            return Err(CoreError::DocumentNotFound(doc_id.to_string()));
+        };
+        Ok(DocumentSummary {
+            id,
+            chunk_count: chunk_count.max(0) as u64,
+            metadata: serde_json::from_str(&metadata_json).unwrap_or_default(),
+        })
     }
 
     /// Delete a document and all its chunks.
