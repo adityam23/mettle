@@ -1972,7 +1972,7 @@ impl ProfileManager {
                 .filter(|(id, st)| {
                     matches!(st, SlotState::Loaded(_))
                         && !pinned.contains(*id)
-                        && lu.get(*id).is_none_or(|t| *t < deadline)
+                        && lu.get(*id).map_or(true, |t| *t < deadline)
                 })
                 .map(|(id, _)| id.clone())
                 .collect()

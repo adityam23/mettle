@@ -70,7 +70,7 @@ impl Device for CudaDevice {
                 total_bytes: total_mib * 1024 * 1024,
                 free_bytes: free_mib * 1024 * 1024,
             };
-            if best.is_none_or(|b| m.free_bytes > b.free_bytes) {
+            if best.map_or(true, |b| m.free_bytes > b.free_bytes) {
                 best = Some(m);
             }
         }
