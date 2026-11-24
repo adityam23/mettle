@@ -33,7 +33,10 @@ futures = "0.3.32"
 hf-hub = { version = "0.4.3", features = ["tokio"] }
 # Provisional PDF-extraction crate (spec resolved decision #2: final choice
 # at M2 by measured extraction quality; candidates pdf-extract and lopdf).
-pdf-extract = "0.9"
+# 0.12 pulls lopdf 0.42: the 0.9 line pinned lopdf 0.36, which stack-overflows
+# on deeply nested PDF objects (GHSA for lopdf < 0.42) — and ingest parses
+# untrusted uploads.
+pdf-extract = "0.12"
 indexmap = "2.14.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
